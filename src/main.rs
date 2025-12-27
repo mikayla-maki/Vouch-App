@@ -4,6 +4,8 @@ use gpui_component::{
     button::{Button, ButtonVariants},
 };
 
+actions!(vouch, [Quit]);
+
 struct Vouch {
     count: i32,
 }
@@ -59,6 +61,10 @@ fn main() {
     Application::new().run(|cx| {
         gpui_component::init(cx);
 
+        // Bind Cmd+Q to quit
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         cx.open_window(
             WindowOptions {
@@ -75,5 +81,8 @@ fn main() {
             },
         )
         .unwrap();
+
+        // Activate the app (bring to foreground)
+        cx.activate(true);
     });
 }
