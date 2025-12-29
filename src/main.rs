@@ -1,71 +1,36 @@
 use gpui::*;
-use gpui_component::{
-    Root,
-    button::{Button, ButtonVariants},
-};
+use gpui_component::Root;
+
+mod app;
+mod data;
+mod theme;
+mod ui;
+
+use app::VouchApp;
+use theme::ActiveTheme;
 
 actions!(vouch, [Quit]);
-
-struct Vouch {
-    count: i32,
-}
-
-impl Vouch {
-    fn new() -> Self {
-        Self { count: 0 }
-    }
-
-    fn increment(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.count += 1;
-        cx.notify();
-    }
-
-    fn decrement(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.count -= 1;
-        cx.notify();
-    }
-}
-
-impl Render for Vouch {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .justify_center()
-            .items_center()
-            .gap_4()
-            .child(div().text_xl().child("Welcome to Vouch!"))
-            .child(div().text_2xl().child(format!("{}", self.count)))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        Button::new("decrement")
-                            .label("-")
-                            .on_click(cx.listener(Self::decrement)),
-                    )
-                    .child(
-                        Button::new("increment")
-                            .primary()
-                            .label("+")
-                            .on_click(cx.listener(Self::increment)),
-                    ),
-            )
-    }
-}
 
 fn main() {
     Application::new().run(|cx| {
         gpui_component::init(cx);
 
-        // Bind Cmd+Q to quit
+        cx.set_global(ActiveTheme::light());
+
+        let mut previous_theme_name: &'static str = "light";
+        cx.observe_global::<ActiveTheme>(move |cx| {
+            let current_name = cx.global::<ActiveTheme>().name;
+            if current_name != previous_theme_name {
+                previous_theme_name = current_name;
+                cx.refresh_windows();
+            }
+        })
+        .detach();
+
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -76,13 +41,12 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|_cx| Vouch::new());
+                let view = cx.new(|cx| VouchApp::new(cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )
         .unwrap();
 
-        // Activate the app (bring to foreground)
         cx.activate(true);
     });
 }

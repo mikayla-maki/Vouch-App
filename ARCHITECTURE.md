@@ -73,14 +73,18 @@ struct ContentHash(Vec<u8>);
 
 This enables:
 - **Deduplication**: Same recommendation from multiple contacts is recognized as identical
-- **Efficient sync**: "Do you have content ABC?" rather than replaying full content
 - **Stable references**: Reactions and disavowals reference content that won't change
+- **Verification in adversarial networks**: Even trusted networks have bad actors. When Bob revouches "Alice's recommendation," you can verify he didn't alter the text by checking `hash(content) == original_hash`. This is especially important for multi-hop trust where you don't know the original author directly.
 
-### User Identity
+Note: We inline full content in events (no round-trips) but include content hashes for verification and deduplication. The hash is a trust primitive, not just an optimization.
+
+### User Identity and Cryptographic Signing
+
+User identifiers are public keys. Each user generates a keypair—the public key *is* their identity, and the private key signs all their events.
 
 ```rust
-/// Opaque, globally unique identifier (e.g., public key)
-struct UserIdentifier(Vec<u8>);
+/// A user's public key - this IS their identity
+struct UserIdentifier(PublicKey);
 
 /// A contact in your local address book
 struct Contact {
@@ -90,14 +94,20 @@ struct Contact {
 }
 ```
 
+**Why signatures matter:**
+
+Content hashes verify *what* was said. Signatures verify *who* said it.
+
+Without signatures, Bob could fabricate "Alice's vouch" and Carol would have no way to verify Alice actually authored it. With signatures, every event carries cryptographic proof of authorship that anyone can verify using the author's public key (their `UserIdentifier`).
+
 ### Events
 
-All state changes flow through the event system:
+All state changes flow through the event system. Every event is signed by its author.
 
 ```rust
 /// A single event in a contact connection
 struct VouchEvent {
-    /// Who authored this event
+    /// Who authored this event (their public key)
     author: UserIdentifier,
     /// Per-author ordering for sync
     sequence: u64,
@@ -105,6 +115,8 @@ struct VouchEvent {
     timestamp: Timestamp,
     /// The actual event payload
     payload: VouchEventPayload,
+    /// Cryptographic signature: sign(private_key, hash(author + sequence + timestamp + payload))
+    signature: Signature,
 }
 
 enum VouchEventPayload {
@@ -114,7 +126,14 @@ enum VouchEventPayload {
     /// Resharing someone else's recommendation
     Revouch {
         original_author: UserIdentifier,
+        original_signature: Signature,  // Proves original author actually said this
         content: RecommendationContent,  // Embedded for simplicity
+    },
+    
+    /// Update your own profile (name, picture, etc.)
+    UpdateProfile {
+        name: String,
+        picture: Option<ContentHash>,  // References CAS for heavy content
     },
     
     /// Marking a recommendation as retracted/untrusted
@@ -140,6 +159,15 @@ enum Reaction {
     // etc.
 }
 ```
+
+**Verification chain for revouches:**
+
+1. Alice vouches for Restaurant X, signs with her private key
+2. Bob revouches, including Alice's original signature
+3. Carol receives Bob's revouch and verifies:
+   - Bob's signature on the revouch event ✓
+   - Alice's original signature on the content ✓
+4. Carol now has cryptographic proof of the entire chain
 
 ### Contact Connections
 
@@ -463,6 +491,37 @@ This solves several problems:
 - **Core stays simple** — the vouch is what you said, everything else is enhancement
 
 The current `subject` + `recommendation` fields would become optional metadata rather than required structure. Worth deeper thought.
+
+### Content-Addressable Storage for Heavy Content
+
+For text vouches, we inline content everywhere—duplication is cheap (500 bytes × 10,000 vouches = 5MB). But heavy content like images changes the calculus.
+
+**The problem:**
+- Profile pictures need to sync but shouldn't be duplicated in every event
+- Future image attachments on vouches have the same issue
+- We don't want round-trip latency for text, but lazy-loading images is acceptable
+
+**Potential approach:**
+- Add `DefineContent` events to the event log for heavy content
+- Events reference images by hash
+- Content store is a projection from `DefineContent` events (same as other materialized views)
+- Images load lazily; missing content shows placeholder until fetched
+
+```rust
+enum VouchEventPayload {
+    // Heavy content definition
+    DefineContent { hash: ContentHash, content: ContentBlob },
+    
+    // Profile updates reference image by hash
+    UpdateProfile { name: String, picture: Option<ContentHash> },
+    
+    // Regular vouches still inline text (small, no round-trips)
+    Vouch(RecommendationContent),
+    // ...
+}
+```
+
+**For v1:** Skip images entirely, or use external URLs. CAS infrastructure can come later when images become a real requirement.
 
 ## References
 
