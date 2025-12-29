@@ -11,10 +11,10 @@ pub struct VouchApp {
 }
 
 impl VouchApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let data = MockData::generate();
 
-        let feed_panel = cx.new(|_cx| FeedPanel::new(data.clone()));
+        let feed_panel = cx.new(|cx| FeedPanel::new(data.clone(), window, cx));
 
         Self { feed_panel, data }
     }

@@ -1,5 +1,6 @@
 use crate::data::{MockData, Recommendation};
 use crate::theme::Theme;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::time::SystemTime;
 
@@ -95,7 +96,9 @@ impl RecordCard {
             .border_color(theme.border)
             .rounded_lg()
             .cursor_pointer()
-            .hover(|style| style.bg(theme.card_hover))
+            .when(!is_selected, |this| {
+                this.hover(|style| style.bg(theme.card_hover))
+            })
             .child(
                 div()
                     .flex()

@@ -1,19 +1,25 @@
 use gpui::*;
 use gpui_component::Root;
+use gpui_component::theme::{Theme, ThemeMode};
 
 mod app;
+mod assets;
 mod data;
 mod theme;
 mod ui;
 
 use app::VouchApp;
+use assets::Assets;
 use theme::ActiveTheme;
 
 actions!(vouch, [Quit]);
 
 fn main() {
-    Application::new().run(|cx| {
+    Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
+
+        // Force gpui-component's theme to light mode so Input text is dark
+        Theme::change(ThemeMode::Light, None, cx);
 
         cx.set_global(ActiveTheme::light());
 
@@ -41,7 +47,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| VouchApp::new(cx));
+                let view = cx.new(|cx| VouchApp::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )

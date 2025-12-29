@@ -1,19 +1,49 @@
 use crate::data::{MockData, RecommendationId};
 use crate::theme::{ActiveTheme, Theme};
 use crate::ui::record_card::RecordCard;
+use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 
 use gpui::*;
+
+// TODO: When recommendations can change (add/edit/delete), we need to invalidate
+// the cached filtered IDs. Options to consider:
+// - Add a version/generation number to MockData that increments on changes
+// - Use an event subscription pattern to listen for data changes
+// - Store a hash of recommendation IDs to detect changes cheaply
+// Comparing the full Vec<Recommendation> is expensive and should be avoided.
 
 pub struct FeedPanel {
     data: MockData,
     selected_id: Option<RecommendationId>,
+    search_bar: Entity<SearchBar>,
+    search_query: SharedString,
+    /// Cached list of recommendation IDs, filtered and sorted.
+    /// Recomputed when search_query changes.
+    filtered_ids: Vec<RecommendationId>,
 }
 
 impl FeedPanel {
-    pub fn new(data: MockData) -> Self {
+    pub fn new(data: MockData, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search_bar = cx.new(|cx| SearchBar::new(window, cx));
+
+        cx.subscribe(
+            &search_bar,
+            |this, search_bar, _event: &SearchBarEvent, cx| {
+                this.search_query = search_bar.read(cx).query().clone();
+                this.recompute_filtered_ids();
+                cx.notify();
+            },
+        )
+        .detach();
+
+        let filtered_ids = Self::compute_filtered_ids(&data, "");
+
         Self {
             data,
             selected_id: None,
+            search_bar,
+            search_query: SharedString::default(),
+            filtered_ids,
         }
     }
 
@@ -29,37 +59,49 @@ impl FeedPanel {
         &self.data
     }
 
-    fn render_search_bar(&self, theme: &Theme) -> impl IntoElement {
-        div().w_full().p_2().child(
-            div()
-                .w_full()
-                .px_3()
-                .py_2()
-                .bg(theme.card)
-                .border_1()
-                .border_color(theme.border)
-                .rounded_md()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_sm().text_color(theme.text_muted).child("🔍"))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.text_muted)
-                                .child("Search recommendations..."),
-                        ),
-                ),
-        )
+    fn compute_filtered_ids(data: &MockData, query: &str) -> Vec<RecommendationId> {
+        let query = query.to_lowercase();
+
+        let mut results: Vec<&crate::data::Recommendation> = if query.is_empty() {
+            data.recommendations.iter().collect()
+        } else {
+            data.recommendations
+                .iter()
+                .filter(|rec| {
+                    let subject_match = rec.subject_name.to_lowercase().contains(&query);
+                    let content_match = rec.content.to_lowercase().contains(&query);
+                    let author_name = data.get_contact_name(rec.source.original_author);
+                    let author_match = author_name.to_lowercase().contains(&query);
+
+                    subject_match || content_match || author_match
+                })
+                .collect()
+        };
+
+        // Sort by timestamp, newest first
+        results.sort_by(|a, b| b.source.timestamp.cmp(&a.source.timestamp));
+
+        results.into_iter().map(|rec| rec.id).collect()
+    }
+
+    fn recompute_filtered_ids(&mut self) {
+        self.filtered_ids = Self::compute_filtered_ids(&self.data, &self.search_query);
     }
 
     fn render_feed_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut cards: Vec<Stateful<Div>> = Vec::new();
 
-        for recommendation in &self.data.recommendations {
+        for recommendation_id in &self.filtered_ids {
+            let recommendation = self
+                .data
+                .recommendations
+                .iter()
+                .find(|r| r.id == *recommendation_id);
+
+            let Some(recommendation) = recommendation else {
+                continue;
+            };
+
             let is_selected = self.selected_id == Some(recommendation.id);
             let recommendation_id = recommendation.id;
 
@@ -82,15 +124,34 @@ impl FeedPanel {
             cards.push(card);
         }
 
-        div()
-            .id("feed-list")
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .overflow_y_scroll()
-            .flex_1()
-            .children(cards)
+        let theme = cx.global::<ActiveTheme>().clone();
+
+        if cards.is_empty() {
+            div()
+                .id("feed-list")
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .flex_1()
+                .p_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.text_muted)
+                        .child("No recommendations found"),
+                )
+        } else {
+            div()
+                .id("feed-list")
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .overflow_y_scroll()
+                .flex_1()
+                .children(cards)
+        }
     }
 
     fn render_new_vouch_button(&self, theme: &Theme) -> impl IntoElement {
@@ -141,7 +202,7 @@ impl Render for FeedPanel {
             .bg(theme.background)
             .border_r_1()
             .border_color(theme.border)
-            .child(self.render_search_bar(&theme))
+            .child(self.search_bar.clone())
             .child(self.render_feed_list(cx))
             .child(self.render_new_vouch_button(&theme))
     }
