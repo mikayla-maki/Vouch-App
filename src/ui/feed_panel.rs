@@ -1,5 +1,6 @@
 use crate::data::{MockData, RecommendationId};
 use crate::theme::{ActiveTheme, Theme};
+use crate::ui::modals::NewRecommendationModal;
 use crate::ui::record_card::RecordCard;
 use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 
@@ -154,7 +155,9 @@ impl FeedPanel {
         }
     }
 
-    fn render_new_vouch_button(&self, theme: &Theme) -> impl IntoElement {
+    fn render_new_vouch_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let data = self.data.clone();
+
         div()
             .w_full()
             .p_2()
@@ -162,6 +165,7 @@ impl FeedPanel {
             .border_color(theme.border)
             .child(
                 div()
+                    .id("new-vouch-button")
                     .w_full()
                     .px_3()
                     .py_2()
@@ -169,6 +173,9 @@ impl FeedPanel {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.primary_hover))
+                    .on_click(cx.listener(move |_this, _event, window, cx| {
+                        NewRecommendationModal::open(data.clone(), window, cx);
+                    }))
                     .child(
                         div()
                             .flex()
@@ -204,6 +211,6 @@ impl Render for FeedPanel {
             .border_color(theme.border)
             .child(self.search_bar.clone())
             .child(self.render_feed_list(cx))
-            .child(self.render_new_vouch_button(&theme))
+            .child(self.render_new_vouch_button(&theme, cx))
     }
 }

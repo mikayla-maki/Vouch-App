@@ -489,6 +489,8 @@ impl DetailPanel {
     }
 
     fn render_action_bar(is_own: bool, theme: &Theme) -> Div {
+        let not_implemented_border = gpui::red();
+
         div()
             .flex()
             .flex_row()
@@ -499,41 +501,37 @@ impl DetailPanel {
             .border_color(theme.border)
             .bg(theme.surface)
             .mt_auto()
-            .child(Self::render_action_button(
+            .child(Self::render_stub_button(
                 "revouch-btn",
                 "🔄",
                 "Revouch",
-                theme.primary,
-                theme.primary_hover,
                 theme,
+                not_implemented_border,
             ))
-            .child(Self::render_action_button(
+            .child(Self::render_stub_button(
                 "disavow-btn",
                 "🚫",
                 "Disavow",
-                theme.card,
-                theme.card_hover,
                 theme,
+                not_implemented_border,
             ))
             .when(is_own, |this| {
-                this.child(Self::render_action_button(
+                this.child(Self::render_stub_button(
                     "edit-btn",
                     "✏️",
                     "Edit",
-                    theme.accent,
-                    theme.accent_hover,
                     theme,
+                    not_implemented_border,
                 ))
             })
     }
 
-    fn render_action_button(
+    fn render_stub_button(
         id: &'static str,
         emoji: &str,
         label: &str,
-        bg_color: Hsla,
-        hover_color: Hsla,
         theme: &Theme,
+        border_color: Hsla,
     ) -> Stateful<Div> {
         div()
             .id(id)
@@ -543,13 +541,12 @@ impl DetailPanel {
             .gap_2()
             .px_4()
             .py_2()
-            .bg(bg_color)
+            .bg(theme.card)
             .rounded_lg()
-            .cursor_pointer()
-            .border_1()
-            .border_color(theme.border)
+            .cursor_not_allowed()
+            .border_2()
+            .border_color(border_color)
             .shadow_sm()
-            .hover(|style| style.bg(hover_color))
             .child(div().text_sm().child(emoji.to_string()))
             .child(
                 div()

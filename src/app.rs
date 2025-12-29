@@ -3,7 +3,9 @@ use crate::theme::ActiveTheme;
 use crate::ui::detail_panel::DetailPanel;
 use crate::ui::feed_panel::FeedPanel;
 use crate::ui::sidebar::Sidebar;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::Root;
 
 pub struct VouchApp {
     feed_panel: Entity<FeedPanel>,
@@ -35,11 +37,12 @@ impl VouchApp {
 }
 
 impl Render for VouchApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selected_recommendation_id(cx);
         let theme = cx.global::<ActiveTheme>();
 
         div()
+            .relative()
             .flex()
             .flex_row()
             .size_full()
@@ -53,5 +56,8 @@ impl Render for VouchApp {
             )
             .child(self.feed_panel.clone())
             .child(DetailPanel::new(self.data.clone()).selected(selected_id))
+            .when_some(Root::render_dialog_layer(window, cx), |this, layer| {
+                this.child(layer)
+            })
     }
 }
