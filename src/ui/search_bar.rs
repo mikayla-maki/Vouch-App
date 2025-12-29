@@ -1,8 +1,7 @@
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::theme::ActiveTheme;
 use gpui_component::{Icon, IconName};
-
-use crate::theme::ActiveTheme;
 
 pub struct SearchBar {
     input_state: Entity<InputState>,
@@ -48,7 +47,7 @@ impl EventEmitter<SearchBarEvent> for SearchBar {}
 
 impl Render for SearchBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.global::<ActiveTheme>().clone();
+        let theme = cx.theme();
 
         div().w_full().p_2().child(
             div()
@@ -57,14 +56,14 @@ impl Render for SearchBar {
                 .items_center()
                 .gap_2()
                 .px_2()
-                .bg(theme.card)
+                .bg(theme.list)
                 .border_1()
                 .border_color(theme.border)
                 .rounded_md()
                 .child(
                     Icon::new(IconName::Search)
                         .size_4()
-                        .text_color(theme.text_muted),
+                        .text_color(theme.muted_foreground),
                 )
                 .child(
                     Input::new(&self.input_state)

@@ -1,6 +1,7 @@
 use crate::data::{Contact, MockData};
-use crate::theme::{ActiveTheme, Theme};
+use crate::theme::{is_dark_mode, toggle_theme};
 use gpui::*;
+use gpui_component::theme::{ActiveTheme, Theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterOption {
@@ -27,6 +28,7 @@ impl Sidebar {
         }
     }
 
+    #[allow(dead_code)]
     pub fn selected_filter(mut self, filter: FilterOption) -> Self {
         self.selected_filter = filter;
         self
@@ -47,7 +49,7 @@ impl Sidebar {
 
     fn render_filter_item(label: &'static str, is_selected: bool, theme: &Theme) -> Div {
         let background = if is_selected {
-            theme.selected
+            theme.list_active
         } else {
             theme.sidebar
         };
@@ -59,15 +61,20 @@ impl Sidebar {
             .rounded_md()
             .cursor_pointer()
             .bg(background)
-            .hover(|style| style.bg(theme.card_hover))
+            .hover(|style| style.bg(theme.list_hover))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().text_sm().text_color(theme.text_muted).child("•"))
-                    .child(div().text_sm().text_color(theme.text).child(label)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("•"),
+                    )
+                    .child(div().text_sm().text_color(theme.foreground).child(label)),
             )
     }
 
@@ -81,15 +88,20 @@ impl Sidebar {
             .rounded_md()
             .cursor_pointer()
             .bg(theme.sidebar)
-            .hover(|style| style.bg(theme.card_hover))
+            .hover(|style| style.bg(theme.list_hover))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().text_sm().text_color(theme.text_muted).child("•"))
-                    .child(div().text_sm().text_color(theme.text).child(petname)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("•"),
+                    )
+                    .child(div().text_sm().text_color(theme.foreground).child(petname)),
             )
     }
 
@@ -98,7 +110,7 @@ impl Sidebar {
             div()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_muted)
+                .text_color(theme.muted_foreground)
                 .child(label),
         )
     }
@@ -106,19 +118,53 @@ impl Sidebar {
     fn render_divider(theme: &Theme) -> Div {
         div().my_2().mx_3().h(px(1.0)).bg(theme.border)
     }
+
+    fn render_theme_switcher(theme: &Theme, is_dark: bool) -> Stateful<Div> {
+        let icon = if is_dark { "☀" } else { "☾" };
+        let tooltip = if is_dark {
+            "Switch to light mode"
+        } else {
+            "Switch to dark mode"
+        };
+
+        div()
+            .id("theme-switcher")
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(theme.sidebar)
+            .hover(|style| style.bg(theme.list_hover))
+            .on_click(move |_event, window, cx| {
+                toggle_theme(window, cx);
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_sm().child(icon))
+                    .child(div().text_sm().text_color(theme.foreground).child(tooltip)),
+            )
+    }
 }
 
 impl RenderOnce for Sidebar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.global::<ActiveTheme>();
+        let theme = cx.theme();
+        let is_dark = is_dark_mode(cx);
 
         if self.is_collapsed {
+            let theme_icon = if is_dark { "☀" } else { "☾" };
+
             let mut expand_btn = div()
                 .id("expand-btn")
                 .cursor_pointer()
                 .p_2()
                 .rounded_md()
-                .hover(|style| style.bg(theme.card_hover))
+                .hover(|style| style.bg(theme.list_hover))
                 .child(
                     div()
                         .text_sm()
@@ -133,6 +179,17 @@ impl RenderOnce for Sidebar {
                 });
             }
 
+            let theme_btn = div()
+                .id("theme-btn-collapsed")
+                .cursor_pointer()
+                .p_2()
+                .rounded_md()
+                .hover(|style| style.bg(theme.list_hover))
+                .on_click(move |_event, window, cx| {
+                    toggle_theme(window, cx);
+                })
+                .child(div().text_sm().child(theme_icon));
+
             return div()
                 .flex()
                 .flex_col()
@@ -144,7 +201,9 @@ impl RenderOnce for Sidebar {
                 .border_color(theme.border)
                 .items_center()
                 .pt_2()
-                .child(expand_btn);
+                .child(expand_btn)
+                .child(div().flex_1())
+                .child(div().pb_2().child(theme_btn));
         }
 
         let contacts_except_self: Vec<&Contact> = self
@@ -162,12 +221,12 @@ impl RenderOnce for Sidebar {
             ("Friends", FilterOption::Friends),
         ]
         .into_iter()
-        .map(|(label, filter)| Self::render_filter_item(label, selected_filter == filter, theme))
+        .map(|(label, filter)| Self::render_filter_item(label, selected_filter == filter, &theme))
         .collect();
 
         let contact_items: Vec<Div> = contacts_except_self
             .iter()
-            .map(|contact| Self::render_contact_item(contact, theme))
+            .map(|contact| Self::render_contact_item(contact, &theme))
             .collect();
 
         let mut collapse_btn = div()
@@ -176,8 +235,13 @@ impl RenderOnce for Sidebar {
             .px_2()
             .py_1()
             .rounded_md()
-            .hover(|style| style.bg(theme.card_hover))
-            .child(div().text_xs().text_color(theme.text_muted).child("◀"));
+            .hover(|style| style.bg(theme.list_hover))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("◀"),
+            );
 
         if let Some(on_toggle) = self.on_toggle {
             collapse_btn = collapse_btn.on_click(move |event, window, cx| {
@@ -221,11 +285,18 @@ impl RenderOnce for Sidebar {
                     .flex_1()
                     .overflow_y_scroll()
                     .p_2()
-                    .child(Self::render_section_header("Filters", theme))
+                    .child(Self::render_section_header("Filters", &theme))
                     .children(filter_items)
-                    .child(Self::render_divider(theme))
-                    .child(Self::render_section_header("Contacts", theme))
+                    .child(Self::render_divider(&theme))
+                    .child(Self::render_section_header("Contacts", &theme))
                     .children(contact_items),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(Self::render_theme_switcher(&theme, is_dark)),
             )
     }
 }

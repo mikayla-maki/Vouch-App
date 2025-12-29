@@ -1,5 +1,5 @@
 use crate::data::{ContactId, MockData, Recommendation, RecommendationId};
-use crate::theme::{ActiveTheme, Theme};
+use gpui_component::theme::{ActiveTheme, Theme};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
@@ -43,23 +43,23 @@ impl DetailPanel {
                             .w_16()
                             .h_16()
                             .rounded_full()
-                            .bg(theme.surface)
+                            .bg(theme.muted)
                             .flex()
                             .justify_center()
                             .items_center()
-                            .child(div().text_2xl().text_color(theme.text_muted).child("💭")),
+                            .child(div().text_2xl().text_color(theme.muted_foreground).child("💭")),
                     )
                     .child(
                         div()
                             .text_lg()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text_muted)
+                            .text_color(theme.muted_foreground)
                             .child("Select a recommendation"),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(theme.text_muted)
+                            .text_color(theme.muted_foreground)
                             .child("Click on a vouch in the feed to see details"),
                     ),
             )
@@ -103,13 +103,13 @@ impl DetailPanel {
             .pb_4()
             .border_b_1()
             .border_color(theme.border)
-            .bg(theme.surface)
+            .bg(theme.muted)
             .child(
                 div()
                     .w_24()
                     .h_24()
                     .rounded_full()
-                    .bg(theme.card)
+                    .bg(theme.list)
                     .border_3()
                     .border_color(theme.primary)
                     .flex()
@@ -123,7 +123,7 @@ impl DetailPanel {
                     .mt_4()
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(theme.text)
+                    .text_color(theme.foreground)
                     .text_center()
                     .child(recommendation.subject_name.clone()),
             )
@@ -131,7 +131,7 @@ impl DetailPanel {
                 div()
                     .mt_1()
                     .text_sm()
-                    .text_color(theme.text_muted)
+                    .text_color(theme.muted_foreground)
                     .child(Self::get_subject_category(&recommendation.subject_name)),
             )
     }
@@ -178,13 +178,13 @@ impl DetailPanel {
                             .flex()
                             .justify_center()
                             .items_center()
-                            .child(div().text_xs().text_color(theme.text).child("📝")),
+                            .child(div().text_xs().text_color(theme.foreground).child("📝")),
                     )
                     .child(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child("Recommendation"),
                     ),
             )
@@ -192,7 +192,7 @@ impl DetailPanel {
                 div()
                     .w_full()
                     .p_4()
-                    .bg(theme.card)
+                    .bg(theme.list)
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
@@ -202,7 +202,7 @@ impl DetailPanel {
                             .w_full()
                             .overflow_hidden()
                             .text_base()
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child(div().size_full().child(recommendation.content.clone())),
                     ),
             )
@@ -282,13 +282,13 @@ impl DetailPanel {
                             .flex()
                             .justify_center()
                             .items_center()
-                            .child(div().text_xs().text_color(theme.text).child("🔗")),
+                            .child(div().text_xs().text_color(theme.foreground).child("🔗")),
                     )
                     .child(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child("Vouch Chain"),
                     ),
             )
@@ -322,7 +322,7 @@ impl DetailPanel {
             .p_3()
             .ml_2()
             .bg(if is_primary {
-                theme.surface
+                theme.muted
             } else {
                 theme.background
             })
@@ -350,14 +350,14 @@ impl DetailPanel {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.text_muted)
+                            .text_color(theme.muted_foreground)
                             .child(SharedString::from(label)),
                     )
                     .child(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child(SharedString::from(value.to_string())),
                     )
                     .when(subtitle.is_some(), |this| {
@@ -365,7 +365,7 @@ impl DetailPanel {
                         this.child(
                             div()
                                 .text_xs()
-                                .text_color(theme.text_muted)
+                                .text_color(theme.muted_foreground)
                                 .mt_1()
                                 .child(SharedString::from(sub)),
                         )
@@ -374,7 +374,7 @@ impl DetailPanel {
                         this.child(
                             div()
                                 .text_xs()
-                                .text_color(theme.text_muted)
+                                .text_color(theme.muted_foreground)
                                 .mt_1()
                                 .child(SharedString::from(timestamp.to_string())),
                         )
@@ -412,22 +412,22 @@ impl DetailPanel {
                             .flex()
                             .justify_center()
                             .items_center()
-                            .child(div().text_xs().text_color(theme.text).child("📚")),
+                            .child(div().text_xs().text_color(theme.foreground).child("📚")),
                     )
                     .child(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child(format!("Related Vouches ({})", count)),
                     ),
             )
             .when(count == 0, |this| {
                 this.child(
-                    div().p_4().bg(theme.surface).rounded_md().child(
+                    div().p_4().bg(theme.muted).rounded_md().child(
                         div()
                             .text_sm()
-                            .text_color(theme.text_muted)
+                            .text_color(theme.muted_foreground)
                             .text_center()
                             .child("No other vouches for this subject yet"),
                     ),
@@ -448,12 +448,12 @@ impl DetailPanel {
 
         div()
             .p_3()
-            .bg(theme.card)
+            .bg(theme.list)
             .rounded_md()
             .border_1()
             .border_color(theme.border)
             .cursor_pointer()
-            .hover(|style| style.bg(theme.card_hover))
+            .hover(|style| style.bg(theme.list_hover))
             .child(
                 div()
                     .flex()
@@ -480,11 +480,11 @@ impl DetailPanel {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text)
+                                    .text_color(theme.foreground)
                                     .child(author_name.to_string()),
                             ),
                     )
-                    .child(div().text_sm().text_color(theme.text_muted).child(excerpt)),
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(excerpt)),
             )
     }
 
@@ -499,7 +499,7 @@ impl DetailPanel {
             .p_4()
             .border_t_1()
             .border_color(theme.border)
-            .bg(theme.surface)
+            .bg(theme.muted)
             .mt_auto()
             .child(Self::render_stub_button(
                 "revouch-btn",
@@ -541,7 +541,7 @@ impl DetailPanel {
             .gap_2()
             .px_4()
             .py_2()
-            .bg(theme.card)
+            .bg(theme.list)
             .rounded_lg()
             .cursor_not_allowed()
             .border_2()
@@ -552,7 +552,7 @@ impl DetailPanel {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.text)
+                    .text_color(theme.foreground)
                     .child(label.to_string()),
             )
     }
@@ -703,18 +703,18 @@ impl DetailPanel {
 
 impl RenderOnce for DetailPanel {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.global::<ActiveTheme>();
+        let theme = cx.theme();
 
         match self.selected_id {
             Some(id) => {
                 if let Some(recommendation) = self.data.recommendations.iter().find(|r| r.id == id)
                 {
-                    Self::render_recommendation_detail(recommendation, &self.data, theme)
+                    Self::render_recommendation_detail(recommendation, &self.data, &theme)
                 } else {
-                    Self::render_empty_state(theme)
+                    Self::render_empty_state(&theme)
                 }
             }
-            None => Self::render_empty_state(theme),
+            None => Self::render_empty_state(&theme),
         }
     }
 }

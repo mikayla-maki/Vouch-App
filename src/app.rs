@@ -1,11 +1,11 @@
 use crate::data::{MockData, RecommendationId};
-use crate::theme::ActiveTheme;
 use crate::ui::detail_panel::DetailPanel;
 use crate::ui::feed_panel::FeedPanel;
 use crate::ui::sidebar::Sidebar;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::Root;
+use gpui_component::theme::ActiveTheme;
 
 pub struct VouchApp {
     feed_panel: Entity<FeedPanel>,
@@ -39,7 +39,7 @@ impl VouchApp {
 impl Render for VouchApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_id = self.selected_recommendation_id(cx);
-        let theme = cx.global::<ActiveTheme>();
+        let theme = cx.theme();
 
         div()
             .relative()

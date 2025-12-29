@@ -1,10 +1,10 @@
 use crate::data::{MockData, RecommendationId};
-use crate::theme::{ActiveTheme, Theme};
 use crate::ui::modals::NewRecommendationModal;
 use crate::ui::record_card::RecordCard;
 use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 
 use gpui::*;
+use gpui_component::theme::{ActiveTheme, Theme};
 
 // TODO: When recommendations can change (add/edit/delete), we need to invalidate
 // the cached filtered IDs. Options to consider:
@@ -48,6 +48,7 @@ impl FeedPanel {
         }
     }
 
+    #[allow(dead_code)]
     pub fn select(&mut self, id: Option<RecommendationId>) {
         self.selected_id = id;
     }
@@ -56,6 +57,7 @@ impl FeedPanel {
         self.selected_id
     }
 
+    #[allow(dead_code)]
     pub fn data(&self) -> &MockData {
         &self.data
     }
@@ -119,13 +121,13 @@ impl FeedPanel {
                     recommendation,
                     is_selected,
                     &self.data,
-                    cx.global::<ActiveTheme>(),
+                    cx.theme(),
                 ));
 
             cards.push(card);
         }
 
-        let theme = cx.global::<ActiveTheme>().clone();
+        let theme = cx.theme();
 
         if cards.is_empty() {
             div()
@@ -139,7 +141,7 @@ impl FeedPanel {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme.text_muted)
+                        .text_color(theme.muted_foreground)
                         .child("No recommendations found"),
                 )
         } else {
@@ -183,12 +185,17 @@ impl FeedPanel {
                             .justify_center()
                             .items_center()
                             .gap_2()
-                            .child(div().text_sm().text_color(theme.text).child("+"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.primary_foreground)
+                                    .child("+"),
+                            )
                             .child(
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text)
+                                    .text_color(theme.primary_foreground)
                                     .child("New Vouch"),
                             ),
                     ),
@@ -198,7 +205,7 @@ impl FeedPanel {
 
 impl Render for FeedPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.global::<ActiveTheme>().clone();
+        let theme = cx.theme().clone();
 
         div()
             .flex()

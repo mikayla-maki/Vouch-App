@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 pub struct Contact {
     pub id: ContactId,
     pub petname: SharedString,
+    #[allow(dead_code)]
     pub public_key: SharedString,
 }
 
@@ -15,6 +16,7 @@ pub struct ContactId(pub u64);
 pub struct RecordSource {
     pub original_author: ContactId,
     pub received_via: Option<ContactId>,
+    #[allow(dead_code)]
     pub is_revouch: bool,
     pub revouched_by: Vec<ContactId>,
     pub timestamp: SystemTime,

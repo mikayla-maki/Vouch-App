@@ -1,7 +1,7 @@
 use crate::data::{MockData, Recommendation};
-use crate::theme::Theme;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::theme::Theme;
 use std::time::SystemTime;
 
 pub struct RecordCard;
@@ -75,9 +75,9 @@ impl RecordCard {
         theme: &Theme,
     ) -> impl IntoElement {
         let background = if is_selected {
-            theme.selected
+            theme.list_active
         } else {
-            theme.card
+            theme.list
         };
 
         let subject_name = recommendation.subject_name.clone();
@@ -97,7 +97,7 @@ impl RecordCard {
             .rounded_lg()
             .cursor_pointer()
             .when(!is_selected, |this| {
-                this.hover(|style| style.bg(theme.card_hover))
+                this.hover(|style| style.bg(theme.list_hover))
             })
             .child(
                 div()
@@ -108,13 +108,13 @@ impl RecordCard {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child(subject_name),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(theme.text_muted)
+                            .text_color(theme.muted_foreground)
                             .child(content_preview),
                     )
                     .child(
@@ -129,11 +129,16 @@ impl RecordCard {
                                     .text_color(theme.primary_hover)
                                     .child(attribution),
                             )
-                            .child(div().text_xs().text_color(theme.text_muted).child("•"))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(theme.text_muted)
+                                    .text_color(theme.muted_foreground)
+                                    .child("•"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
                                     .child(timestamp),
                             ),
                     ),

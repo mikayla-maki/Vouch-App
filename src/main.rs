@@ -1,6 +1,6 @@
 use gpui::*;
 use gpui_component::Root;
-use gpui_component::theme::{Theme, ThemeMode};
+use gpui_component::theme::{Theme, ThemeMode, ThemeSet};
 
 mod app;
 mod assets;
@@ -10,28 +10,36 @@ mod ui;
 
 use app::VouchApp;
 use assets::Assets;
-use theme::ActiveTheme;
 
 actions!(vouch, [Quit]);
+
+fn load_vouch_theme(cx: &mut App) {
+    let theme_json = include_str!("../themes/vouch.json");
+    match serde_json::from_str::<ThemeSet>(theme_json) {
+        Ok(theme_set) => {
+            for theme_config in theme_set.themes {
+                let mode = theme_config.mode;
+                let rc_config = std::rc::Rc::new(theme_config);
+
+                if mode == ThemeMode::Light {
+                    Theme::global_mut(cx).light_theme = rc_config.clone();
+                } else {
+                    Theme::global_mut(cx).dark_theme = rc_config.clone();
+                }
+            }
+            Theme::change(ThemeMode::Light, None, cx);
+        }
+        Err(e) => {
+            eprintln!("Failed to parse Vouch theme: {}", e);
+        }
+    }
+}
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
 
-        // Force gpui-component's theme to light mode so Input text is dark
-        Theme::change(ThemeMode::Light, None, cx);
-
-        cx.set_global(ActiveTheme::light());
-
-        let mut previous_theme_name: &'static str = "light";
-        cx.observe_global::<ActiveTheme>(move |cx| {
-            let current_name = cx.global::<ActiveTheme>().name;
-            if current_name != previous_theme_name {
-                previous_theme_name = current_name;
-                cx.refresh_windows();
-            }
-        })
-        .detach();
+        load_vouch_theme(cx);
 
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());

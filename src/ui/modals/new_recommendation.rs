@@ -2,9 +2,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::WindowExt;
 use gpui_component::input::{Input, InputState};
+use gpui_component::theme::ActiveTheme;
 
 use crate::data::MockData;
-use crate::theme::ActiveTheme;
 
 pub struct NewRecommendationModal;
 
@@ -82,7 +82,7 @@ impl NewRecommendationForm {
 
 impl RenderOnce for NewRecommendationForm {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.global::<ActiveTheme>().clone();
+        let theme = cx.theme();
 
         div()
             .flex()
@@ -98,7 +98,7 @@ impl RenderOnce for NewRecommendationForm {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child("Subject"),
                     )
                     .child(Input::new(&self.subject_state))
@@ -106,7 +106,7 @@ impl RenderOnce for NewRecommendationForm {
                         this.child(
                             div()
                                 .text_xs()
-                                .text_color(theme.text_muted)
+                                .text_color(theme.muted_foreground)
                                 .child("Existing subjects: ")
                                 .child(
                                     self.subject_suggestions
@@ -128,7 +128,7 @@ impl RenderOnce for NewRecommendationForm {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text)
+                            .text_color(theme.foreground)
                             .child("Your Recommendation"),
                     )
                     .child(Input::new(&self.content_state)),
