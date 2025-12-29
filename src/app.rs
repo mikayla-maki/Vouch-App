@@ -8,6 +8,7 @@ use gpui::*;
 pub struct VouchApp {
     feed_panel: Entity<FeedPanel>,
     data: MockData,
+    sidebar_collapsed: bool,
 }
 
 impl VouchApp {
@@ -16,11 +17,20 @@ impl VouchApp {
 
         let feed_panel = cx.new(|cx| FeedPanel::new(data.clone(), window, cx));
 
-        Self { feed_panel, data }
+        Self {
+            feed_panel,
+            data,
+            sidebar_collapsed: true,
+        }
     }
 
     fn selected_recommendation_id(&self, cx: &App) -> Option<RecommendationId> {
         self.feed_panel.read(cx).selected_id()
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
     }
 }
 
@@ -34,7 +44,13 @@ impl Render for VouchApp {
             .flex_row()
             .size_full()
             .bg(theme.background)
-            .child(Sidebar::new(self.data.clone()))
+            .child(
+                Sidebar::new(self.data.clone())
+                    .collapsed(self.sidebar_collapsed)
+                    .on_toggle(cx.listener(|this, _, _window, cx| {
+                        this.toggle_sidebar(cx);
+                    })),
+            )
             .child(self.feed_panel.clone())
             .child(DetailPanel::new(self.data.clone()).selected(selected_id))
     }

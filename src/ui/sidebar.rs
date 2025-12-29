@@ -14,6 +14,7 @@ pub struct Sidebar {
     data: MockData,
     selected_filter: FilterOption,
     is_collapsed: bool,
+    on_toggle: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl Sidebar {
@@ -22,6 +23,7 @@ impl Sidebar {
             data,
             selected_filter: FilterOption::All,
             is_collapsed: false,
+            on_toggle: None,
         }
     }
 
@@ -32,6 +34,14 @@ impl Sidebar {
 
     pub fn collapsed(mut self, collapsed: bool) -> Self {
         self.is_collapsed = collapsed;
+        self
+    }
+
+    pub fn on_toggle(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle = Some(Box::new(handler));
         self
     }
 
@@ -96,58 +106,6 @@ impl Sidebar {
     fn render_divider(theme: &Theme) -> Div {
         div().my_2().mx_3().h(px(1.0)).bg(theme.border)
     }
-
-    fn render_header(theme: &Theme) -> Div {
-        div()
-            .flex()
-            .flex_row()
-            .justify_between()
-            .items_center()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.primary_hover)
-                    .child("Vouch"),
-            )
-            .child(
-                div()
-                    .id("collapse-btn")
-                    .cursor_pointer()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .hover(|style| style.bg(theme.card_hover))
-                    .child(div().text_xs().text_color(theme.text_muted).child("◀")),
-            )
-    }
-
-    fn render_collapsed(theme: &Theme) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .h_full()
-            .w_10()
-            .min_w_10()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.border)
-            .items_center()
-            .pt_2()
-            .child(
-                div()
-                    .id("expand-btn")
-                    .cursor_pointer()
-                    .p_2()
-                    .rounded_md()
-                    .hover(|style| style.bg(theme.card_hover))
-                    .child(div().text_xs().text_color(theme.text_muted).child("▶")),
-            )
-    }
 }
 
 impl RenderOnce for Sidebar {
@@ -155,7 +113,38 @@ impl RenderOnce for Sidebar {
         let theme = cx.global::<ActiveTheme>();
 
         if self.is_collapsed {
-            return Self::render_collapsed(theme);
+            let mut expand_btn = div()
+                .id("expand-btn")
+                .cursor_pointer()
+                .p_2()
+                .rounded_md()
+                .hover(|style| style.bg(theme.card_hover))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.primary_hover)
+                        .child("V"),
+                );
+
+            if let Some(on_toggle) = self.on_toggle {
+                expand_btn = expand_btn.on_click(move |event, window, cx| {
+                    on_toggle(event, window, cx);
+                });
+            }
+
+            return div()
+                .flex()
+                .flex_col()
+                .h_full()
+                .w_10()
+                .min_w_10()
+                .bg(theme.sidebar)
+                .border_r_1()
+                .border_color(theme.border)
+                .items_center()
+                .pt_2()
+                .child(expand_btn);
         }
 
         let contacts_except_self: Vec<&Contact> = self
@@ -181,6 +170,39 @@ impl RenderOnce for Sidebar {
             .map(|contact| Self::render_contact_item(contact, theme))
             .collect();
 
+        let mut collapse_btn = div()
+            .id("collapse-btn")
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .hover(|style| style.bg(theme.card_hover))
+            .child(div().text_xs().text_color(theme.text_muted).child("◀"));
+
+        if let Some(on_toggle) = self.on_toggle {
+            collapse_btn = collapse_btn.on_click(move |event, window, cx| {
+                on_toggle(event, window, cx);
+            });
+        }
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .items_center()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.primary_hover)
+                    .child("Vouch"),
+            )
+            .child(collapse_btn);
+
         div()
             .flex()
             .flex_col()
@@ -190,7 +212,7 @@ impl RenderOnce for Sidebar {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
-            .child(Self::render_header(theme))
+            .child(header)
             .child(
                 div()
                     .id("sidebar-content")
