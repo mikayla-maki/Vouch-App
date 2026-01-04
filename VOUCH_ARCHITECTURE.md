@@ -243,7 +243,7 @@ struct RecommendationId {
 
 ### Local Storage
 
-Conceptually, local storage has three layers:
+All local data is persisted in a SQLite database. Conceptually, local storage has three layers:
 
 **1. Event Log (Source of Truth)**
 
