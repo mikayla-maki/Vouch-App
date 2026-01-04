@@ -2,41 +2,91 @@
 
 Vouch is a local-first, privacy-preserving database of recommendations by you and your trusted friends.
 
+## Terminology
+
+| Term | Meaning |
+|------|---------|
+| **Rec** | A recommendation—the core content unit (short for "recommendation") |
+| **Database** | An event log owned by an identity. One user can have multiple databases for different topics. |
+| **Subscription** | Following a database to replicate its events locally. |
+| **Revouch** | Rehosting a rec from a subscribed database into your own database. An endorsement AND a durability decision. |
+
 ## Overview
 
 Vouch enables users to:
-- Create and manage recommendations locally
-- Connect with other Vouch users via E2E encrypted channels
-- Share recommendations with specific contacts or all contacts
-- Reshare (revouch) recommendations received from others
-- Disconnect from or block contacts and disavow their recommendations
+- Create and manage recommendations locally in their own database(s)
+- Subscribe to other users' databases to see their recs
+- Revouch (rehost) recs from subscriptions into their own database
+- Maintain multiple databases for different topics or audiences
+- Disconnect from or block databases and disavow recs
 
 The system is built on three pillars:
 1. **Local-first**: Your data lives on your device. The network is for sync, not storage.
 2. **Privacy by design**: E2E encryption for all sync. You control what you share.
-3. **Trust through relationships**: Recommendations flow through your personal network, not algorithms.
+3. **Trust through relationships**: Recs flow through your personal network, not algorithms.
 
 ## Core Concepts
+
+### The Database Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        YOUR LOCAL STORAGE                        │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐   ┌──────────────────┐                    │
+│  │  YOUR DATABASE   │   │  YOUR DATABASE   │                    │
+│  │  (Food Recs)     │   │  (Sports Recs)   │   ← LOCAL          │
+│  │                  │   │                  │     (you are the   │
+│  │  - Your recs     │   │  - Your recs     │      source of     │
+│  │  - Your revouches│   │  - Your revouches│      truth)        │
+│  └──────────────────┘   └──────────────────┘                    │
+│                                                                  │
+│  ┌──────────────────┐   ┌──────────────────┐                    │
+│  │ ALICE'S DATABASE │   │  CONSUMER CORP   │   ← SUBSCRIBED     │
+│  │                  │   │    DATABASE      │     (they are the  │
+│  │  - Her recs      │   │                  │      source of     │
+│  │  - Her revouches │   │  - Their reviews │      truth)        │
+│  └──────────────────┘   └──────────────────┘                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key semantics:**
+- **Local databases**: Append-only event logs you control. This is YOUR data. You can have multiple for different topics/audiences. You are the source of truth.
+- **Subscribed databases**: Local replicas of others' databases. They are the source of truth. You store these events locally for offline access.
+- **Revouch = rehost**: Explicitly copies a rec from a subscribed database INTO your local database. Now it's yours. You're endorsing it AND taking storage responsibility.
+
+**Why databases instead of per-user connections?**
+
+The previous model defined event logs *between* individual users, requiring explicit per-user decisions for every rec. This made several things awkward:
+- Where do your recs go when you have no connections? (Special-cased "personal log")
+- How do you share with many people at once? (User groups, complex ACLs)
+- How do you subscribe to public sources like Consumer Reports? (Different mechanism)
+
+With databases:
+- Your database exists whether you have zero subscribers or a million
+- Subscribing to a friend works exactly like subscribing to Consumer Reports
+- Topic separation = multiple databases (no per-rec ACLs needed)
+- Revouch is an explicit trust/durability boundary, not automatic sync
 
 ### Petnames
 
 User identity follows the [petname system](https://files.spritely.institute/papers/petnames.html):
 
-- **Identifier**: An opaque, globally unique, decentralized identifier (e.g., a public key or UUID)
+- **Identifier**: An opaque, globally unique, decentralized identifier (e.g., a public key)
 - **Petname**: A local, human-readable name you assign to a contact (e.g., "Mom", "College Roommate")
 - **Self-proposed name**: The name a user broadcasts as their preferred display name
 
 You see your petnames. Others see theirs. There's no global namespace to fight over.
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Your View          │  Alice's View             │
-├─────────────────────┼───────────────────────────┤
-│  "Mom" ──────────── │ ──────────── "Me"         │
-│  "Alice" ────────── │ ──────────── "Best Friend"│
-│  "Thai Place Guy" ─ │ ─────────── "Valued Cust" │
-└─────────────────────────────────────────────────┘
-        Same identifiers, different petnames
+┌─────────────────────────────────────────────────────────────┐
+│  Your View              │  Alice's View                     │
+├─────────────────────────┼───────────────────────────────────┤
+│  "Mom" ──────────────── │ ──────────────────────── "Me"     │
+│  "Alice" ────────────── │ ──────────────────── "Best Friend"│
+│  "Thai Place Guy" ───── │ ─────────────────── "Valued Cust" │
+└─────────────────────────────────────────────────────────────┘
+            Same identifiers, different petnames
 ```
 
 ### Convergent Event Sourcing
@@ -44,39 +94,37 @@ You see your petnames. Others see theirs. There's no global namespace to fight o
 Vouch uses event sourcing with **eventually consistent** semantics:
 
 - All state changes are captured as immutable events
-- Events are replicated across devices and contacts
+- Events are replicated across devices and subscriptions
 - When any two nodes see the same set of events, they converge to the same state
 - Order of event arrival doesn't matter—only the final set
 
 This is achieved through:
-- **Monotonic operations**: Events only add information (vouches, reactions) or mark things as invalid (disavowals via tombstones)
-- **Content-addressed data**: Recommendations are identified by their content hash, enabling deduplication
+- **Monotonic operations**: Events only add information (recs, reactions) or mark things as invalid (disavowals via tombstones)
+- **Content-addressed data**: Recs are identified by their content hash, enabling deduplication
 - **Tombstone strategy**: Disavowals are stored even if the target event hasn't arrived yet
 
 ## Data Model
 
 ### Content Hash as Primary Identifier
 
-Recommendations are identified by the hash of their content:
+Recs are identified by the hash of their content:
 
 ```rust
-/// The actual recommendation content, hashed for identity
+/// The actual rec content, hashed for identity
 struct RecommendationContent {
-    subject: String,        // The entity being discussed
-    recommendation: String, // The actual recommendation 
+    subject: String,     // The entity being discussed
+    body: String,        // The actual recommendation text
 }
 
-/// A content hash uniquely identifies recommendation content
-/// ContentHash = hash(subject, recommendation)
+/// A content hash uniquely identifies rec content
+/// ContentHash = hash(subject, body)
 struct ContentHash(Vec<u8>);
 ```
 
 This enables:
-- **Deduplication**: Same recommendation from multiple contacts is recognized as identical
+- **Deduplication**: Same rec from multiple databases is recognized as identical
 - **Stable references**: Reactions and disavowals reference content that won't change
-- **Verification in adversarial networks**: Even trusted networks have bad actors. When Bob revouches "Alice's recommendation," you can verify he didn't alter the text by checking `hash(content) == original_hash`. This is especially important for multi-hop trust where you don't know the original author directly.
-
-Note: We inline full content in events (no round-trips) but include content hashes for verification and deduplication. The hash is a trust primitive, not just an optimization.
+- **Verification**: When Bob revouches "Alice's rec," you can verify he didn't alter the text by checking `hash(content) == original_hash`
 
 ### User Identity and Cryptographic Signing
 
@@ -89,8 +137,8 @@ struct UserIdentifier(PublicKey);
 /// A contact in your local address book
 struct Contact {
     identifier: UserIdentifier,
-    petname: String,  // Your local name for them
-    self_proposed_name: Option<String>,  // What they call themselves
+    petname: String,
+    self_proposed_name: Option<String>,
 }
 ```
 
@@ -98,51 +146,101 @@ struct Contact {
 
 Content hashes verify *what* was said. Signatures verify *who* said it.
 
-Without signatures, Bob could fabricate "Alice's vouch" and Carol would have no way to verify Alice actually authored it. With signatures, every event carries cryptographic proof of authorship that anyone can verify using the author's public key (their `UserIdentifier`).
+Without signatures, Bob could fabricate "Alice's rec" and Carol would have no way to verify Alice actually authored it. With signatures, every event carries cryptographic proof of authorship that anyone can verify using the author's public key.
+
+### Databases
+
+A database is an event log owned by an identity. Each user has at least one database (their default), but can create additional databases for topic separation.
+
+```rust
+/// A database is an event log owned by an identity
+struct Database {
+    /// Unique identifier for this database
+    id: DatabaseId,
+    
+    /// The identity that owns this database (signs all events)
+    owner: UserIdentifier,
+    
+    /// Human-readable name for the database
+    name: String,
+    
+    /// Optional description
+    description: Option<String>,
+    
+    /// Whether this is a local (owned) or subscribed database
+    is_local: bool,
+}
+
+/// Unique database identifier (could be hash of owner + name + creation time)
+struct DatabaseId(Vec<u8>);
+```
+
+**Multiple databases per user:**
+
+Bob might have:
+- "Bob's Food Recs" (shared with foodie friends)
+- "Bob's Sports Takes" (shared with sports friends)
+- "Bob's Private Notes" (no subscribers)
+
+These are treated as independent entities on the network. Carol can subscribe to one without the other.
+
+**Identity linking:**
+
+For v1, databases from the same owner are linkable (same `UserIdentifier`). This is convenient ("show me all of Bob's databases") but reduces privacy. We may revisit this for users who want unlinkable pseudonymous databases.
 
 ### Events
 
-All state changes flow through the event system. Every event is signed by its author.
+All state changes flow through the event system. Every event is signed by the database owner.
 
 ```rust
-/// A single event in a contact connection
+/// A single event in a database
 struct VouchEvent {
-    /// Who authored this event (their public key)
+    /// Which database this event belongs to
+    database_id: DatabaseId,
+    
+    /// Who authored this event (must be database owner)
     author: UserIdentifier,
-    /// Per-author ordering for sync
+    
+    /// Per-database sequence number for sync
     sequence: u64,
+    
     /// When this event was created
     timestamp: Timestamp,
+    
     /// The actual event payload
     payload: VouchEventPayload,
-    /// Cryptographic signature: sign(private_key, hash(author + sequence + timestamp + payload))
+    
+    /// Cryptographic signature
     signature: Signature,
 }
 
 enum VouchEventPayload {
-    /// A new recommendation you're making
-    Vouch(RecommendationContent),
+    /// A new rec you're making
+    Rec(RecommendationContent),
     
-    /// Resharing someone else's recommendation
+    /// Rehosting someone else's rec into your database
     Revouch {
-        original_author: UserIdentifier,
-        original_signature: Signature,  // Proves original author actually said this
-        content: RecommendationContent,  // Embedded for simplicity
+        /// The database this rec came from
+        source_database: DatabaseId,
+        /// Original author's signature (proves authenticity)
+        original_signature: Signature,
+        /// The rec content (embedded for simplicity)
+        content: RecommendationContent,
     },
     
-    /// Update your own profile (name, picture, etc.)
-    UpdateProfile {
+    /// Update your database metadata
+    UpdateDatabase {
         name: String,
-        picture: Option<ContentHash>,  // References CAS for heavy content
+        picture: Option<ContentHash>,
     },
     
-    /// Marking a recommendation as retracted/untrusted
+    /// Mark a rec as retracted/untrusted
     Disavow {
-        author: UserIdentifier,      // Whose recommendation
-        content_hash: ContentHash,   // Which one
+        author: UserIdentifier,
+        content_hash: ContentHash,
     },
     
-    /// A reaction to a recommendation
+    /// A reaction to a rec
     React {
         author: UserIdentifier,
         content_hash: ContentHash,
@@ -150,131 +248,124 @@ enum VouchEventPayload {
     },
 }
 
-/// Simple emoji reactions
 enum Reaction {
     ThumbsUp,
     ThumbsDown,
     Laugh,
     Heart,
-    // etc.
 }
 ```
 
-**Verification chain for revouches:**
+**Revouch verification chain:**
 
-1. Alice vouches for Restaurant X, signs with her private key
-2. Bob revouches, including Alice's original signature
-3. Carol receives Bob's revouch and verifies:
+1. Alice creates a rec in her database, signs with her private key
+2. Bob subscribes to Alice's database, sees her rec
+3. Bob revouches into his database, including Alice's original signature
+4. Carol subscribes to Bob's database and verifies:
    - Bob's signature on the revouch event ✓
    - Alice's original signature on the content ✓
-4. Carol now has cryptographic proof of the entire chain
+5. Carol now has cryptographic proof of the entire chain
 
-### Contact Connections
+### Subscriptions
 
-Each contact connection has a single shared event log—the conversation between you:
+A subscription is a sync relationship with another database.
 
 ```rust
-/// The sync state with a single contact
-struct ContactConnection {
-    contact: UserIdentifier,
+/// A subscription to another database
+struct Subscription {
+    /// The database you're subscribed to
+    database_id: DatabaseId,
     
-    /// All events in this connection (both yours and theirs)
-    events: Vec<VouchEvent>,
+    /// The database owner (for verification)
+    owner: UserIdentifier,
     
-    /// Sync state: highest sequence we've sent that they've acknowledged
-    my_acked_sequence: u64,
+    /// Your petname for this subscription
+    petname: String,
     
-    /// Sync state: highest sequence we've processed from them
-    their_processed_sequence: u64,
+    /// Sync state: highest sequence you've received
+    last_synced_sequence: u64,
+    
+    /// Whether sync is active
+    status: SubscriptionStatus,
+}
+
+enum SubscriptionStatus {
+    Active,
+    Paused,
+    Blocked,
 }
 ```
 
-The event log is a unified view of the conversation. Each event is tagged with its `author`, and sequence numbers are per-author for sync purposes.
+**Local vs Subscribed databases:**
+
+All events are stored the same way. The difference is ownership:
+- **Local databases**: You create events. You are the source of truth.
+- **Subscribed databases**: You replicate events. They are the source of truth.
+
+**Subscribe vs Revouch:**
+
+| Action | Meaning | Where it lives | Durability |
+|--------|---------|----------------|------------|
+| **Subscribe** | "I want to see this" | Subscribed database | Depends on source |
+| **Revouch** | "I endorse this AND host it" | Your local database | You control |
 
 ## Sync Protocol
 
 ### Transport Abstraction
 
-The sync layer is transport-agnostic. Implementation can be swapped without changing application logic:
+The sync layer is transport-agnostic:
 
 ```rust
 #[async_trait]
-trait ContactTransport {
-    /// Send events to a contact
-    async fn send_events(
+trait DatabaseTransport {
+    /// Fetch events from a database since a sequence number
+    async fn fetch_events(
         &self,
-        contact: &UserIdentifier,
-        events: Vec<VouchEvent>,
-    ) -> Result<()>;
-    
-    /// Receive incoming events (blocks until available)
-    async fn receive_events(&self) -> Result<(UserIdentifier, Vec<VouchEvent>)>;
-    
-    /// Request events from a contact starting from a sequence number
-    async fn request_events_since(
-        &self,
-        contact: &UserIdentifier,
+        database: &DatabaseId,
         since_sequence: u64,
     ) -> Result<Vec<VouchEvent>>;
     
-    /// Acknowledge receipt of events up to a sequence number
-    async fn acknowledge(
+    /// Publish events to your own database (for subscribers to fetch)
+    async fn publish_events(
         &self,
-        contact: &UserIdentifier,
-        up_to_sequence: u64,
+        database: &DatabaseId,
+        events: Vec<VouchEvent>,
     ) -> Result<()>;
+    
+    /// Subscribe to real-time updates from a database
+    async fn subscribe(
+        &self,
+        database: &DatabaseId,
+    ) -> Result<EventStream>;
 }
 ```
 
-### Transport Options
-
-| Phase | Transport | Notes |
-|-------|-----------|-------|
-| **v1 (now)** | Custom relay server | Simple WebSocket server, routes by user ID |
-| **v2** | Add E2EE | Olm/Megolm libraries, still custom relay |
-| **Future** | Matrix federation | If we want decentralized relays |
-| **Future** | P2P (libp2p) | For true serverless sync |
-
 ### Sync Flow
 
-```
-┌─────────┐                    ┌─────────┐
-│  You    │                    │  Alice  │
-└────┬────┘                    └────┬────┘
-     │                              │
-     │  1. New Vouch event          │
-     │  (your sequence: 47)         │
-     ├─────────────────────────────►│
-     │                              │
-     │  2. ACK your sequence 47     │
-     │◄─────────────────────────────┤
-     │                              │
-     │  3. Alice's new Revouch      │
-     │  (her sequence: 23)          │
-     │◄─────────────────────────────┤
-     │                              │
-     │  4. ACK her sequence 23      │
-     ├─────────────────────────────►│
-     │                              │
-```
+**Publishing (your databases):**
+1. Create event locally, sign it, append to your database
+2. Publish to relay/storage for subscribers to fetch
+3. Subscribers pull on their own schedule
 
-### Handling Offline / Reconnection
+**Subscribing (others' databases):**
+1. Request events since your last synced sequence
+2. Verify signatures on received events
+3. Store events locally
+4. Update sync state
 
-When reconnecting after being offline:
-
-1. Exchange current sequence numbers: "I've seen up to your sequence 45"
-2. Each side sends events the other hasn't seen
-3. Process incoming events, update local state
-4. Acknowledge receipt
+**Handling offline:**
+1. Work with locally stored data while offline
+2. On reconnect, fetch missed events from subscribed databases
+3. Publish any events you created while offline
 
 Events are idempotent—receiving the same event twice is harmless.
 
 ### Tombstone Handling
 
-When a `Disavow` event arrives before the target `Vouch`:
+When a `Disavow` event arrives before the target `Rec`:
 
 1. Store the tombstone: `(author, content_hash) → tombstoned`
-2. When the `Vouch` eventually arrives, check tombstone set
+2. When the `Rec` eventually arrives, check tombstone set
 3. If tombstoned, mark as disavowed immediately
 
 This ensures convergence regardless of event arrival order.
@@ -286,67 +377,81 @@ This ensures convergence regardless of event arrival order.
 Events are persisted to SQLite as the authoritative record:
 
 ```sql
-CREATE TABLE events (
-    id INTEGER PRIMARY KEY,
-    contact_id BLOB NOT NULL,         -- Which contact connection
-    author_id BLOB NOT NULL,          -- Who authored this event
-    sequence INTEGER NOT NULL,        -- Per-author sequence number
-    timestamp INTEGER NOT NULL,
-    event_type TEXT NOT NULL,
-    payload BLOB NOT NULL,            -- JSON or msgpack
-    UNIQUE(contact_id, author_id, sequence)
+-- All databases (local and subscribed)
+CREATE TABLE databases (
+    id BLOB PRIMARY KEY,
+    owner_id BLOB NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_local BOOLEAN NOT NULL,  -- TRUE = you own it, FALSE = subscribed
+    last_synced_sequence INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
 );
 
+-- All events (from local and subscribed databases)
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY,
+    database_id BLOB NOT NULL,
+    author_id BLOB NOT NULL,
+    sequence INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    signature BLOB NOT NULL,
+    UNIQUE(database_id, sequence),
+    FOREIGN KEY (database_id) REFERENCES databases(id)
+);
+
+-- Tombstones (applies to all databases)
 CREATE TABLE tombstones (
     author_id BLOB NOT NULL,
     content_hash BLOB NOT NULL,
     tombstoned_at INTEGER NOT NULL,
     PRIMARY KEY (author_id, content_hash)
 );
-
-CREATE TABLE sync_state (
-    contact_id BLOB PRIMARY KEY,
-    my_acked_sequence INTEGER NOT NULL DEFAULT 0,
-    their_processed_sequence INTEGER NOT NULL DEFAULT 0
-);
 ```
+
+Events are events—whether from a local or subscribed database, they're stored the same way. The `databases.is_local` field tells you who the source of truth is.
 
 ### Materialized View (Query Layer)
 
 Events are projected into a queryable format:
 
 ```sql
-CREATE TABLE recommendations (
+-- Deduplicated rec content
+CREATE TABLE recs (
     content_hash BLOB PRIMARY KEY,
     subject TEXT NOT NULL,
-    recommendation TEXT NOT NULL,
+    body TEXT NOT NULL,
     first_seen_at INTEGER NOT NULL
 );
 
-CREATE TABLE recommendation_sources (
+-- Who has this rec (original or revouch)
+CREATE TABLE rec_sources (
     content_hash BLOB NOT NULL,
+    database_id BLOB NOT NULL,
     author_id BLOB NOT NULL,
     is_revouch BOOLEAN NOT NULL,
-    original_author_id BLOB,          -- NULL if not a revouch
-    received_at INTEGER NOT NULL,
+    source_database_id BLOB,  -- NULL if original, set if revouch
+    event_sequence INTEGER NOT NULL,
     is_disavowed BOOLEAN NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (content_hash, author_id)
+    PRIMARY KEY (content_hash, database_id)
 );
 
+-- Reactions
 CREATE TABLE reactions (
     content_hash BLOB NOT NULL,
-    author_id BLOB NOT NULL,
     reactor_id BLOB NOT NULL,
     reaction TEXT NOT NULL,
     reacted_at INTEGER NOT NULL,
-    PRIMARY KEY (content_hash, author_id, reactor_id)
+    PRIMARY KEY (content_hash, reactor_id)
 );
 
+-- Contact book (identities you've named)
 CREATE TABLE contacts (
     identifier BLOB PRIMARY KEY,
     petname TEXT NOT NULL,
     self_proposed_name TEXT,
-    connection_status TEXT NOT NULL,  -- 'connected', 'disconnected', 'blocked'
     created_at INTEGER NOT NULL
 );
 ```
@@ -355,49 +460,82 @@ CREATE TABLE contacts (
 
 The UI subscribes to query results. When events arrive and update the materialized view, affected queries re-run and the UI updates automatically. This follows the [LiveStore pattern](https://docs.livestore.dev/evaluation/how-livestore-works/).
 
+## The Merged Feed View
+
+The UI shows a unified view of all databases (local + subscribed):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Your Feed (merged view)                                        │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ 🍜 Thai Place Downtown                                  │    │
+│  │ "Best pad thai I've ever had..."                        │    │
+│  │ from: Alice's Recs • 2 hours ago                        │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ 🔧 John's Auto                                          │    │
+│  │ "Honest mechanic, fair prices"                          │    │
+│  │ from: Your Food Recs (revouched from Bob) • 1 day ago   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ ⭐ Consumer Reports Rating                               │    │
+│  │ "Top-rated vacuum cleaner 2024"                         │    │
+│  │ from: Consumer Reports • 3 days ago                     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Each rec shows:
+- The content (subject + body)
+- The source database (with your petname)
+- If it's a revouch, the original source
+- Timestamp
+
+Users can filter by database, search, etc.
+
 ## Blocking and Disconnecting
 
-### Disconnect
+### Unsubscribe
 
-- Stop syncing with the contact
-- Keep their historical recommendations visible
-- No events broadcast to other contacts
-- Can reconnect later and resume sync
+- Stop syncing with the database
+- Keep stored events for now (can view history)
+- Can resubscribe later and resume sync
 
 ### Block
 
-- Stop syncing with the contact
-- Filter all their content from your view (query-time filter, data retained)
-- Broadcast `Disavow` tombstones for any content you revouched from them
-- Your other contacts see you've retracted those reshares
+- Stop syncing with the database
+- Delete all events from that database
+- Broadcast `Disavow` events for any recs you revouched from them
+- Add to blocklist (won't accidentally resubscribe)
 
-### Disavow (Single Recommendation)
+### Disavow (Single Rec)
 
-- Broadcast a `Disavow` event to your contacts
-- If you had revouched it, your contacts see the retraction
-- Original content remains in event log (tombstoned)
+- Append a `Disavow` event to your database
+- If you had revouched it, subscribers see the retraction
+- Original content remains tombstoned
 
 ## V1 Scope
 
-For the initial implementation, focus on:
-
 ### Must Have
-- [ ] Local recommendation CRUD (create, view, edit, delete)
+- [ ] Local rec CRUD (create, view, edit via disavow + new rec)
+- [ ] Single default database per user
 - [ ] SQLite persistence (event log + materialized view)
-- [ ] Basic contact management (add, remove, petnames)
+- [ ] Basic subscription management (subscribe, unsubscribe)
+- [ ] Rec and Revouch events
+- [ ] Disavow events
 - [ ] Simple sync over WebSocket relay
-- [ ] Vouch and Revouch events
-- [ ] Disavow events (single recommendation)
 
 ### Deferred
+- Multiple databases per user
 - E2E encryption (use TLS for relay connection initially)
 - Multi-device sync for same user
 - Reactions
-- Tags/categories for recommendations
+- Tags/categories for recs
 - Multi-hop trust queries ("friends of friends")
-- Block (vs disconnect) semantics
+- Block semantics
 - Key rotation / device compromise recovery
-- Federation / P2P transport
+- Relay-hosted storage for availability
 
 ## Future Considerations
 
@@ -410,118 +548,113 @@ A core UX philosophy: humans are fuzzy, and that's okay.
 "That Burger Place" is a perfectly valid subject if your friend group knows what it means. Context is implicit in your network. We don't need global entity resolution—we need to make it easy for humans to converge *when they want to*.
 
 **Creation UX nudges toward reuse:**
-- Autocomplete from your network's existing subjects as you type
+- Autocomplete from your subscribed recs' subjects as you type
 - Pre-fill link data when you select an existing subject
 - Still allow freeform entry—sometimes the informal name *is* the right name
 
 **Viewing UX uses progressive disclosure:**
-- Casual: "Related: 3 vouches mention this" (collapsed)
-- Curious: Click to expand and see linking vouches
+- Casual: "Related: 3 recs mention this" (collapsed)
+- Curious: Click to expand and see related recs
 - Power user: Trace the full connection graph
 
-#### Links as Vouches
+#### Links as Recs
 
-Links between subjects are themselves vouches—first-class content with reasons and attribution.
+Links between subjects are themselves recs—first-class content with reasons and attribution.
 
-Example: Your friend group is tracking a scammer who keeps setting up fake Etsy shops. People vouch individually about Shop X, Shop Y, etc. When someone discovers they're connected:
+Example: Your friend group is tracking a scammer who keeps setting up fake Etsy shops. People rec individually about Shop X, Shop Y, etc. When someone discovers they're connected:
 
 > "I'm pretty sure **Shop X** and **Shop Y** are the same person because I found matching PayPal accounts"
 
-This linking vouch:
-- References the original vouches (auto-linked, like Wikipedia inline links)
+This linking rec:
+- References the original recs (auto-linked)
 - Has a reason explaining *why* they're connected
-- Can be revouched, disavowed, or reacted to like any vouch
-- Creates backlinks: viewing Shop X shows "mentioned in 2 other vouches"
-
-This approach requires no special linking infrastructure—it emerges from vouches that reference other vouches. The graph is built collaboratively, with full attribution and reasoning at every node.
+- Can be revouched, disavowed, or reacted to like any rec
+- Creates backlinks: viewing Shop X shows "mentioned in 2 other recs"
 
 ### Tags and Categories
 
 ```rust
 struct RecommendationContent {
     subject: String,
-    recommendation: String,
+    body: String,
     tags: Vec<String>,  // User-defined: ["restaurant", "thai", "portland"]
 }
 ```
 
-Query: "Show me restaurant recommendations from climbing friends"
+Query: "Show me restaurant recs from climbing friends"
 
-### Sensitive Recommendations
+### Sensitive Recs
 
-Some recommendations shouldn't sync freely:
+Some recs shouldn't sync broadly:
 - Medical providers
-- Legal services  
+- Legal services
 - Personal matters
 
-This should be handled by only producing events for a specified audience (All or some selection of contacts). That should be recorded seperately, considered as a projection and cache of data stored in individual event logs
+With the database model, this is straightforward: create a separate database with limited subscribers. No per-rec ACLs needed.
 
 ### Multi-Hop Trust
 
 The data model supports this naturally:
-- Direct vouch = 1 hop
-- Revouch from friend = 2 hops
+- Direct rec = 1 hop
+- Revouch from subscription = 2 hops
 - Revouch of revouch = 3 hops
 
-We should follow the twitter retweet model, where you can only observe the original vouch and the closest revouch. Disclosing the chain is unnecessary.
+Following the retweet model: display shows original author and closest revoucher. Full chain available on demand but not prominently displayed.
 
-### Vouch as Text + Optional Metadata
+### Rec as Text + Optional Metadata
 
-An idea worth exploring: what if a vouch is fundamentally just text, with everything else as optional typed metadata?
+An idea worth exploring: what if a rec is fundamentally just text, with everything else as optional typed metadata?
 
 ```rust
-struct Vouch {
+struct Rec {
     text: String,  // The only required thing - what did you actually say?
     metadata: Vec<(String, MetadataValue)>,  // Optional structured data
 }
 
 enum MetadataValue {
     Text(String),           // subject, notes, etc.
-    Link(ContentHash),      // Reference to another vouch
+    Link(ContentHash),      // Reference to another rec
     Location(Address),      // For map features
     Image(ImageRef),        // For galleries
-    // etc.
 }
 ```
 
 This solves several problems:
-- **Linking vouches aren't special** — they're just vouches with `Link` metadata
-- **Regular vouches aren't forced into structure** — "That Burger Place" doesn't need a formal address
-- **UI renders metadata smartly** — maps for locations, backlinks for references, galleries for images
-- **Core stays simple** — the vouch is what you said, everything else is enhancement
-
-The current `subject` + `recommendation` fields would become optional metadata rather than required structure. Worth deeper thought.
+- **Linking recs aren't special** — they're just recs with `Link` metadata
+- **Regular recs aren't forced into structure** — "That Burger Place" doesn't need a formal address
+- **UI renders metadata smartly** — maps for locations, backlinks for references
+- **Core stays simple** — the rec is what you said, everything else is enhancement
 
 ### Content-Addressable Storage for Heavy Content
 
-For text vouches, we inline content everywhere—duplication is cheap (500 bytes × 10,000 vouches = 5MB). But heavy content like images changes the calculus.
+For text recs, we inline content everywhere—duplication is cheap. But heavy content like images changes the calculus.
 
-**The problem:**
-- Profile pictures need to sync but shouldn't be duplicated in every event
-- Future image attachments on vouches have the same issue
-- We don't want round-trip latency for text, but lazy-loading images is acceptable
-
-**Potential approach:**
+**Approach:**
 - Add `DefineContent` events to the event log for heavy content
 - Events reference images by hash
-- Content store is a projection from `DefineContent` events (same as other materialized views)
+- Content store is a projection from `DefineContent` events
 - Images load lazily; missing content shows placeholder until fetched
 
 ```rust
 enum VouchEventPayload {
-    // Heavy content definition
     DefineContent { hash: ContentHash, content: ContentBlob },
-    
-    // Profile updates reference image by hash
-    UpdateProfile { name: String, picture: Option<ContentHash> },
-    
-    // Regular vouches still inline text (small, no round-trips)
-    Vouch(RecommendationContent),
+    UpdateDatabase { name: String, picture: Option<ContentHash> },
+    Rec(RecommendationContent),
     // ...
 }
 ```
 
-**For v1:** Skip images entirely, or use external URLs. CAS infrastructure can come later when images become a real requirement.
+**For v1:** Skip images entirely, or use external URLs.
+
+### Collaborative Databases
+
+Future extension: databases with multiple authorized writers.
+
+A friend group could have a shared "Our Picks" database where multiple people can publish. Auth becomes "who has write keys?" This extends naturally from the single-owner model.
+
+### Database Forking
+
+See a database you like but want to curate it? Fork it (revouch everything into a new database), add your own commentary, publish your version.
 
 ## References
 
