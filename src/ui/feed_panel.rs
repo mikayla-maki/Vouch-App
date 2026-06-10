@@ -5,6 +5,8 @@ use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
+use gpui_component::{Icon, IconName};
+use std::rc::Rc;
 
 // TODO: When recommendations can change (add/edit/delete), we need to invalidate
 // the cached filtered IDs. Options to consider:
@@ -14,7 +16,7 @@ use gpui_component::theme::{ActiveTheme, Theme};
 // Comparing the full Vec<Recommendation> is expensive and should be avoided.
 
 pub struct FeedPanel {
-    data: MockData,
+    data: Rc<MockData>,
     selected_id: Option<RecommendationId>,
     search_bar: Entity<SearchBar>,
     search_query: SharedString,
@@ -24,13 +26,14 @@ pub struct FeedPanel {
 }
 
 impl FeedPanel {
-    pub fn new(data: MockData, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(data: Rc<MockData>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_bar = cx.new(|cx| SearchBar::new(window, cx));
 
         cx.subscribe(
             &search_bar,
-            |this, search_bar, _event: &SearchBarEvent, cx| {
-                this.search_query = search_bar.read(cx).query().clone();
+            |this, _search_bar, event: &SearchBarEvent, cx| {
+                let SearchBarEvent::QueryChanged(query) = event;
+                this.search_query = query.clone();
                 this.recompute_filtered_ids();
                 cx.notify();
             },
@@ -48,18 +51,8 @@ impl FeedPanel {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn select(&mut self, id: Option<RecommendationId>) {
-        self.selected_id = id;
-    }
-
     pub fn selected_id(&self) -> Option<RecommendationId> {
         self.selected_id
-    }
-
-    #[allow(dead_code)]
-    pub fn data(&self) -> &MockData {
-        &self.data
     }
 
     fn compute_filtered_ids(data: &MockData, query: &str) -> Vec<RecommendationId> {
@@ -157,6 +150,9 @@ impl FeedPanel {
         }
     }
 
+    // NOTE: gpui-component 0.5.x's `Button` would be the natural widget here,
+    // but its released hover style paints the label `red_400()` (upstream bug
+    // in button.rs), so this stays hand-rolled until that is fixed.
     fn render_new_vouch_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let data = self.data.clone();
 
@@ -186,10 +182,9 @@ impl FeedPanel {
                             .items_center()
                             .gap_2()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.primary_foreground)
-                                    .child("+"),
+                                Icon::new(IconName::Plus)
+                                    .size_4()
+                                    .text_color(theme.primary_foreground),
                             )
                             .child(
                                 div()

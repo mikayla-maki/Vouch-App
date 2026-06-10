@@ -1,16 +1,18 @@
 use crate::data::{ContactId, MockData, Recommendation, RecommendationId};
-use gpui_component::theme::{ActiveTheme, Theme};
+use crate::ui::format::{TimeStyle, format_relative_time, truncate};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::theme::{ActiveTheme, Theme};
+use std::rc::Rc;
 
 #[derive(IntoElement)]
 pub struct DetailPanel {
     selected_id: Option<RecommendationId>,
-    data: MockData,
+    data: Rc<MockData>,
 }
 
 impl DetailPanel {
-    pub fn new(data: MockData) -> Self {
+    pub fn new(data: Rc<MockData>) -> Self {
         Self {
             selected_id: None,
             data,
@@ -47,7 +49,12 @@ impl DetailPanel {
                             .flex()
                             .justify_center()
                             .items_center()
-                            .child(div().text_2xl().text_color(theme.muted_foreground).child("💭")),
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .text_color(theme.muted_foreground)
+                                    .child("💭"),
+                            ),
                     )
                     .child(
                         div()
@@ -93,7 +100,8 @@ impl DetailPanel {
     }
 
     fn render_subject_header(recommendation: &Recommendation, theme: &Theme) -> Div {
-        let subject_emoji = Self::get_subject_emoji(&recommendation.subject_name);
+        let (subject_emoji, subject_category) =
+            Self::classify_subject(&recommendation.subject_name);
 
         div()
             .flex()
@@ -109,7 +117,7 @@ impl DetailPanel {
                     .w_24()
                     .h_24()
                     .rounded_full()
-                    .bg(theme.list)
+                    .bg(theme.colors.list)
                     .border_3()
                     .border_color(theme.primary)
                     .flex()
@@ -132,7 +140,7 @@ impl DetailPanel {
                     .mt_1()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(Self::get_subject_category(&recommendation.subject_name)),
+                    .child(subject_category),
             )
     }
 
@@ -192,7 +200,7 @@ impl DetailPanel {
                 div()
                     .w_full()
                     .p_4()
-                    .bg(theme.list)
+                    .bg(theme.colors.list)
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
@@ -213,7 +221,7 @@ impl DetailPanel {
         let original_author_name = data.get_contact_name(original_author_id);
         let is_own_recommendation = original_author_id == MockData::local_user_id();
 
-        let timestamp = Self::format_timestamp(&recommendation.source.timestamp);
+        let timestamp = format_relative_time(recommendation.source.timestamp, TimeStyle::Verbose);
 
         let mut chain_items: Vec<Div> = Vec::new();
 
@@ -360,8 +368,7 @@ impl DetailPanel {
                             .text_color(theme.foreground)
                             .child(SharedString::from(value.to_string())),
                     )
-                    .when(subtitle.is_some(), |this| {
-                        let sub = subtitle.unwrap_or("");
+                    .when_some(subtitle, |this, sub| {
                         this.child(
                             div()
                                 .text_xs()
@@ -422,33 +429,34 @@ impl DetailPanel {
                             .child(format!("Related Vouches ({})", count)),
                     ),
             )
-            .when(count == 0, |this| {
-                this.child(
-                    div().p_4().bg(theme.muted).rounded_md().child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .text_center()
-                            .child("No other vouches for this subject yet"),
-                    ),
-                )
-            })
-            .when(count > 0, |this| {
-                let mut items: Vec<Div> = Vec::new();
-                for rec in related_records.iter() {
-                    items.push(Self::render_related_item(rec, data, theme));
+            .map(|this| {
+                if related_records.is_empty() {
+                    this.child(
+                        div().p_4().bg(theme.muted).rounded_md().child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .text_center()
+                                .child("No other vouches for this subject yet"),
+                        ),
+                    )
+                } else {
+                    let items: Vec<Div> = related_records
+                        .iter()
+                        .map(|rec| Self::render_related_item(rec, data, theme))
+                        .collect();
+                    this.child(div().flex().flex_col().gap_2().children(items))
                 }
-                this.child(div().flex().flex_col().gap_2().children(items))
             })
     }
 
     fn render_related_item(recommendation: &Recommendation, data: &MockData, theme: &Theme) -> Div {
         let author_name = data.get_contact_name(recommendation.source.original_author);
-        let excerpt = Self::truncate_text(&recommendation.content, 80);
+        let excerpt = truncate(&recommendation.content, 80);
 
         div()
             .p_3()
-            .bg(theme.list)
+            .bg(theme.colors.list)
             .rounded_md()
             .border_1()
             .border_color(theme.border)
@@ -484,7 +492,12 @@ impl DetailPanel {
                                     .child(author_name.to_string()),
                             ),
                     )
-                    .child(div().text_sm().text_color(theme.muted_foreground).child(excerpt)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(excerpt),
+                    ),
             )
     }
 
@@ -541,7 +554,7 @@ impl DetailPanel {
             .gap_2()
             .px_4()
             .py_2()
-            .bg(theme.list)
+            .bg(theme.colors.list)
             .rounded_lg()
             .cursor_not_allowed()
             .border_2()
@@ -583,54 +596,16 @@ impl DetailPanel {
             })
             .collect();
 
-        match names.len() {
-            0 => String::new(),
-            1 => names[0].clone(),
-            2 => format!("{} and {}", names[0], names[1]),
-            _ => {
-                let last = names.last().unwrap();
-                let rest = &names[..names.len() - 1];
-                format!("{}, and {}", rest.join(", "), last)
-            }
+        match names.as_slice() {
+            [] => String::new(),
+            [only] => only.clone(),
+            [first, second] => format!("{} and {}", first, second),
+            [rest @ .., last] => format!("{}, and {}", rest.join(", "), last),
         }
     }
 
-    fn format_timestamp(timestamp: &std::time::SystemTime) -> String {
-        let now = std::time::SystemTime::now();
-        let duration = now
-            .duration_since(*timestamp)
-            .unwrap_or(std::time::Duration::ZERO);
-
-        let seconds = duration.as_secs();
-        let minutes = seconds / 60;
-        let hours = minutes / 60;
-        let days = hours / 24;
-
-        if days > 0 {
-            format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
-        } else if hours > 0 {
-            format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
-        } else if minutes > 0 {
-            format!(
-                "{} minute{} ago",
-                minutes,
-                if minutes == 1 { "" } else { "s" }
-            )
-        } else {
-            "Just now".to_string()
-        }
-    }
-
-    fn truncate_text(text: &str, max_len: usize) -> String {
-        if text.len() <= max_len {
-            text.to_string()
-        } else {
-            let truncated: String = text.chars().take(max_len).collect();
-            format!("{}...", truncated.trim_end())
-        }
-    }
-
-    fn get_subject_emoji(subject_name: &str) -> &'static str {
+    /// Classifies a subject by keyword, returning `(emoji, category label)`.
+    fn classify_subject(subject_name: &str) -> (&'static str, &'static str) {
         let lower = subject_name.to_lowercase();
 
         if lower.contains("restaurant")
@@ -639,64 +614,29 @@ impl DetailPanel {
             || lower.contains("food")
             || lower.contains("cafe")
         {
-            "🍜"
+            ("🍜", "Restaurant / Food")
         } else if lower.contains("auto") || lower.contains("car") || lower.contains("repair") {
-            "🚗"
+            ("🚗", "Auto Services")
         } else if lower.contains("doctor")
             || lower.contains("dentist")
             || lower.contains("dr.")
             || lower.contains("medical")
         {
-            "🏥"
+            ("🏥", "Healthcare")
         } else if lower.contains("trail")
             || lower.contains("hike")
             || lower.contains("park")
             || lower.contains("nature")
         {
-            "🥾"
+            ("🥾", "Outdoor / Recreation")
         } else if lower.contains("library") || lower.contains("book") || lower.contains("study") {
-            "📚"
+            ("📚", "Library / Education")
         } else if lower.contains("plant") || lower.contains("garden") || lower.contains("flower") {
-            "🌱"
+            ("🌱", "Garden / Plants")
         } else if lower.contains("shop") || lower.contains("store") {
-            "🏪"
+            ("🏪", "Shopping")
         } else {
-            "📍"
-        }
-    }
-
-    fn get_subject_category(subject_name: &str) -> &'static str {
-        let lower = subject_name.to_lowercase();
-
-        if lower.contains("restaurant")
-            || lower.contains("thai")
-            || lower.contains("bakery")
-            || lower.contains("food")
-            || lower.contains("cafe")
-        {
-            "Restaurant / Food"
-        } else if lower.contains("auto") || lower.contains("car") || lower.contains("repair") {
-            "Auto Services"
-        } else if lower.contains("doctor")
-            || lower.contains("dentist")
-            || lower.contains("dr.")
-            || lower.contains("medical")
-        {
-            "Healthcare"
-        } else if lower.contains("trail")
-            || lower.contains("hike")
-            || lower.contains("park")
-            || lower.contains("nature")
-        {
-            "Outdoor / Recreation"
-        } else if lower.contains("library") || lower.contains("book") || lower.contains("study") {
-            "Library / Education"
-        } else if lower.contains("plant") || lower.contains("garden") || lower.contains("flower") {
-            "Garden / Plants"
-        } else if lower.contains("shop") || lower.contains("store") {
-            "Shopping"
-        } else {
-            "Place"
+            ("📍", "Place")
         }
     }
 }

@@ -1,692 +1,543 @@
-# Vouch Architecture
+# Vouch: Architecture & Vision
 
-Vouch is a local-first, privacy-preserving database of recommendations by you and your trusted friends.
+**Distributed, privacy-preserving recommendations from people you trust.**
 
-## Overview
+Vouch is three things, deliberately layered:
 
-Vouch enables users to:
-- Create and manage recommendations in their own database(s)
-- Subscribe to others' databases to see their recommendations
-- Vouch for (rehost) recommendations from subscriptions into their own database
-- Maintain full privacy from relay operators and network observers
+1. **An engine** — a small sync library for single-writer, signed, append-only
+   logs of claims. Publish your log, subscribe to others', and merge any
+   number of logs into one reactive, queryable claim graph.
+2. **A vocabulary** — a short normative spec of well-known claim types, field
+   names, and link relations that give the graph meaning.
+3. **An app** — a recommendations-and-warnings client ("distributed Yelp, but
+   only people you trust") built on both, targeting desktop and mobile via
+   GPUI.
 
-The system is built on four pillars:
+The app is the product, and it drives every design decision. The engine is the
+part designed to outlive it: a focused tool that happens to be reusable, not a
+framework hunting for use cases.
 
-1. **Local-first**: Your data lives on your device. The network is for sync
-2. **Privacy by design**: E2E encryption is the foundation
-3. **Trust through relationships**: Recommendations flow through your personal network
-4. **Invite-only**: No public discovery. All access is explicitly granted out-of-band.
+## The idea in one paragraph
 
-## Core Concepts
+Every user broadcasts an event log. A subscription is a full sync of someone
+else's log. Because all logs share one format, a client can merge its N
+subscribed logs into the database you'd have if everyone had written into it
+together — and the UI is a reactive projection of that merge. Recommendations
+are low-volume, low-size data, so full replication of each subscribed log is
+not just feasible but the simplest correct design.
 
-### Database = Identity
+## Why this stays simple: single-writer
 
-There is no separate "user" concept at the network level. Each database IS an identity:
+Each log has exactly one author. This is the load-bearing simplification, and
+nearly every other design choice exists to protect it:
 
-- One database = one keypair = one public identity
-- `DatabaseId` is the public key itself (following Signal's model)
-- Alice's "Food Recommendations" and Alice's "Sports Takes" are separate identities on the network
-- They're only connected in Alice's local app because she manages both keypairs
-- Others cannot tell these databases belong to the same person
+- **No merge conflicts.** Two people never edit the same object. Merging N
+  logs is a set union, not conflict resolution.
+- **No CRDTs, no consensus.** Per-author sequence numbers totally order each
+  log. There is nothing to vote on and nothing to converge except "have I seen
+  event (author, n) yet?"
+- **Trivial sync.** "Send me everything after sequence X" is the entire
+  incremental sync protocol.
+
+The temptation as the engine generalizes will be multi-writer logs. Resist it.
+Multi-writer is where coordinators, epochs, and consensus live (see n0pe's
+architecture for what that costs); Vouch's domain doesn't need it.
+
+### Inspirations
+
+- [LiveStore](https://livestore.dev/) — the store pipeline: commit event →
+  materialize into SQLite → reactive queries. Vouch extends it from one log to
+  N merged logs.
+- [Secure Scuttlebutt](https://handbook.scuttlebutt.nz/concepts/identity),
+  [Nostr](https://github.com/nostr-protocol/nips), and
+  [AT Protocol](https://atproto.com/) — three independent systems that all
+  converged on the same data shape Vouch uses: one record type with a type
+  hint and links, optimistically parsed, well-known types driving the UI.
+- [Petnames](https://files.spritely.institute/papers/petnames.html) — humane
+  decentralized naming, applied here to both databases and entities.
+- [Signal](https://signal.org/docs/) — identity-is-a-keypair, TOFU, and (later)
+  the multi-device model.
+- [mitchellh/vouch](https://github.com/mitchellh/vouch) — proof that "personal
+  attestation lists, merged by consumers" is a primitive worth building well.
+  Used here as a litmus test, not a target (see Non-Goals).
+
+## Core Model
+
+### Database = Identity = Log
+
+There is no separate "user" at the network level. Each database IS an
+identity: one database, one keypair, one append-only log.
+
+- `DatabaseId` is the Ed25519 public key itself.
+- Alice's "Food Recs" and Alice's "Sports Takes" are unlinkable identities on
+  the network, connected only inside Alice's app because she holds both keys.
 
 ```rust
 /// A database is an identity.
-#[derive(Clone, PartialEq, Eq, Hash)]
 struct DatabaseId(PublicKey);
 
-/// A database you know about (local or remote)
+/// A database you know about (yours or someone else's).
 struct Database {
-    /// The identity (public key)
     id: DatabaseId,
-
-    /// Private key for signing (only present if we own this database)
+    /// Present only for databases you own.
     signing_key: Option<SigningKey>,
-
-    /// Symmetric key for E2EE (from invitation or self-generated)
-    event_key: SymmetricKey,
-
-    /// Metadata from latest UpdateDatabase event
-    name: String,
-}
-```
-
-### Events
-
-All state changes flow through the event system. Every event is signed by the database owner.
-
-```rust
-/// A single event in a database's append-only log
-struct VouchEvent {
-    /// Which database this event belongs to
-    database_id: DatabaseId,
-
-    /// Monotonically increasing sequence number
-    sequence: u64,
-
-    /// When this event was created
-    timestamp: Timestamp,
-
-    /// The actual event data
-    payload: DatabaseEvent,
+    /// Sync state, None if you merely know of this database.
+    subscription: Option<Subscription>,
 }
 
-/// A signed event ready for transmission or storage
-struct SignedVouchEvent {
-    /// The event content
-    event: VouchEvent,
-
-    /// Signature over the event
-    /// Verifiable using event.database_id (which IS the public key)
-    signature: Signature,
-}
-
-/// Event payloads
-enum DatabaseEvent {
-    /// A new recommendation you're making
-    Recommendation(RecommendationContent),
-
-    /// Vouching for someone else's recommendation
-    Vouch {
-        /// The database this recommendation came from (also the verification key)
-        source_database: DatabaseId,
-        /// Original author's signature (proves authenticity)
-        original_signature: Signature,
-        /// The recommendation content
-        content: RecommendationContent,
-        /// What we claim the source database is called (for display)
-        source_name: Option<String>,
-    },
-
-    /// Update database metadata (name, description)
-    UpdateDatabase {
-        name: String,
-        description: Option<String>,
-    },
-
-    /// Mark a recommendation as retracted/disavowed
-    Disavow {
-        /// Which database's recommendation we're disavowing
-        database_id: DatabaseId,
-        /// Which event (by sequence) we're disavowing
-        sequence: u64,
-    },
-}
-
-/// Recommendation content
-#[non_exhaustive]
-enum RecommendationContent {
-    /// Simple text recommendation
-    Simple {
-        /// The entity being recommended (restaurant, book, person, etc.)
-        subject: String,
-        /// The recommendation text
-        body: String,
-    },
-}
-```
-
-### The Four-Name Model
-
-Each database identity has four types of names, a petname system:
-
-**1. Identifier (DatabaseId)**
-- The public key itself
-- Globally unique, cryptographically verifiable, permanent
-- Not human-readable
-
-**2. Self-Proposed Name**
-- Set by database owner via `UpdateDatabase` events
-- Cryptographically signed (part of event log)
-- Verifiable by anyone who fetches the events
-- This is the authoritative name from the source
-
-**3. Proposed Names**
-- Names claimed by others in vouches (`source_name` field)
-- Unverified until you fetch from the source
-- Could be stale or malicious
-
-**4. Petname**
-- Your personal, private name for a database
-- Never leaves your device
-- Takes precedence in your UI
-- You control what you call things
-
-```rust
-/// Local-only naming data for a database
-struct DatabaseNaming {
-    /// Your personal name (never transmitted)
-    petname: Option<String>,
-
-    /// Verified name from UpdateDatabase events (if fetched)
-    verified_name: Option<String>,
-
-    /// Names proposed by others in vouches
-    /// Sorted by recency
-    proposed_names: Vec<ProposedName>,
-}
-
-struct ProposedName {
-    name: String,
-    proposed_by: DatabaseId,
-    seen_at: Timestamp,
-}
-```
-
-**Name Resolution:**
-
-```rust
-fn display_name(db: &Database, naming: &DatabaseNaming) -> String {
-    if let Some(petname) = &naming.petname {
-        return petname.clone();
-    }
-
-    if let Some(verified) = &naming.verified_name {
-        return format!("{} ✓", verified);
-    }
-
-    if let Some(proposed) = naming.proposed_names.first() {
-        return format!("{} (unverified)", proposed.name);
-    }
-
-    format!("Unknown ({}...)", db.id.short())
-}
-```
-
-### Subscriptions
-
-A subscription is local state tracking your sync relationship with a remote database.
-
-```rust
-/// Subscription state for a remote database
+/// Sync state for a database you follow.
 struct Subscription {
-    /// The database you're subscribed to
     database_id: DatabaseId,
-
-    /// Highest sequence number you've received
     last_synced_sequence: u64,
 }
 ```
 
-**Key distinction:** You can know about a database (have a `Database` entry with naming info) without being subscribed to it. This happens when you see a vouch referencing a database you don't follow.
+### Claims: one shape for everything
 
-### Vouch Semantics
+Every entry in a log is a **claim**: a header, a dynamically-typed body, and a
+signature. There is no closed enum of event kinds. Recommendations, warnings,
+entities, edits, disavowals, profile updates, merges — all are claims,
+distinguished by convention (the vocabulary), not by structure.
+
+```rust
+struct EventHeader {
+    /// Wire-format version. Structural changes to the signed layout bump
+    /// this; new claim types and fields never do. Also the hedge that lets
+    /// multi-device land later as a v2 header instead of a format break.
+    version: u16,
+    database_id: DatabaseId,
+    /// Monotonic, per-database. Totally orders this log.
+    sequence: u64,
+    /// Author-claimed creation time. For display, never for correctness.
+    timestamp: Timestamp,
+}
+
+struct Claim {
+    header: EventHeader,
+    /// A deterministic-CBOR map. Free-form, except for reserved keys.
+    body: CborMap,
+}
+
+/// A claim as transmitted and stored: the canonical bytes it was signed
+/// over, plus the signature. Decoding is a view; the bytes are the truth.
+struct SignedEvent {
+    bytes: Bytes,
+    signature: Signature,
+}
+```
+
+**Links are values, not fields.** The body is fully freeform. Instead of
+reserving keys, the wire format defines two well-known CBOR-tagged value
+types that may appear *anywhere* in a body — a top-level field, a list
+entry, a span target inside rich text:
+
+| Tagged value | Content | Purpose |
+| ------------ | ------- | ------- |
+| `ClaimRef` | `(DatabaseId, sequence)` | an edge to another claim; meaning given by context |
+| `Embed`    | `SignedEvent` | a rehosted original, signature-verified by the engine |
+
+(`type` is an ordinary body key — `"rec"`, `"warning"`, `"entity"`, ... — a
+vocabulary convention, not a structural requirement.)
+
+Rules:
+
+1. **A body MUST be a CBOR map.** The only structural requirement. The store
+   indexes links by walking every body's value tree and collecting tagged
+   values with their paths — so forward and backward references are indexed
+   for *any* claim, including types the client has never seen. A link's
+   meaning (its "rel") comes from where it sits — the field name or structure
+   around it — which is vocabulary, not wire format.
+2. **Tagged values are validated leniently.** A malformed `ClaimRef` drops
+   out of the index; the claim itself is stored and re-gossiped regardless.
+   Signed bytes are never discarded (see Forward Compatibility).
+3. **`Embed` is the engine's business.** Verifying an embedded author's
+   signature is a byte-level concern no vocabulary can express, so embedded
+   originals are verified, deduplicated, and indexed by the engine itself,
+   wherever in a body they appear.
+
+### The vocabulary
+
+The engine moves bytes and indexes edges; the vocabulary is where meaning
+lives. It is a short normative document with the same status as the wire
+format spec, shipped with conformance vectors. The starter set:
+
+| `type` | Well-known fields (refs are `ClaimRef` values) |
+| ------ | ---------------------------------------------- |
+| `rec`       | `subject`, `body`, `location?`, `photo?`, `about?: ClaimRef` → entity |
+| `warning`   | same as `rec`, plus `regarding?: ClaimRef` → any claim |
+| `entity`    | `name`, `description?`, `location?`, `photo?`, `same-as?: [ClaimRef]` |
+| `edit`      | replacement fields, `supersedes: ClaimRef` (own log only) |
+| `disavowal` | `body?` (the reason), `disavows: ClaimRef` |
+| `vouch`     | `body?` (commentary), `original: Embed` |
+| `profile`   | `name`, `description?` — self-description of this log |
+
+The vocabulary also defines well-known *value* shapes, not just claim types —
+notably a rich-text value whose styled spans can carry inline `ClaimRef`
+targets, so mentions of entities and other claims flow inside prose. The
+indexer finds them there the same as anywhere else.
+
+Two properties of this design do real work:
+
+- **Commentary is free everywhere.** A disavowal with a reason, a merge with
+  an explanation, a vouch with a note — in a closed-enum design each of these
+  forces the enum to grow; here they're just body text on a claim whose links
+  carry the semantics.
+- **Unknown types degrade gracefully.** A claim type you don't recognize still
+  stores, syncs, indexes its links, and renders generically (its fields and
+  its edges). Well-known types get hand-built UI; everything else gets the
+  generic renderer. New vocabulary deploys without breaking old clients.
+
+The discipline that keeps this from becoming RDF-style schema soup: the
+vocabulary stays small, versioned, and normative. Named patterns are
+hand-coded in the app; there is no generic graph-query engine in V1.
+
+### Entities and aliases
+
+An entity (a person, business, or place being recommended) is itself a claim
+in someone's log — there is no global registry. Recs and warnings link
+`about` → an entity claim. When two entities turn out to be the same thing
+(Alice's "Joe's Pizza", Bob's "Joes pizza on 5th"), *you* publish or locally
+record a `same-as` claim — entity resolution is personal and local, the
+petname model applied to subjects. Your merge is yours; nobody has to agree.
+
+### Identity of a claim and cross-path dedup
+
+A claim's canonical identity is its author's `(DatabaseId, sequence)`.
+Rehosted copies carry the embedded original, so the same rec seen via three
+paths (the author directly, plus two friends' vouches) deduplicates to one
+item with three endorsements — and a disavowal of the original matches all
+three paths, because every path resolves to the same canonical id.
+
+### Vouch semantics
 
 Vouching is both an endorsement AND a durability decision:
 
-| Action | Meaning | Where it lives | Durability |
-|--------|---------|----------------|------------|
-| **Subscribe** | "I want to see this" | Their database (synced locally) | Depends on source |
-| **Vouch** | "I endorse this AND host it" | Your database | You control |
+| Action        | Meaning                       | Where it lives | Durability    |
+| ------------- | ----------------------------- | -------------- | ------------- |
+| **Subscribe** | "I want to see this"          | Their log      | Theirs        |
+| **Vouch**     | "I endorse this AND host it"  | Your log       | Yours         |
 
-**Verification chain:**
-1. Alice creates a recommendation, signs with her private key
-2. Bob subscribes to Alice's database, sees her recommendation
-3. Bob vouches for it into his database, including Alice's original signature
-4. Carol subscribes to Bob's database and verifies:
-   - Bob's signature on the vouch event ✓
-   - Alice's original signature using `source_database` as the public key ✓
-5. Carol now has cryptographic proof of the entire chain
+Verification chain: Alice signs a rec → Bob vouches it (embedding her signed
+bytes) → Carol, subscribed only to Bob, verifies Bob's signature on the vouch
+*and* Alice's signature on the embedded original. Provenance is cryptographic
+the whole way down; no trust in intermediaries required.
 
-## Data Model
+### Convergence invariants
 
-### Primary Identifier
+The projection must be a pure, order-insensitive fold over the union of
+claims: any two clients holding the same claim set render identical state,
+regardless of arrival order.
 
-Recommendations are identified by `(DatabaseId, sequence)`:
+The claim-graph model makes this structural rather than clever:
+
+- **Ingest interprets nothing.** Claims are stored as received; semantics are
+  resolved at query time by following links.
+- **Dangling edges heal.** A link to a claim that hasn't arrived yet is just
+  an unresolved edge; when the target arrives, every query that follows the
+  link sees it. No tombstone special-casing.
+- **Display order is not log order.** The UI sorts by
+  `(timestamp, database_id, sequence)` — deterministic across clients, but
+  timestamps are author-claimed, so this order is cosmetic. Correctness never
+  depends on it.
+
+This invariant is the engine's contract and gets enforced by property tests:
+shuffled replay of any claim set must produce a byte-identical projection.
+
+## Canonical Serialization & Wire Format
+
+Signatures are computed over encoded bytes, so the wire format is the real
+cross-language contract: every client implementation (Rust, Swift, Kotlin, ...)
+must produce byte-identical encodings for the same claim. This section is
+normative for all implementations.
+
+### Canonical encoding
+
+All signed structures are encoded with **deterministic CBOR** (RFC 8949 §4.2
+core deterministic encoding): definite-length containers, shortest-form
+integers, map keys sorted bytewise. CBOR over a Rust-native format (e.g.
+postcard) because mature implementations exist in every target language — and
+because the dynamically-typed claim body is natively a CBOR map.
+
+```text
+signature = Ed25519::sign(signing_key, canonical_bytes(Claim))
+```
+
+**Rules:**
+
+1. **Sign bytes, verify bytes.** Verifiers MUST check the signature against
+   the bytes as received, and only then decode. Never decode → re-encode →
+   verify; round-tripping is where canonicalization bugs hide.
+2. **Store the original bytes.** Claims persist with their received encoding
+   alongside the decoded form, so any claim can be re-transmitted or
+   re-verified byte-for-byte. This is also what makes vouching verifiable.
+
+### Envelope / payload split
+
+Transports see two layers, kept separate from day one even while payloads are
+plaintext:
+
+- **Envelope**: `database_id`, `sequence` — the minimum a transport needs for
+  routing and incremental sync.
+- **Payload**: the canonical bytes of the `SignedEvent` — opaque to all
+  transports. Links live inside the payload, so once E2EE lands, the
+  relationship graph is as private as the content; all link indexing is
+  client-side, after decryption and verification.
+
+When E2EE lands, encryption is a payload transform; the envelope, the sync
+protocol, and every transport implementation are unchanged.
+
+### Forward compatibility
+
+A client that cannot interpret a claim (unknown `type`, unrecognized fields,
+malformed tagged values) MUST retain and re-gossip the raw bytes rather than
+drop it. Rehosting and convergence depend on old clients not silently
+discarding data they can't read. In the claim-graph model this is the common
+path, not the exception: unknown claims still index their links and render
+generically.
+
+### Conformance test vectors
+
+The spec ships with test vectors: fixed keypairs, claims, their canonical byte
+encodings, and signatures — plus vocabulary vectors (well-formed and malformed
+tagged values in assorted body positions, and the expected lenient-validation
+and indexing outcomes). A client
+implementation in any language validates against the vectors before anything
+else. The vectors are the cheapest durable artifact for keeping N
+implementations honest — far cheaper than FFI bindings — and double as
+regression tests for the Rust reference implementation.
+
+## Storage & Reactivity
+
+The local store follows the LiveStore pipeline, extended to N logs:
+
+```text
+commit claim → append to log (SQLite) → index links → materialize → notify queries → sync
+```
+
+- **The claim log is the source of truth.** SQLite tables hold every claim
+  (original bytes + decoded columns) from your databases and subscriptions.
+- **The link index is generic.** Forward and backward edges are extracted by
+  walking every body's value tree for tagged `ClaimRef`s — known claim type or
+  not, top-level field or inline rich-text span. "Show all claims referencing
+  this one" is a store primitive, not a vocabulary feature.
+- **Materializers are vocabulary-aware projections** — pure functions from
+  claims to queryable tables (recs, warnings, entities with resolved aliases,
+  endorsement counts, naming). Views are disposable: any of them can be
+  rebuilt by refolding the log. At "reviews from people you know" scale a full
+  refold is milliseconds — no incremental view-maintenance machinery
+  (differential dataflow et al.) is warranted.
+- **Reactive queries** subscribe to table-change notifications; the UI never
+  polls and never shows a loading state for local data.
+
+**Position: the storage backend is concrete, not pluggable.** Materialized
+views, reactive queries, and sync bookkeeping all lean on SQLite specifically;
+a trait abstracting "SQLite or a flat file" would be satisfied by neither.
+The storage *format*, however, is already generic for free: the wire format
+defines what a serialized log is, so export/import of a database as a single
+file falls out of the spec — and a file is just another pipe (see Transports).
+
+## Sync & Transports
+
+### Transport is a trait; everything is a pipe
 
 ```rust
-/// Unique identifier for a recommendation
-struct RecommendationId {
-    database_id: DatabaseId,
-    sequence: u64,
+trait Transport {
+    /// Publish events to a database you own (auth: signature challenge).
+    async fn publish(&self, db: DatabaseId, events: Vec<Envelope>) -> Result<()>;
+    /// Incremental pull: everything after a sequence number.
+    async fn fetch_since(&self, db: DatabaseId, seq: u64) -> Result<Vec<Envelope>>;
+    /// Live tail for reactive sync.
+    async fn stream(&self, db: DatabaseId, from: u64) -> Result<EventStream>;
 }
 ```
 
-### Local Storage
+Planned implementations, in order:
 
-All local data is persisted in a SQLite database. Conceptually, local storage has three layers:
+1. **Relay** — a dumb store-and-forward server, for networking ease. Owners
+   authenticate via signature challenge (the relay sends a nonce; the client
+   signs it; `DatabaseId` is the verification key). Fetching requires no auth.
+2. **iroh p2p** — [iroh](https://github.com/n0-computer/iroh)'s
+   dial-by-public-key QUIC maps directly onto `DatabaseId`-is-a-pubkey, and an
+   iroh relay node is literally "the relay as just another pipe." Strong
+   candidate to be the relay's implementation substrate rather than a separate
+   transport; decided by prototyping behind the trait.
+3. **Files** — a serialized log is a valid transport: backups, sneakernet,
+   attach-your-database-to-an-email.
 
-**1. Event Log (Source of Truth)**
+### Sync flow
 
-```rust
-/// Stored events from all databases (local and subscribed)
-struct StoredEvent {
-    /// The decrypted and verified event
-    event: SignedVouchEvent,
-
-    /// Encrypted payload (as received from relay, for retransmission)
-    encrypted_payload: Vec<u8>,
-
-    /// When we received this event
-    received_at: Timestamp,
-}
-```
-
-**2. Database Registry**
-
-```rust
-/// All databases we know about
-struct DatabaseEntry {
-    id: DatabaseId,
-
-    /// E2EE key (from invitation or self-generated)
-    event_key: SymmetricKey,
-
-    /// Current metadata (from latest UpdateDatabase)
-    name: String,
-
-    /// Local naming
-    petname: String,
-    verified_name: Option<String>,
-    proposed_names: Vec<ProposedName>,
-
-    created_at: Timestamp,
-
-    /// Subscription state (None if not subscribed)
-    subscription: Option<Subscription>,
-}
-```
-
-**3. Materialized Views (Query Layer)**
-
-Events are projected into queryable structures for the UI:
-
-```rust
-/// A rec ready for display
-struct Recommendation {
-    /// Primary identifier
-    id: RecommendationId,
-
-    /// The content
-    content: RecommendationContent,
-
-    /// When it was created
-    timestamp: Timestamp,
-
-    /// Source database
-    database_id: DatabaseId,
-
-    /// If this is a vouch, the original source
-    original_source: Option<DatabaseId>,
-
-    /// Is this disavowed?
-    disavowed_by: Vec<DatabaseId>,
-}
-```
-
-### Convergent Event Sourcing
-
-Vouch uses event sourcing with eventually consistent semantics:
-
-- All state changes are captured as immutable events
-- Events are replicated across devices via subscriptions
-- When any two nodes see the same set of events, they converge to the same state
-- Order of event arrival doesn't matter—only the final set
-
-This is achieved through:
-- **Monotonic operations**: Events only add information or mark things as invalid
-- **Sequence numbers**: Events within a database are totally ordered
-- **Tombstone strategy**: Disavowals are stored even if the target event hasn't arrived yet
-
-## Encryption & Privacy
-
-### Threat Model
-
-**Attackers we protect against:**
-- Relay operator trying to read content
-- Relay operator trying to map social graph
-- Passive network observer (ISP, corporate firewall)
-- Compromised relay attempting traffic analysis
-- Byzantine faults from subscribed databases.
-
-**Attack vectors prevented:**
-- ✅ Content reading (E2EE)
-- ✅ Content tampering (signatures)
-- ✅ Publisher impersonation (signature verification)
-
-### Per-Database Symmetric Keys
-
-Each database has a symmetric key shared among all authorized subscribers:
-
-```rust
-/// Keys for a database
-struct DatabaseKeys {
-    /// The identity (public key)
-    id: DatabaseId,
-
-    /// Symmetric key for encrypting all events
-    /// Shared via invitation
-    event_key: SymmetricKey,
-
-    /// Signing key (only for owned databases)
-    signing_key: Option<SigningKey>,
-}
-```
-
-**Encryption flow (publishing):**
-```
-VouchEvent (unsigned)
-  → Sign with signing_key → SignedVouchEvent
-  → Encrypt with event_key → EncryptedEvent
-  → Publish to relay (relay verifies ownership via signature challenge)
-```
-
-**Decryption flow (subscribing):**
-```
-EncryptedEvent from relay
-  → Decrypt with event_key → SignedVouchEvent
-  → Verify signature using database_id (the public key)
-  → Store as StoredEvent
-  → Update materialized views
-```
-
-```rust
-/// An encrypted event for transmission over the relay
-struct EncryptedEvent {
-    /// Which database (needed for routing)
-    database_id: DatabaseId,
-
-    /// Encrypted SignedVouchEvent
-    ciphertext: Vec<u8>,
-}
-```
-
-### Relay Authentication (V1)
-
-For v1, only the database owner can publish events. The relay verifies this via signature challenge:
-
-**Publishing flow:**
-1. Client connects to relay, requests to publish to database X
-2. Relay sends a random challenge nonce
-3. Client signs nonce with their signing key
-4. Relay verifies signature using DatabaseId (which IS the public key)
-5. If valid, relay accepts the encrypted events
-
-**What the relay learns:**
-- Which database is being published to
-- That the publisher owns that database (since DatabaseId = PublicKey)
-- When events are published
-
-**What the relay cannot learn:**
-- Event content (encrypted with event_key)
-- Who subscribes to what (fetch requests don't require auth)
-
-**Note:** Since DatabaseId = owner's public key and only owners publish, the relay inherently knows "the owner of database X published." True publisher anonymity would require anonymous credentials, which is deferred to a future version with multi-writer databases.
-
-### What the Relay Can and Cannot Do (V1)
-
-**Cannot:**
-- ❌ Read event content (encrypted with event_key)
-- ❌ Tamper with events (clients verify signatures)
-- ❌ Impersonate publishers (signature challenge auth)
-
-**Can:**
-- ✅ Know which databases exist
-- ✅ Know who owns each database (DatabaseId = PublicKey)
-- ✅ Know when owners publish events
-- ✅ Know rough activity levels per database
-- ✅ See who fetches events (IP addresses)
-- ✅ Enforce rate limits per database
-- ✅ Delete old events (retention policy)
-- ✅ Block entire databases (for abuse)
-
-## Sync Protocol
+- **Publish**: create → sign → append locally → index/materialize → push via
+  any transport when available.
+- **Subscribe**: `fetch_since(last_synced_sequence)` → verify signatures →
+  store → index/materialize → bump sync state.
+- **Offline is the normal case**: the app is fully functional on local data;
+  claims are idempotent, so replays and duplicates are harmless.
 
 ### Invitations
 
-All access is granted via out-of-band invitation. No in-app discovery.
+All access is granted out-of-band. No in-app discovery.
 
-```rust
-/// Database invitation
-struct DatabaseInvite {
-    /// The database identity (also the verification key)
-    database_id: DatabaseId,
-
-    /// Symmetric key for decrypting events
-    event_key: SymmetricKey,
-
-    /// Where to fetch events
-    relay_url: String,
-
-    /// Optional: who's inviting you (for display)
-    inviter_name: Option<String>,
-
-    /// Optional: single-use relay access token
-    access_token: Option<AccessToken>,
-
-    /// Optional: expiration
-    expires_at: Option<Timestamp>,
-}
-
-// Serialized as URL or QR code:
-// vouch://invite?db=<base64>&key=<base64>&relay=<url>&...
+```text
+vouch://invite?db=<base64-pubkey>&relay=<url>[&key=...][&token=...][&expires=...]
 ```
 
-**Invitation flows:**
+Sent as a link or QR code over channels you already trust (Signal, email, in
+person). The `key` parameter carries the database's symmetric event key once
+E2EE lands; in V1 it is absent.
 
-*link (Signal, email):*
-1. Alice generates invite link: `vouch://invite?...`
-2. Alice sends via Signal/WhatsApp/email
-3. Bob clicks link → Opens Vouch app
-4. Same subscription flow
+## Naming: the Four-Name Model
 
-### Relay Protocol
+Every database has up to four kinds of name, resolved in priority order:
 
-```rust
-#[async_trait]
-trait VouchRelay {
-    /// Authenticate as database owner (signature challenge)
-    async fn authenticate(
-        &self,
-        database_id: DatabaseId,
-        challenge_response: Signature,
-    ) -> Result<AuthToken>;
+1. **Petname** — your private name for it. Never transmitted. Always wins.
+2. **Self-proposed name** — from the database's own signed `profile`
+   claims. Verified, shown with a checkmark.
+3. **Proposed names** — what vouchers claim the source is called.
+   Unverified until you fetch from the source; could be stale or malicious.
+   Shown with an "unverified" marker.
+4. **The key itself** — truncated, as a last resort.
 
-    /// Publish encrypted events (requires auth)
-    async fn publish(
-        &self,
-        auth: AuthToken,
-        events: Vec<EncryptedEvent>,
-    ) -> Result<()>;
+Naming data is local-only state, never part of any log except via vouches'
+source annotations and the database's own `profile` claims. The same
+resolution philosophy applies to entities (see Entities and aliases): your
+local names and merges always win over anyone's claims.
 
-    /// Fetch events since a sequence number (no auth required)
-    async fn fetch_events(
-        &self,
-        database_id: DatabaseId,
-        since_sequence: u64,
-    ) -> Result<Vec<EncryptedEvent>>;
-}
+## Privacy: deferred, not forgotten
+
+V1 ships with plaintext payloads. This is a sequencing decision, not a scope
+cut — the envelope/payload split exists from day one precisely so that
+encryption can land later as a pure payload transform.
+
+**Planned model** (unchanged from the original design):
+
+- **Per-database symmetric key** (ChaCha20-Poly1305), shared with subscribers
+  via the invitation. Relay operators and network observers can't read
+  content; subscribers can.
+- **Ed25519 signatures** on every claim (this part ships in V1 — signing is
+  not deferred, only encryption).
+- Relay learns: which databases exist, who owns them (`DatabaseId` is the
+  owner's pubkey), publish timing/volume, fetcher IPs. Relay cannot: read
+  content or the link graph, tamper (signatures), impersonate (challenge
+  auth).
+- Out of scope, permanently: device compromise, coerced disclosure,
+  nation-state traffic analysis. Vouch defends against curious operators and
+  passive observers, not Mossad.
+
+### Position on permanence
+
+Synced is shared. Once a peer has replicated your log, your claims live on
+hardware you don't control — the protocol cannot unpublish, and pretending
+otherwise would be dishonest. `edit` and `disavowal` claims change what
+conformant clients *display*, not what anyone *holds*. The UI must make this
+legible at the moment of posting, not bury it in documentation.
+
+## Keys, Identity & Devices
+
+- **One keypair per database.** `DatabaseId` is the public key, so TOFU is
+  trivial — there is no separate trust step and no key/identity mismatch to
+  detect.
+- **Backup is a 24-word BIP39 mnemonic** of the signing key, shown at database
+  creation. No key rotation in V1; the mnemonic is the identity.
+- **Compromise = new identity.** Publish a farewell claim in the compromised
+  database, create a new one, re-invite out-of-band. Crude, honest, V1.
+- **Multi-device is explicitly single-device in V1.** The plan is Signal's
+  shape when it lands: an identity key signs per-device keys, each device
+  writes its own log, and clients merge per-device logs under one displayed
+  identity — preserving the single-writer invariant instead of forking
+  sequence numbers. The `version` field in the event header is the designated
+  retrofit point; this is a planned v2 header, not a redesign.
+
+**Key storage**: OS keychain on every platform (macOS Keychain, Windows
+Credential Manager, iOS Keychain, Android Keystore).
+
+## The Library Boundary
+
+```text
+vouch-core    claim types, canonical encoding, sign/verify, embed verification,
+              fold invariants. No I/O.
+              (this crate + the test vectors IS the cross-language spec)
+vouch-store   SQLite claim log, generic link index, materializer framework,
+              reactive queries
+vouch-sync    Transport trait + sync sessions (relay, iroh, files)
+vouch-vocab   the vocabulary: well-known types, fields, rels + lenient parsers
+vouch-app     vocabulary-driven UI, naming, invitations UX, GPUI state
 ```
 
-### Sync Flow
+**Cross-language strategy**: spec-first, not FFI-first. Other-language clients
+are independent implementations of the wire format + vocabulary, validated
+against the conformance vectors. Bindings (UniFFI etc.) only if a real
+consumer shows up.
 
-**Publishing (your databases):**
-1. Create event locally, sign it, append to your database
-2. Encrypt with database event_key
-3. Authenticate with relay (signature challenge)
-4. Publish encrypted events
-5. Subscribers pull on their own schedule
+**Genericness rule**: a seam gets a trait only when it has two real consumers
+today. Claim bodies — dynamic by design (the app's vocabulary, the engine's
+reserved keys). Transport — trait (relay, iroh, files; all near-term).
+Storage backend — concrete (SQLite, full stop).
 
-**Subscribing (others' databases):**
-1. Request events since your last synced sequence
-2. Decrypt with event_key (from invitation)
-3. Verify signatures using database_id
-4. Store events locally
-5. Update materialized views
-6. Update sync state
+**The litmus test**: could a trustdown-shaped tool
+([mitchellh/vouch](https://github.com/mitchellh/vouch)) be built on this
+engine? Under the claim-graph model the answer sharpens: it's just a
+vocabulary — claim type `attestation`, link rel `denounces`. That question
+gets asked of every API boundary, because it keeps the engine/vocabulary/app
+split honest. It is *not* a shipped target: trustdown's defining virtues are
+hand-editable text and zero-dependency parsing, and a signed claim log is
+constitutionally neither.
 
-**Handling offline:**
-1. Work with locally stored data while offline
-2. On reconnect, fetch missed events from subscribed databases
-3. Publish any events you created while offline
-4. Events are idempotent—receiving duplicates is harmless
+## Non-Goals (V1)
 
-### Tombstone Handling
+- **Multi-writer databases** — imports consensus; defeats the core simplification
+- **Multi-device** — single device first; Signal-style retrofit planned (see above)
+- **Public discovery / search** — invite-only is a feature, not a gap
+- **Pluggable storage backends** — SQLite is load-bearing
+- **E2EE** — deferred one phase; the envelope split it needs ships in V1
+- **Generic graph-query engine** — named patterns are hand-coded; the
+  vocabulary stays small and curated
+- **Media / blobs / unbounded data** — claims are small; full-log replication
+  depends on keeping it that way (photos are a known want; they arrive with a
+  blob story, not before)
+- **Key rotation, anonymous publishing, reactions** — see [ROADMAP.md](./ROADMAP.md)
 
-When a `Disavow` event arrives before the target event:
+## V1 Scope
 
-1. Store the tombstone: `(target_database, target_sequence) → tombstoned`
-2. When the target event eventually arrives, check tombstone set
-3. If tombstoned, mark as disavowed immediately
-
-This ensures convergence regardless of event arrival order.
-
-## Key Management
-
-### Single Key Model (V1)
-
-Following Signal's approach, each database has exactly one keypair:
-
-```rust
-struct Database {
-    /// DatabaseId IS the public key
-    id: DatabaseId,
-
-    /// Private key for signing (only for owned databases)
-    signing_key: Option<SigningKey>,
-}
-```
-
-**Verification is straightforward:**
-```rust
-fn verify_event(signed: &SignedVouchEvent) -> Result<()> {
-    // The database_id IS the public key
-    let public_key = &signed.event.database_id;
-
-    // Verify signature over the event content
-    verify_signature(&signed.signature, &signed.event, public_key)
-}
-```
-
-### Key Backup
-
-Since keys cannot be rotated in v1, backup is essential.
-
-**BIP39 Mnemonic:**
-```rust
-impl SigningKey {
-    fn to_mnemonic(&self) -> String {
-        // Convert 32-byte key to 24-word mnemonic
-        bip39::encode(self.secret_bytes())
-    }
-
-    fn from_mnemonic(words: &str) -> Result<Self> {
-        let bytes = bip39::decode(words)?;
-        SigningKey::from_bytes(bytes)
-    }
-}
-```
-
-**UX flow:**
-```
-[Create Database]
-→ Generate keypair
-→ Show backup screen:
-  "Your database identity is tied to this key. Back it up!"
-
-  [Show Recovery Phrase]
-  → Display 24 words
-  → "Write these down and store safely"
-  → [ ] I've written down my recovery phrase
-  → [Continue]
-```
-
-### Trust On First Use (TOFU)
-
-When you first encounter a database, you learn its public key and trust it:
-
-```rust
-fn process_invitation(invite: DatabaseInvite) -> Result<()> {
-    // The database_id IS the public key - no separate trust step needed
-    // Just store and use it for verification
-
-    databases.insert(DatabaseEntry {
-        id: invite.database_id,
-        event_key: invite.event_key,
-        // ...
-    });
-
-    Ok(())
-}
-```
-
-Since `DatabaseId` is the public key itself, TOFU is trivial—you can't have a mismatch.
-
-### Key Compromise (V1 Mitigation)
-
-If a private key is compromised:
-1. User has lost control of that database identity
-2. Must create new database with new key
-3. Publish farewell message in compromised database
-4. Share new invite links via out-of-band channels
-5. Subscribers manually migrate
-
-## Security Considerations
-
-### Cryptographic Primitives
-
-- **Symmetric encryption**: ChaCha20-Poly1305 for event payloads
-- **Signatures**: Ed25519 for event signing
-- **Key derivation**: HKDF for deriving keys
-- **Secure random**: OS-provided CSPRNG
-
-### Key Storage
-
-- **iOS**: Keychain with `kSecAttrAccessibleWhenUnlocked`
-- **Android**: Android Keystore with `ENCRYPT` purpose
-- **Desktop**: OS keychain (macOS Keychain, Windows Credential Manager)
-
-### Known Limitations
-
-**Not protected against:**
-- Device compromise (malware can read local database)
-- Coerced disclosure (can't deny you have the data)
-- Traffic analysis by nation-state adversaries
-- Social engineering (user tricked into inviting attacker)
-- Screenshots/screen recording
-- Quantum computers (pre-quantum crypto)
-
-**When to use Vouch:**
-- ✅ Protecting against curious relay operators
-- ✅ Protecting against corporate surveillance
-- ✅ Protecting against passive network monitoring
-- ❌ Against nation-state adversaries (use Tor + Tails)
-- ❌ Against device seizure (use full-disk encryption)
-
-## Roadmap
-
-### V1 Scope
-
-**Must have:**
-- Local rec CRUD (create, view, disavow)
-- Single database per user (simplify multi-database for later)
-- Event log + materialized view persistence
-- Basic subscription management (subscribe, unsubscribe)
-- Rec and Vouch events
-- Disavow events
-- E2EE with per-database symmetric keys
-- Invite-only subscriptions (QR code + links)
-- Simple sync over WebSocket relay
-- Four-name model (petnames, verified names, proposed names)
-- Mnemonic phrase backup
-
-See [ROADMAP.md](./ROADMAP.md) for V2+ enhancements.
+- Create, view, edit (supersede), and disavow recs and warnings in your own
+  database
+- Entity claims with `about` links; local alias resolution (`same-as`)
+- One database per user, one device
+- Claim log + generic link index + materialized views in SQLite, reactive
+  queries to the UI
+- Signed claims, canonical CBOR wire format, conformance test vectors,
+  starter vocabulary
+- Subscribe/unsubscribe via invite links and QR codes
+- Vouch (rehost with embedded original) and cross-path dedup
+- Sync through the relay transport; offline-first throughout
+- Four-name model with petnames
+- BIP39 mnemonic backup
 
 ## Terminology
 
-| Term | Meaning |
-|------|---------|
-| **Rec** | A recommendation—the core content unit |
-| **Database** | An event log with a single keypair identity |
-| **DatabaseId** | The public key of a database (IS the identity) |
-| **Subscription** | Following a database to replicate its events locally |
-| **Vouch** | Endorsing someone else's recommendation into your own database (endorsement + durability) |
-| **Petname** | Your local, private name for a database |
-| **Disavow** | Mark a rec as retracted/untrusted |
-| **Event** | An immutable, signed state change in a database |
-| **Relay** | Store-and-forward server for syncing events |
+| Term             | Meaning                                                        |
+| ---------------- | -------------------------------------------------------------- |
+| **Claim**        | The one record shape: header + CBOR body + signature           |
+| **Body**         | A claim's deterministic-CBOR map; free-form except reserved keys |
+| **ClaimRef**     | A tagged CBOR value referencing a claim by `(DatabaseId, sequence)`; legal anywhere in a body |
+| **Embed**        | Another author's `SignedEvent` carried as a tagged value; verified by the engine |
+| **Vocabulary**   | The normative set of well-known claim types, fields, and rels  |
+| **Database**     | An append-only claim log with a single keypair identity        |
+| **DatabaseId**   | The public key of a database (IS the identity)                 |
+| **Entity**       | A claim describing a person/place/thing that recs link `about` |
+| **Rec / Warning**| The app's core content claims — endorse or caution             |
+| **Vouch**        | Rehosting another's claim into your log: endorsement + durability |
+| **Disavowal**    | A claim that retracts/distrusts another claim, with optional reason |
+| **Subscription** | Following a database, replicating its log locally              |
+| **Petname**      | Your local, private name for a database (or entity)            |
+| **Transport**    | Any pipe that moves envelopes: relay, iroh, files              |
+| **Relay**        | A dumb store-and-forward server; one transport among several   |
 
 ## References
 
-- [Petnames Paper](https://files.spritely.institute/papers/petnames.html) - Humane decentralized naming
-- [Signal Protocol](https://signal.org/docs/) - Identity keys, encryption
-- [SSB Identity](https://handbook.scuttlebutt.nz/concepts/identity) - Single key model
+- [LiveStore](https://livestore.dev/) — reactive event-sourced store design
+- [Petnames Paper](https://files.spritely.institute/papers/petnames.html)
+- [Signal Protocol](https://signal.org/docs/) — identity keys, multi-device model
+- [SSB](https://handbook.scuttlebutt.nz/concepts/identity), [Nostr](https://github.com/nostr-protocol/nips), [AT Protocol](https://atproto.com/) — prior art for the claim-graph shape
+- [iroh](https://github.com/n0-computer/iroh) — dial-by-pubkey QUIC transport
+- [mitchellh/vouch](https://github.com/mitchellh/vouch) — the litmus test
+- [RFC 8949 §4.2](https://www.rfc-editor.org/rfc/rfc8949#section-4.2) — CBOR core deterministic encoding

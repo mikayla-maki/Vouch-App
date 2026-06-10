@@ -6,18 +6,23 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::Root;
 use gpui_component::theme::ActiveTheme;
+use std::rc::Rc;
 
 pub struct VouchApp {
     feed_panel: Entity<FeedPanel>,
-    data: MockData,
+    data: Rc<MockData>,
     sidebar_collapsed: bool,
 }
 
 impl VouchApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let data = MockData::generate();
+        let data = Rc::new(MockData::generate());
 
         let feed_panel = cx.new(|cx| FeedPanel::new(data.clone(), window, cx));
+
+        // FeedPanel owns the selection, but VouchApp reads it in render to
+        // drive the detail panel, so re-render whenever the feed notifies.
+        cx.observe(&feed_panel, |_, _, cx| cx.notify()).detach();
 
         Self {
             feed_panel,

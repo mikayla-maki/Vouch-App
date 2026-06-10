@@ -2,6 +2,8 @@ use crate::data::{Contact, MockData};
 use crate::theme::{is_dark_mode, toggle_theme};
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
+use gpui_component::{Icon, IconName};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterOption {
@@ -12,14 +14,14 @@ pub enum FilterOption {
 
 #[derive(IntoElement)]
 pub struct Sidebar {
-    data: MockData,
+    data: Rc<MockData>,
     selected_filter: FilterOption,
     is_collapsed: bool,
     on_toggle: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl Sidebar {
-    pub fn new(data: MockData) -> Self {
+    pub fn new(data: Rc<MockData>) -> Self {
         Self {
             data,
             selected_filter: FilterOption::All,
@@ -120,7 +122,11 @@ impl Sidebar {
     }
 
     fn render_theme_switcher(theme: &Theme, is_dark: bool) -> Stateful<Div> {
-        let icon = if is_dark { "☀" } else { "☾" };
+        let icon = if is_dark {
+            IconName::Sun
+        } else {
+            IconName::Moon
+        };
         let tooltip = if is_dark {
             "Switch to light mode"
         } else {
@@ -145,7 +151,7 @@ impl Sidebar {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().text_sm().child(icon))
+                    .child(Icon::new(icon).size_4().text_color(theme.foreground))
                     .child(div().text_sm().text_color(theme.foreground).child(tooltip)),
             )
     }
@@ -157,7 +163,11 @@ impl RenderOnce for Sidebar {
         let is_dark = is_dark_mode(cx);
 
         if self.is_collapsed {
-            let theme_icon = if is_dark { "☀" } else { "☾" };
+            let theme_icon = if is_dark {
+                IconName::Sun
+            } else {
+                IconName::Moon
+            };
 
             let mut expand_btn = div()
                 .id("expand-btn")
@@ -188,7 +198,7 @@ impl RenderOnce for Sidebar {
                 .on_click(move |_event, window, cx| {
                     toggle_theme(window, cx);
                 })
-                .child(div().text_sm().child(theme_icon));
+                .child(Icon::new(theme_icon).size_4().text_color(theme.foreground));
 
             return div()
                 .flex()
@@ -237,10 +247,9 @@ impl RenderOnce for Sidebar {
             .rounded_md()
             .hover(|style| style.bg(theme.list_hover))
             .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("◀"),
+                Icon::new(IconName::PanelLeftClose)
+                    .size_4()
+                    .text_color(theme.muted_foreground),
             );
 
         if let Some(on_toggle) = self.on_toggle {

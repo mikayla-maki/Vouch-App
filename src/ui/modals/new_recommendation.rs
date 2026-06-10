@@ -1,15 +1,18 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::WindowExt;
+use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState};
 use gpui_component::theme::ActiveTheme;
+
+use std::rc::Rc;
 
 use crate::data::MockData;
 
 pub struct NewRecommendationModal;
 
 impl NewRecommendationModal {
-    pub fn open(data: MockData, window: &mut Window, cx: &mut App) {
+    pub fn open(data: Rc<MockData>, window: &mut Window, cx: &mut App) {
         let subject_suggestions: Vec<SharedString> = data
             .recommendations
             .iter()
@@ -35,7 +38,7 @@ impl NewRecommendationModal {
             dialog
                 .title("New Recommendation")
                 .w(px(500.))
-                .confirm()
+                .button_props(DialogButtonProps::default().show_cancel(true))
                 .on_ok(move |_, _window, cx| {
                     let subject = subject_state_clone.read(cx).text().to_string();
                     let content = content_state_clone.read(cx).text().to_string();
@@ -44,7 +47,9 @@ impl NewRecommendationModal {
                         return false;
                     }
 
-                    println!("SAVE THIS - Subject: {}, Content: {}", subject, content);
+                    // TODO(data-layer): persist the new recommendation (subject,
+                    // content) once a mutable data store exists; for now the
+                    // input is validated and then discarded.
                     true
                 })
                 .child(

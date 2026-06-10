@@ -36,7 +36,7 @@ fn load_vouch_theme(cx: &mut App) {
 }
 
 fn main() {
-    Application::new().with_assets(Assets).run(|cx| {
+    gpui_platform::application().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
 
         load_vouch_theme(cx);
