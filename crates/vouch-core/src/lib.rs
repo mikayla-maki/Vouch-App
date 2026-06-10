@@ -1,0 +1,61 @@
+//! # vouch-core
+//!
+//! The Vouch engine core: single-writer signed claim logs with
+//! content-addressed identity, the dynamic value model, canonical CBOR
+//! encoding, and an in-memory claim store with a generic link index.
+//!
+//! This crate is deliberately I/O-free. Everything here operates on bytes
+//! and in-memory structures, which makes multi-client interactions testable
+//! as plain unit tests: create several [`Writer`]s, exchange
+//! [`SignedEvent`]s between [`ClaimStore`]s, and assert convergence.
+//!
+//! The crate (together with its conformance test vectors) doubles as the
+//! cross-language wire-format spec: see `VOUCH_ARCHITECTURE.md` at the
+//! repository root.
+//!
+//! ## The shape
+//!
+//! A claim is a signed *header* that pins a detachable *body* by hash; its
+//! identity is the hash of the header. The sequence number in the header is
+//! advisory — shared language for sync and ordering, never an enforced
+//! invariant; drift it can't see is caught by per-log set fingerprints at
+//! sync time. There are no slots and therefore no forks; redaction drops a
+//! body and leaves the signed header as a tombstone. The graph that *means*
+//! something (recs, entities, vouches, disavowals) lives entirely inside
+//! bodies as [`ClaimRef`] values; the header is plumbing.
+//!
+//! ## Layering
+//!
+//! - [`value`] — the dynamic body model: CBOR values plus the well-known
+//!   tagged types [`ClaimRef`], `Embed`, and [`BlobRef`].
+//! - [`cbor`] — deterministic encoding (RFC 8949 §4.2) and a strict decoder
+//!   that rejects non-canonical input.
+//! - [`claim`] — headers, bodies, canonical bytes, signing and verification.
+//! - [`store`] — an in-memory, order-insensitive claim store with backlink
+//!   indexing, cross-path dedup, redaction, and body fill-in.
+//! - [`blob`] — content-addressed media storage: verify-on-arrival,
+//!   want-list driven, GC'd when redaction orphans the bytes.
+//! - [`writer`] — the pen: a keypair plus advisory position, no data.
+//! - [`database`] — the composition: N merged logs + media + your writers
+//!   behind one door in and a query surface out. The sync engine is this
+//!   plus pipes; a relay is this with no writers.
+
+pub mod blob;
+pub mod cbor;
+pub mod claim;
+pub mod database;
+pub mod error;
+pub mod keys;
+pub mod store;
+pub mod value;
+pub mod writer;
+
+pub use blob::BlobStore;
+pub use claim::{Claim, EventHeader, MAX_BODY_SIZE, SignedEvent, WIRE_VERSION};
+pub use database::Database;
+pub use ed25519_dalek::Signature;
+pub use error::Error;
+pub use keys::LogId;
+pub use store::{ClaimStore, IngestReport, Provenance, StateVector, StoredClaim};
+pub use value::{BlobHash, BlobRef, ClaimHash, ClaimRef, Path, PathSeg, Value};
+pub use writer::Writer;

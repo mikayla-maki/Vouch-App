@@ -1,0 +1,12 @@
+[package]
+name = "vouch-core"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "Vouch engine core: claims, canonical CBOR, signing, in-memory claim store. No I/O."
+
+[dependencies]
+blake3 = "1"
+ed25519-dalek = "2"
+getrandom = "0.3"
+thiserror = "2"

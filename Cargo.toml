@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/vouch-core"]
+
 [package]
 name = "vouch"
 version = "0.1.0"
