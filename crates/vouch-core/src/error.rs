@@ -35,9 +35,11 @@ pub enum Error {
     #[error("signature verification failed for a claim by {log_id}")]
     BadSignature { log_id: LogId },
 
-    /// The wire version is newer than this implementation understands.
+    /// The wire version is not one this implementation understands. Carries
+    /// the claimed version faithfully (it may be wider than the current
+    /// u16-range version field, e.g. a far-future or garbage value).
     #[error("unsupported wire version {0}")]
-    UnsupportedVersion(u16),
+    UnsupportedVersion(u64),
 
     /// Embeds nested deeper than the recursion cap.
     #[error("embed nesting exceeds maximum depth")]
@@ -46,4 +48,10 @@ pub enum Error {
     /// OS randomness was unavailable (key generation only).
     #[error("system randomness unavailable")]
     Randomness,
+
+    /// A storage backend failed (e.g. a file-backed blob store's I/O).
+    /// vouch-core itself never produces this; it exists so backends
+    /// implementing core traits can report through the core vocabulary.
+    #[error("storage backend failure: {0}")]
+    Storage(String),
 }

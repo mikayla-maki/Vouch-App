@@ -16,13 +16,14 @@
 //! ## The shape
 //!
 //! A claim is a signed *header* that pins a detachable *body* by hash; its
-//! identity is the hash of the header. The sequence number in the header is
-//! advisory — shared language for sync and ordering, never an enforced
-//! invariant; drift it can't see is caught by per-log set fingerprints at
-//! sync time. There are no slots and therefore no forks; redaction drops a
-//! body and leaves the signed header as a tombstone. The graph that *means*
-//! something (recs, entities, vouches, disavowals) lives entirely inside
-//! bodies as [`ClaimRef`] values; the header is plumbing.
+//! identity is the hash of the header `[version, log_id, body_hash]`.
+//! Nothing about ordering is signed — sync coordinates are pipe-local
+//! arrival counts each store keeps about itself, and drift between pipes is
+//! caught by per-log set fingerprints. There are no slots and therefore no
+//! forks; redaction drops a body and leaves the signed header as a
+//! tombstone. The graph that *means* something (recs, entities, vouches,
+//! disavowals) lives entirely inside bodies as [`ClaimRef`] values; the
+//! header is plumbing.
 //!
 //! ## Layering
 //!
@@ -35,7 +36,7 @@
 //!   indexing, cross-path dedup, redaction, and body fill-in.
 //! - [`blob`] — content-addressed media storage: verify-on-arrival,
 //!   want-list driven, GC'd when redaction orphans the bytes.
-//! - [`writer`] — the pen: a keypair plus advisory position, no data.
+//! - [`writer`] — the pen: just a signing key, no data and no position.
 //! - [`database`] — the composition: N merged logs + media + your writers
 //!   behind one door in and a query surface out. The sync engine is this
 //!   plus pipes; a relay is this with no writers.
@@ -46,16 +47,20 @@ pub mod claim;
 pub mod database;
 pub mod error;
 pub mod keys;
+pub mod storage;
 pub mod store;
 pub mod value;
 pub mod writer;
 
-pub use blob::BlobStore;
-pub use claim::{Claim, EventHeader, MAX_BODY_SIZE, SignedEvent, WIRE_VERSION};
+pub use blob::{BlobStorage, BlobStore, MemoryBlobStorage};
+pub use claim::{
+    Claim, EventHeader, MAX_BODY_SIZE, SIGNING_DOMAIN, SignedEvent, WIRE_VERSION, signing_input,
+};
 pub use database::Database;
 pub use ed25519_dalek::Signature;
 pub use error::Error;
 pub use keys::LogId;
+pub use storage::{ClaimStorage, MemoryClaimStorage};
 pub use store::{ClaimStore, IngestReport, Provenance, StateVector, StoredClaim};
 pub use value::{BlobHash, BlobRef, ClaimHash, ClaimRef, Path, PathSeg, Value};
 pub use writer::Writer;

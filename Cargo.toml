@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vouch-core"]
+members = ["crates/vouch-core", "crates/vouch-store"]
 
 [package]
 name = "vouch"

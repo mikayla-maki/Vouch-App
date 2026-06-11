@@ -1,0 +1,11 @@
+[package]
+name = "vouch-store"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "Durable storage backends for vouch-core: SQLite claim storage, file blob storage"
+
+[dependencies]
+vouch-core = { path = "../vouch-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"

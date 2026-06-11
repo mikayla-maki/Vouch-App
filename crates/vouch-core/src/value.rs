@@ -107,6 +107,10 @@ impl fmt::Display for BlobHash {
 /// fetches before holding a single byte.
 ///
 /// Wire form: tag 33003 wrapping `[bytes-32 hash, uint size, text mime]`.
+/// `size` is a `u64` in memory but bounded to the decodable range
+/// `[0, i64::MAX]` on the wire (the value model carries `i64`); the writer
+/// refuses to sign a larger one. A blob that big is unrepresentable here by
+/// design — real media is many orders of magnitude smaller.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlobRef {
     pub hash: BlobHash,

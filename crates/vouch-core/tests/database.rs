@@ -5,12 +5,7 @@
 use vouch_core::{ClaimRef, Database, Error, LogId, SignedEvent, Value, Writer};
 
 fn pull(from: &Database, into: &mut Database, log: &LogId, since: u64) {
-    let events: Vec<SignedEvent> = from
-        .claims()
-        .serve_since(log, since)
-        .into_iter()
-        .cloned()
-        .collect();
+    let events: Vec<SignedEvent> = from.claims().serve_since(log, since);
     for e in events {
         into.ingest(e).unwrap();
     }
@@ -22,11 +17,10 @@ fn mint_sync_heal_redact_gc_full_session() {
     let mut alice = Database::new();
     let log = alice.add_writer(Writer::from_seed([1; 32]));
     let jpeg = b"golden hour at the counter".to_vec();
-    let photo = alice.attach(jpeg.clone(), "image/jpeg");
+    let photo = alice.attach(jpeg.clone(), "image/jpeg").unwrap();
     let rec = alice
         .claim(
             &log,
-            100,
             Value::map([
                 ("type", Value::text("rec")),
                 ("subject", Value::text("Joe's Pizza")),
@@ -51,13 +45,12 @@ fn mint_sync_heal_redact_gc_full_session() {
     // The photo heals from whatever pipe has it.
     assert!(bob.ingest_blob(photo.hash, jpeg).unwrap());
     assert!(bob.missing_blobs().is_empty());
-    assert_eq!(bob.blobs().get(&photo.hash).map(<[u8]>::len), Some(26));
+    assert_eq!(bob.blobs().get(&photo.hash).map(|b| b.len()), Some(26));
 
-    // Alice regrets the rec and mints a redaction (seq 2).
+    // Alice regrets the rec and mints a redaction.
     alice
         .claim(
             &log,
-            200,
             Value::map([
                 ("type", Value::text("redact")),
                 (
@@ -72,13 +65,13 @@ fn mint_sync_heal_redact_gc_full_session() {
         .unwrap();
     // Locally: body gone, photo orphaned, GC forgets the bytes.
     assert!(!alice.claims().contains(&rec.id()));
-    assert_eq!(alice.gc_blobs(), vec![photo.hash]);
+    assert_eq!(alice.gc_blobs().unwrap(), vec![photo.hash]);
 
     // Bob pulls the increment; "seen is applied" drops the body, and his
     // own GC sweep forgets the photo too. The databases agree exactly.
     pull(&alice, &mut bob, &log, 1);
     assert!(!bob.claims().contains(&rec.id()));
-    assert_eq!(bob.gc_blobs(), vec![photo.hash]);
+    assert_eq!(bob.gc_blobs().unwrap(), vec![photo.hash]);
     assert_eq!(
         bob.claims().fingerprint(&log),
         alice.claims().fingerprint(&log)
@@ -92,12 +85,12 @@ fn minting_requires_an_owned_log() {
     let stranger = Writer::from_seed([9; 32]).id();
     let body = Value::map([("type", Value::text("rec"))]);
 
-    let err = db.claim(&stranger, 0, body.clone()).unwrap_err();
+    let err = db.claim(&stranger, body.clone()).unwrap_err();
     assert!(matches!(err, Error::NotOurLog(id) if id == stranger));
 
     // A created log can be minted into immediately.
     let own = db.create_log().unwrap();
-    db.claim(&own, 0, body).unwrap();
+    db.claim(&own, body).unwrap();
     assert_eq!(db.owned_logs().collect::<Vec<_>>(), vec![&own]);
     assert_eq!(db.claims().log(&own).len(), 1);
 }
@@ -109,14 +102,13 @@ fn a_relay_is_a_database_with_no_writers() {
     // nothing — it's the same Database type doing store-and-forward.
     let mut alice = Database::new();
     let log = alice.add_writer(Writer::from_seed([1; 32]));
-    for (i, place) in ["Joe's", "Blue Bottle", "the park"].iter().enumerate() {
+    for place in ["Joe's", "Blue Bottle", "the park"] {
         alice
             .claim(
                 &log,
-                i as i64,
                 Value::map([
                     ("type", Value::text("rec")),
-                    ("subject", Value::text(*place)),
+                    ("subject", Value::text(place)),
                 ]),
             )
             .unwrap();

@@ -28,27 +28,26 @@ impl Rng {
     }
 }
 
-fn rec_body(subject: &str) -> Value {
+fn rec_body(at: i64, subject: &str) -> Value {
     Value::map([
         ("type", Value::text("rec")),
+        ("at", Value::Int(at)),
         ("subject", Value::text(subject)),
         ("body", Value::text(format!("{subject} is great"))),
     ])
 }
 
-fn rec(db: &mut Writer, ts: i64, subject: &str) -> SignedEvent {
-    db.claim(ts, rec_body(subject)).unwrap()
+fn rec(db: &mut Writer, at: i64, subject: &str) -> SignedEvent {
+    db.claim(rec_body(at, subject)).unwrap()
 }
 
-fn vouch(db: &mut Writer, ts: i64, original: &SignedEvent) -> SignedEvent {
-    db.claim(
-        ts,
-        Value::map([
-            ("type", Value::text("vouch")),
-            ("original", Value::Embed(Box::new(original.clone()))),
-            ("body", Value::text("seconded!")),
-        ]),
-    )
+fn vouch(db: &mut Writer, at: i64, original: &SignedEvent) -> SignedEvent {
+    db.claim(Value::map([
+        ("type", Value::text("vouch")),
+        ("at", Value::Int(at)),
+        ("original", Value::Embed(Box::new(original.clone()))),
+        ("body", Value::text("seconded!")),
+    ]))
     .unwrap()
 }
 
@@ -143,25 +142,21 @@ fn shuffled_replay_converges() {
     }
     // Bob vouches some of Alice's recs and writes an entity + rec of his own.
     let bob_entity = bob
-        .claim(
-            2000,
-            Value::map([
-                ("type", Value::text("entity")),
-                ("name", Value::text("Joe's Pizza")),
-            ]),
-        )
+        .claim(Value::map([
+            ("type", Value::text("entity")),
+            ("at", Value::Int(2000)),
+            ("name", Value::text("Joe's Pizza")),
+        ]))
         .unwrap();
     let entity_ref = cref(&bob_entity);
     events.push(bob_entity.clone());
     events.push(
-        bob.claim(
-            2001,
-            Value::map([
-                ("type", Value::text("rec")),
-                ("about", Value::ClaimRef(entity_ref)),
-                ("body", Value::text("best slice in town")),
-            ]),
-        )
+        bob.claim(Value::map([
+            ("type", Value::text("rec")),
+            ("at", Value::Int(2001)),
+            ("about", Value::ClaimRef(entity_ref)),
+            ("body", Value::text("best slice in town")),
+        ]))
         .unwrap(),
     );
     events.push(vouch(&mut bob, 2002, &events[0]));
@@ -169,14 +164,12 @@ fn shuffled_replay_converges() {
     // Carol disavows one of Alice's recs (dangling until it arrives).
     events.push(
         carol
-            .claim(
-                3000,
-                Value::map([
-                    ("type", Value::text("disavowal")),
-                    ("disavows", Value::ClaimRef(cref(&events[5]))),
-                    ("body", Value::text("closed down last year")),
-                ]),
-            )
+            .claim(Value::map([
+                ("type", Value::text("disavowal")),
+                ("at", Value::Int(3000)),
+                ("disavows", Value::ClaimRef(cref(&events[5]))),
+                ("body", Value::text("closed down last year")),
+            ]))
             .unwrap(),
     );
 
@@ -206,34 +199,30 @@ fn dangling_backlinks_heal_when_the_target_arrives() {
     let alice_rec = rec(&mut alice, 100, "Joe's Pizza");
     let target = id_of(&alice_rec);
     let disavowal = carol
-        .claim(
-            200,
-            Value::map([
-                ("type", Value::text("disavowal")),
-                ("disavows", Value::ClaimRef(cref(&alice_rec))),
-            ]),
-        )
+        .claim(Value::map([
+            ("type", Value::text("disavowal")),
+            ("disavows", Value::ClaimRef(cref(&alice_rec))),
+        ]))
         .unwrap();
 
     let mut db = Database::new();
     // Disavowal arrives FIRST: the edge exists, the target doesn't.
     db.ingest(disavowal.clone()).unwrap();
-    assert_eq!(db.claims().backlinks(&target).count(), 1);
+    assert_eq!(db.claims().backlinks(&target).len(), 1);
     assert!(!db.claims().contains(&target));
 
     // Target arrives: the same query now resolves end to end.
     db.ingest(alice_rec).unwrap();
     assert!(db.claims().contains(&target));
-    let disavowers: Vec<_> = db.claims().backlinks(&target).collect();
-    assert_eq!(disavowers, vec![&id_of(&disavowal)]);
+    assert_eq!(db.claims().backlinks(&target), vec![id_of(&disavowal)]);
 }
 
 #[test]
 fn same_seed_writers_collide_harmlessly() {
-    // The old fork scenario: one identity, two devices, both write "claim 1"
-    // with different content. Under content-addressed identity these are
-    // simply two different claims that share an advisory sequence — both
-    // store, nothing conflicts. Order doesn't matter.
+    // The old fork scenario: one identity, two devices, both writing at
+    // once. A writer carries no position at all — there is nothing to
+    // restore after a crash and nothing for two devices to collide on.
+    // Just two different claims in one log, in any order.
     let mut a1 = Writer::from_seed([8; 32]);
     let mut a2 = Writer::from_seed([8; 32]);
     assert_eq!(a1.id(), a2.id());
@@ -241,10 +230,6 @@ fn same_seed_writers_collide_harmlessly() {
     let first = rec(&mut a1, 100, "version one");
     let second = rec(&mut a2, 100, "version two");
     assert_ne!(id_of(&first), id_of(&second));
-    assert_eq!(
-        first.header().unwrap().sequence,
-        second.header().unwrap().sequence
-    );
 
     let mut ab = Database::new();
     ab.ingest(first.clone()).unwrap();
@@ -264,90 +249,77 @@ fn same_seed_writers_collide_harmlessly() {
 
 #[test]
 fn fingerprint_flags_silent_divergence_that_cursors_cannot_see() {
-    // Alice mints claims 1..=6 in her database and syncs them to a
-    // follower. Then her device dies; she restores from a backup taken at
-    // claim 5 and mints a DIFFERENT claim 6, then 7 and 8. The follower
-    // catches up "since 6": it receives 7 and 8, and both sides now sit at
-    // max_sequence 8 with equal claim counts — every cursor agrees — yet
-    // the follower holds old-6 (which Alice lost) and is missing new-6
-    // (which "since 6" will never resend). The fingerprint catches this.
-    let mut alice = Database::new();
-    let log = alice.add_writer(Writer::from_seed([1; 32]));
-    let mut early: Vec<SignedEvent> = (0..6)
-        .map(|i| alice.claim(&log, i, rec_body("original")).unwrap())
+    // Cursors are pipe-local arrival counts, so an AUTHOR can no longer
+    // collide on numbering — but a RELAY restored from a backup can reuse
+    // arrival positions. Alice publishes c1..c6 to a relay; a client syncs
+    // all six (cursor = 6). The relay dies and is restored from a backup
+    // holding only c1..c5; Alice then publishes c7 and c8, which land at
+    // arrivals 5 and 6 on the restored relay. The client pulls "I have 6"
+    // and receives only c8 — and now both sides hold seven claims, the
+    // cursor equals the relay's count, every cursor-shaped signal agrees —
+    // yet the client holds c6 (which the relay lost) and is missing c7.
+    // The fingerprint catches it.
+    let mut alice = Writer::from_seed([1; 32]);
+    let log = alice.id();
+    let claims: Vec<SignedEvent> = (0..8)
+        .map(|i| rec(&mut alice, 1000 + i, &format!("place-{i}")))
         .collect();
-    let old_six = early.pop().unwrap();
 
-    let mut follower = Database::new();
-    for e in early.iter().chain([&old_six]) {
-        follower.ingest(e.clone()).unwrap();
+    let mut relay = Database::new();
+    for c in &claims[..6] {
+        relay.ingest(c.clone()).unwrap();
     }
-
-    // Alice's device dies. She restores from the claim-5 backup: the five
-    // early claims, plus a writer resumed at sequence 6 — old-6 is lost.
-    let mut alice = Database::new();
-    let log = alice.add_writer(Writer::resume([1; 32], 6));
-    for e in &early {
-        alice.ingest(e.clone()).unwrap();
+    let mut client = Database::new();
+    for e in relay.claims().serve_since(&log, 0) {
+        client.ingest(e).unwrap();
     }
-    let new_six = alice.claim(&log, 50, rec_body("rewritten")).unwrap();
-    alice.claim(&log, 51, rec_body("seven")).unwrap();
-    alice.claim(&log, 52, rec_body("eight")).unwrap();
-    assert_eq!(
-        old_six.header().unwrap().sequence,
-        new_six.header().unwrap().sequence
-    );
+    let mut cursor = client.claims().log_len(&log);
+    assert_eq!(cursor, 6);
 
-    // The fast path: follower pulls "since 6" and gets 7 and 8.
-    let served: Vec<SignedEvent> = alice
-        .claims()
-        .serve_since(&log, 6)
-        .into_iter()
-        .cloned()
-        .collect();
+    // The relay is restored from a stale backup (c6 lost), then receives
+    // Alice's two new claims at the recycled arrival positions.
+    let mut relay = Database::new();
+    for c in &claims[..5] {
+        relay.ingest(c.clone()).unwrap();
+    }
+    relay.ingest(claims[6].clone()).unwrap();
+    relay.ingest(claims[7].clone()).unwrap();
+
+    // Fast path: the client pulls past its cursor and gets ONE claim (c8).
+    let served = relay.claims().serve_since(&log, cursor);
+    assert_eq!(served.len(), 1);
     for e in served {
-        follower.ingest(e).unwrap();
+        client.ingest(e).unwrap();
     }
+    cursor += 1;
 
-    // Every cursor-shaped signal says the databases agree...
-    assert_eq!(follower.claims().max_sequence(&log), Some(8));
-    assert_eq!(alice.claims().max_sequence(&log), Some(8));
-    assert_eq!(follower.claims().len(), alice.claims().len());
+    // Every cursor-shaped signal says the two agree...
+    assert_eq!(relay.claims().log_len(&log), 7);
+    assert_eq!(client.claims().log_len(&log), 7);
+    assert_eq!(cursor, relay.claims().log_len(&log));
     // ...the fingerprint says they don't.
     assert_ne!(
-        follower.claims().fingerprint(&log),
-        alice.claims().fingerprint(&log)
+        relay.claims().fingerprint(&log),
+        client.claims().fingerprint(&log)
     );
 
     // Mismatch triggers full reconciliation (here: replay everything both
     // ways), after which the fingerprints — and the state — agree.
-    let from_alice: Vec<SignedEvent> = alice
-        .claims()
-        .serve_since(&log, 0)
-        .into_iter()
-        .cloned()
-        .collect();
-    for e in from_alice {
-        follower.ingest(e).unwrap();
+    for e in relay.claims().serve_since(&log, 0) {
+        client.ingest(e).unwrap();
     }
-    let from_follower: Vec<SignedEvent> = follower
-        .claims()
-        .serve_since(&log, 0)
-        .into_iter()
-        .cloned()
-        .collect();
-    for e in from_follower {
-        alice.ingest(e).unwrap();
+    for e in client.claims().serve_since(&log, 0) {
+        relay.ingest(e).unwrap();
     }
     assert_eq!(
-        follower.claims().fingerprint(&log),
-        alice.claims().fingerprint(&log)
+        relay.claims().fingerprint(&log),
+        client.claims().fingerprint(&log)
     );
     assert_eq!(
-        follower.claims().state_vector(),
-        alice.claims().state_vector()
+        relay.claims().state_vector(),
+        client.claims().state_vector()
     );
-    assert_eq!(follower.claims().log(&log).len(), 9); // 1..=5, both 6s, 7, 8
+    assert_eq!(relay.claims().log(&log).len(), 8);
 }
 
 #[test]
@@ -374,7 +346,7 @@ fn cross_path_dedup_gives_one_claim_many_endorsements() {
         db.claims().get(&alice_id).unwrap().provenance,
         Provenance::Direct
     );
-    assert_eq!(db.claims().by_type("vouch").count(), 2);
+    assert_eq!(db.claims().by_type("vouch").len(), 2);
 }
 
 #[test]

@@ -21,25 +21,51 @@
 
 use std::collections::HashMap;
 
-use crate::blob::BlobStore;
+use crate::blob::{BlobStorage, BlobStore};
 use crate::claim::SignedEvent;
 use crate::error::Error;
 use crate::keys::LogId;
+use crate::storage::ClaimStorage;
 use crate::store::{ClaimStore, IngestReport};
 use crate::value::{BlobHash, BlobRef, Value};
 use crate::writer::Writer;
 
 /// N merged logs, their media, and the writers for the logs you own.
-#[derive(Default)]
 pub struct Database {
     claims: ClaimStore,
     blobs: BlobStore,
     writers: HashMap<LogId, Writer>,
 }
 
+impl Default for Database {
+    fn default() -> Database {
+        Database::new()
+    }
+}
+
 impl Database {
+    /// A fully in-memory database (tests, simulations, relays that don't
+    /// care about restarts).
     pub fn new() -> Database {
-        Database::default()
+        Database {
+            claims: ClaimStore::new(),
+            blobs: BlobStore::new(),
+            writers: HashMap::new(),
+        }
+    }
+
+    /// A database with both storage backends injected: claim storage
+    /// (SQLite in the app, memory in tests) and media storage (files,
+    /// memory). Location and backend are upstream's decision, never the
+    /// engine's — and the backends are dumb by construction; all
+    /// verification and convergence logic stays in core no matter what's
+    /// injected here.
+    pub fn with_stores(claims: Box<dyn ClaimStorage>, blobs: Box<dyn BlobStorage>) -> Database {
+        Database {
+            claims: ClaimStore::with_storage(claims),
+            blobs: BlobStore::with_storage(blobs),
+            writers: HashMap::new(),
+        }
     }
 
     // ── Owned logs ──────────────────────────────────────────────────────
@@ -68,28 +94,24 @@ impl Database {
     /// Store media bytes locally and return the [`BlobRef`] to pin in a
     /// claim body. Attach-then-claim ordering is enforced by the API shape:
     /// you can't pin a ref you haven't been handed.
-    pub fn attach(&mut self, bytes: Vec<u8>, mime: impl Into<String>) -> BlobRef {
+    pub fn attach(&mut self, bytes: Vec<u8>, mime: impl Into<String>) -> Result<BlobRef, Error> {
         let size = bytes.len() as u64;
-        let hash = self.blobs.put(bytes);
-        BlobRef {
+        let hash = self.blobs.put(bytes)?;
+        Ok(BlobRef {
             hash,
             size,
             mime: mime.into(),
-        }
+        })
     }
 
     /// Mint a claim into an owned log: sign it, ingest it like any other
     /// event, and return the artifact (for a publish queue). After this
     /// returns, the claim is part of local state — your own claims are
-    /// ordinary claims.
-    pub fn claim(
-        &mut self,
-        log: &LogId,
-        timestamp_ms: i64,
-        body: Value,
-    ) -> Result<SignedEvent, Error> {
+    /// ordinary claims. The body carries everything the claim says,
+    /// including its claimed time (the vocabulary's `at` field).
+    pub fn claim(&mut self, log: &LogId, body: Value) -> Result<SignedEvent, Error> {
         let writer = self.writers.get_mut(log).ok_or(Error::NotOurLog(*log))?;
-        let event = writer.claim(timestamp_ms, body)?;
+        let event = writer.claim(body)?;
         self.claims.ingest(event.clone())?;
         Ok(event)
     }
@@ -102,8 +124,20 @@ impl Database {
         self.claims.ingest(event)
     }
 
-    /// Ingest blob bytes from any pipe, verified against the pinning hash.
-    /// Returns whether the bytes were new; see [`BlobStore::insert_verified`].
+    /// [`ingest`](Self::ingest) with the caller's clock: records when this
+    /// store first learned the claim (local metadata). The engine passes
+    /// "now"; vouch-core never reads a clock.
+    pub fn ingest_at(
+        &mut self,
+        event: SignedEvent,
+        received_at: i64,
+    ) -> Result<IngestReport, Error> {
+        self.claims.ingest_at(event, received_at)
+    }
+
+    /// Ingest blob bytes from any pipe, verified against the pinning hash
+    /// (in core, before any backend sees them). Returns whether the bytes
+    /// were new; see [`BlobStore::insert_verified`].
     pub fn ingest_blob(&mut self, pinned: BlobHash, bytes: Vec<u8>) -> Result<bool, Error> {
         self.blobs.insert_verified(pinned, bytes)
     }
@@ -129,7 +163,7 @@ impl Database {
     // ── Maintenance ─────────────────────────────────────────────────────
 
     /// Drop blobs no live body references (cooperative deletion for media).
-    pub fn gc_blobs(&mut self) -> Vec<BlobHash> {
+    pub fn gc_blobs(&mut self) -> Result<Vec<BlobHash>, Error> {
         self.blobs.gc(&self.claims)
     }
 }

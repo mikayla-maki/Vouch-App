@@ -165,6 +165,11 @@ impl<'a> Decoder<'a> {
         Decoder { buf, pos: 0 }
     }
 
+    /// Bytes consumed so far (for reading from a CBOR sequence).
+    pub(crate) fn pos(&self) -> usize {
+        self.pos
+    }
+
     fn err<T>(&self, reason: &'static str) -> Result<T, Error> {
         Err(Error::Cbor {
             offset: self.pos,
@@ -268,22 +273,6 @@ impl<'a> Decoder<'a> {
             return self.err(reason);
         }
         Ok(arg)
-    }
-
-    /// Read a signed integer (major 0 or 1) bounded to i64.
-    pub(crate) fn int(&mut self, reason: &'static str) -> Result<i64, Error> {
-        let (m, arg) = self.head()?;
-        match m {
-            0 => i64::try_from(arg).or_else(|_| self.err("integer out of range")),
-            1 => {
-                if arg > i64::MAX as u64 {
-                    self.err("integer out of range")
-                } else {
-                    Ok(-1 - arg as i64)
-                }
-            }
-            _ => self.err(reason),
-        }
     }
 
     pub(crate) fn done(&self) -> Result<(), Error> {
