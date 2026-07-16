@@ -266,47 +266,67 @@ fn redacting_the_redaction_does_not_resurrect() {
 // ── Adversarial-review regressions ──────────────────────────────────────
 
 #[test]
-fn redaction_before_an_embedding_container_still_propagates_the_embed() {
-    // CRITICAL regression: an embedded claim is an independent signed
-    // artifact and must be ingested even when its container arrives
-    // already-redacted (body suppressed). Order A (container then redact)
-    // stored the embed; order B (redact then container) used to drop it,
-    // because embeds were extracted from the post-suppression body. The two
-    // stores then diverged forever.
-    let mut bob = Writer::from_seed([2; 32]); // author of the embedded rec
+fn redacting_a_quote_takes_the_quoted_content_with_it() {
+    // The merged-embed contract: a quote is part of the speech that carries
+    // it — it was never a row, so redacting the container removes the quote,
+    // interior and all, with nothing orphaned and nothing to clean up. Both
+    // arrival orders converge on the same nothing.
+    let mut bob = Writer::from_seed([2; 32]); // author of the quoted rec
     let mut alice = Writer::from_seed([1; 32]); // author of the vouch + redact
 
     let inner = rec(&mut bob, 50, "the original");
     let inner_id = id_of(&inner);
-    let container = vouch(&mut alice, 100, &inner); // embeds bob's rec
+    let container = vouch(&mut alice, 100, &inner); // quotes bob's rec
+    let container_id = id_of(&container);
     let redaction = redact(&mut alice, 200, &container);
 
     let mut a = ClaimStore::new();
     a.ingest(container.clone()).unwrap();
+    // While the quote lives, its edges live: the quote backlinks Bob's rec.
+    assert_eq!(a.backlinks(&inner_id), vec![container_id]);
     a.ingest(redaction.clone()).unwrap();
 
     let mut b = ClaimStore::new();
     b.ingest(redaction).unwrap();
     b.ingest(container).unwrap();
 
-    assert!(a.contains(&inner_id), "A lost the embed");
-    assert!(b.contains(&inner_id), "B dropped the embed (the bug)");
+    for (store, order) in [(&a, "container-first"), (&b, "redact-first")] {
+        assert!(
+            store.get(&inner_id).is_none(),
+            "{order}: a quote is content, not a row"
+        );
+        assert!(
+            store.get(&container_id).unwrap().embeds().is_empty(),
+            "{order}: the redacted quote renders nothing"
+        );
+        assert!(
+            store.backlinks(&inner_id).is_empty(),
+            "{order}: the dead quote's edges died with it"
+        );
+        assert_eq!(store.log_len(&bob.id()), 0, "{order}: bob's log untouched");
+    }
     assert_eq!(a.state_vector(), b.state_vector());
-    assert_eq!(a.fingerprint(&bob.id()), b.fingerprint(&bob.id()));
+    assert!(a.verify_integrity().is_empty());
+
+    // Bob's own copy is unaffected by Alice redacting HER quote: anyone who
+    // follows Bob still gets the original from him.
+    let mut bobs_friend = ClaimStore::new();
+    bobs_friend.ingest(inner).unwrap();
+    assert!(bobs_friend.contains(&inner_id));
 }
 
 #[test]
-fn redaction_before_a_container_still_applies_an_embedded_redact() {
-    // CRITICAL corollary: when the redacted container's body embeds a redact
-    // claim, that redact's effect ("seen is applied") must fire in any
-    // arrival order, or the redactions map itself diverges.
+fn an_embedded_redact_is_quotation_not_authority() {
+    // A redact claim arriving INSIDE a quote has no engine effect: quoting
+    // is speech, and redaction authority flows only through the author's
+    // own log as a top-level event. Both arrival orders agree.
     let mut bob = Writer::from_seed([2; 32]);
     let mut alice = Writer::from_seed([1; 32]);
 
     let y = rec(&mut bob, 50, "bob's regret");
     let y_id = id_of(&y);
     let inner_redact = redact(&mut bob, 60, &y); // bob redacts his own y
-    let container = vouch(&mut alice, 100, &inner_redact);
+    let container = vouch(&mut alice, 100, &inner_redact); // alice quotes the redact
     let outer_redact = redact(&mut alice, 200, &container);
 
     let mut a = ClaimStore::new();
@@ -314,17 +334,25 @@ fn redaction_before_a_container_still_applies_an_embedded_redact() {
         a.ingest(e).unwrap();
     }
     let mut b = ClaimStore::new();
-    for e in [outer_redact, container, y] {
+    for e in [outer_redact, container, y.clone()] {
         b.ingest(e).unwrap();
     }
 
-    assert_eq!(a.redaction(&y_id), Some(id_of(&inner_redact)));
-    assert_eq!(
-        b.redaction(&y_id),
-        Some(id_of(&inner_redact)),
-        "embedded redact lost in order B"
-    );
+    for (store, order) in [(&a, "y-first"), (&b, "y-last")] {
+        assert_eq!(
+            store.redaction(&y_id),
+            None,
+            "{order}: a quoted redact must not censor"
+        );
+        assert!(store.contains(&y_id), "{order}: y keeps its body");
+    }
     assert_eq!(a.state_vector(), b.state_vector());
+
+    // Delivered top-level — from Bob's own log, as sync would — the same
+    // redact claim takes effect.
+    a.ingest(inner_redact.clone()).unwrap();
+    assert_eq!(a.redaction(&y_id), Some(id_of(&inner_redact)));
+    assert!(!a.contains(&y_id));
 }
 
 #[test]
@@ -396,7 +424,7 @@ fn fsck_flags_a_redaction_with_no_backing_claim() {
 #[test]
 fn received_at_is_local_metadata_not_convergent_state() {
     // MAJOR coverage gap: received_at (when THIS store learned the claim)
-    // must be excluded from state_vector and fingerprint, like provenance.
+    // must be excluded from state_vector and fingerprint, like arrival.
     let mut alice = Writer::from_seed([1; 32]);
     let content = rec(&mut alice, 100, "Joe's Pizza");
 

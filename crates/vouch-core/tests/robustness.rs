@@ -10,13 +10,12 @@
 //! exhaustive sweep below fails.
 
 use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use vouch_core::storage::{ClaimStorage, MemoryClaimStorage};
 use vouch_core::value::{BlobHash, ClaimHash};
-use vouch_core::{
-    ClaimRef, ClaimStore, Error, LogId, Provenance, SignedEvent, StoredClaim, Value, Writer,
-};
+use vouch_core::{ClaimRef, ClaimStore, Error, LogId, SignedEvent, StoredClaim, Value, Writer};
 
 /// Wraps the memory backend; every MUTATING call spends from a shared
 /// budget and fails once it's gone (reads stay up: a crashed-and-restarted
@@ -25,8 +24,8 @@ use vouch_core::{
 /// partial writes persist.
 struct FlakyStorage {
     inner: MemoryClaimStorage,
-    budget: Rc<Cell<i64>>,
-    writes: Rc<Cell<u64>>,
+    budget: Arc<AtomicI64>,
+    writes: Arc<AtomicU64>,
     /// When false, transactions are EXPLICIT no-ops — the conscious
     /// "partial state can persist across a crash" choice the trait now
     /// forces a backend to write out. When true, forwarded to the memory
@@ -39,16 +38,16 @@ struct FlakyStorage {
 
 impl FlakyStorage {
     fn spend(&mut self) -> Result<(), Error> {
-        self.writes.set(self.writes.get() + 1);
-        if self.fail_once_at.get() == Some(self.writes.get()) {
+        let write = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.fail_once_at.get() == Some(write) {
             self.fail_once_at.set(None);
             return Err(Error::Storage("transient fault".into()));
         }
-        let left = self.budget.get();
+        let left = self.budget.load(Ordering::Relaxed);
         if left <= 0 {
             return Err(Error::Storage("injected fault".into()));
         }
-        self.budget.set(left - 1);
+        self.budget.store(left - 1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -131,8 +130,8 @@ impl ClaimStorage for FlakyStorage {
     }
 }
 
-/// A write-heavy scenario touching every invariant path: embeds (recursive
-/// multi-claim ingest), cross-log refs (backlinks), media (blob
+/// A write-heavy scenario touching every invariant path: embeds (deep edge
+/// indexing through quotes), cross-log refs (backlinks), media (blob
 /// referrers), redaction (entry + body drop + index removal), and a
 /// tombstone fill-in.
 fn scenario() -> Vec<SignedEvent> {
@@ -216,9 +215,9 @@ fn scenario() -> Vec<SignedEvent> {
     ]
 }
 
-fn flaky_store(budget: i64, transactional: bool) -> (ClaimStore, Rc<Cell<i64>>, Rc<Cell<u64>>) {
-    let budget = Rc::new(Cell::new(budget));
-    let writes = Rc::new(Cell::new(0u64));
+fn flaky_store(budget: i64, transactional: bool) -> (ClaimStore, Arc<AtomicI64>, Arc<AtomicU64>) {
+    let budget = Arc::new(AtomicI64::new(budget));
+    let writes = Arc::new(AtomicU64::new(0));
     let storage = FlakyStorage {
         inner: MemoryClaimStorage::new(),
         budget: budget.clone(),
@@ -246,7 +245,7 @@ fn crash_at_every_write_point_heals_under_redelivery() {
     for e in &events {
         counter.ingest(e.clone()).unwrap();
     }
-    let total = writes.get();
+    let total = writes.load(Ordering::Relaxed);
     assert!(total > 10, "scenario should be write-heavy, got {total}");
 
     // Crash at write N, for every N; redeliver; demand exact convergence.
@@ -255,7 +254,7 @@ fn crash_at_every_write_point_heals_under_redelivery() {
         for e in &events {
             let _ = store.ingest(e.clone()); // faults expected
         }
-        budget.set(i64::MAX); // "restart": storage works again
+        budget.store(i64::MAX, Ordering::Relaxed); // "restart": storage works again
         for e in &events {
             store
                 .ingest(e.clone())
@@ -293,7 +292,7 @@ fn transactional_backends_leave_zero_debris() {
     for e in &events {
         counter.ingest(e.clone()).unwrap();
     }
-    let total = writes.get();
+    let total = writes.load(Ordering::Relaxed);
 
     for n in 0..total {
         let (mut store, budget, _) = flaky_store(n as i64, true);
@@ -306,7 +305,7 @@ fn transactional_backends_leave_zero_debris() {
             problems.is_empty(),
             "debris after crash at write {n}: {problems:?}"
         );
-        budget.set(i64::MAX);
+        budget.store(i64::MAX, Ordering::Relaxed);
         for e in &events {
             store.ingest(e.clone()).unwrap();
         }
@@ -435,7 +434,6 @@ fn fsck_catches_a_lying_or_corrupted_backend() {
             body: claim.body,
             refs: vec![],
             blobs: vec![],
-            provenance: Provenance::Direct,
             arrival: 0,
             received_at: 0,
         })
@@ -462,12 +460,11 @@ fn fsck_catches_a_lying_or_corrupted_backend() {
 }
 
 #[test]
-fn a_transient_fault_ingesting_an_embed_aborts_not_swallows() {
+fn a_transient_fault_indexing_a_quote_aborts_not_swallows() {
     // CRITICAL regression: a transient backend fault (one failed write that
-    // would succeed on retry) DURING an embedded claim's ingest must abort
-    // the whole transaction — not be silently miscounted as a "rejected
-    // embed", commit a container without its embed, and return Ok (so a
-    // sync layer advances its cursor and never redelivers).
+    // would succeed on retry) while indexing a quote's edges must abort the
+    // whole transaction — not commit a container with half its edges and
+    // return Ok (so a sync layer advances its cursor and never redelivers).
     let mut bob = Writer::from_seed([2; 32]);
     let mut alice = Writer::from_seed([1; 32]);
     let inner = bob
@@ -483,10 +480,10 @@ fn a_transient_fault_ingesting_an_embed_aborts_not_swallows() {
         ]))
         .unwrap();
 
-    // Embeds are ingested first, so the embed's put_claim is the FIRST
-    // write. Fail it once, transactionally.
-    let budget = Rc::new(Cell::new(i64::MAX));
-    let writes = Rc::new(Cell::new(0u64));
+    // The quote's backlink (add_backlink) is the FIRST write of this
+    // ingest. Fail it once, transactionally.
+    let budget = Arc::new(AtomicI64::new(i64::MAX));
+    let writes = Arc::new(AtomicU64::new(0));
     let storage = FlakyStorage {
         inner: MemoryClaimStorage::new(),
         budget,
@@ -499,15 +496,15 @@ fn a_transient_fault_ingesting_an_embed_aborts_not_swallows() {
     let err = store.ingest(container.clone()).unwrap_err();
     assert!(
         matches!(err, Error::Storage(_)),
-        "transient embed fault must surface as a retriable error, got {err:?}"
+        "transient edge fault must surface as a retriable error, got {err:?}"
     );
     // Nothing committed — not the container, not a phantom index row.
     assert!(store.is_empty());
     assert!(store.verify_integrity().is_empty());
 
-    // Retry (the "redelivery"): now it lands cleanly, embed and all.
+    // Retry (the "redelivery"): now it lands cleanly, edges and all.
     store.ingest(container.clone()).unwrap();
-    assert!(store.contains(&inner.id()));
     assert!(store.contains(&container.id()));
+    assert_eq!(store.backlinks(&inner.id()), vec![container.id()]);
     assert!(store.verify_integrity().is_empty());
 }

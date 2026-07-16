@@ -38,17 +38,28 @@
 //!   want-list driven, GC'd when redaction orphans the bytes.
 //! - [`writer`] — the pen: just a signing key, no data and no position.
 //! - [`database`] — the composition: N merged logs + media + your writers
-//!   behind one door in and a query surface out. The sync engine is this
-//!   plus pipes; a relay is this with no writers.
+//!   behind one door in and a query surface out.
+//! - [`draft`] — a claim under construction: body plus attachments, minted
+//!   atomically.
+//! - [`sync`] — the sans-io sync engine: the wire protocol as data, the
+//!   session state machine, the stateless responder, push frames, cursor
+//!   state.
+//! - [`peer`] — the composition with a name on the network: one actor task
+//!   per database, channel pipes, follows in, broadcasts out. Still no
+//!   I/O — sockets live in transport tasks; this crate ends at typed
+//!   messages.
 
 pub mod blob;
 pub mod cbor;
 pub mod claim;
 pub mod database;
+pub mod draft;
 pub mod error;
 pub mod keys;
+pub mod peer;
 pub mod storage;
 pub mod store;
+pub mod sync;
 pub mod value;
 pub mod writer;
 
@@ -57,10 +68,19 @@ pub use claim::{
     Claim, EventHeader, MAX_BODY_SIZE, SIGNING_DOMAIN, SignedEvent, WIRE_VERSION, signing_input,
 };
 pub use database::Database;
+pub use draft::Draft;
 pub use ed25519_dalek::Signature;
 pub use error::Error;
 pub use keys::LogId;
+pub use peer::{
+    Peer, PeerActor, PeerEvent, PipeConfig, PipeEnd, PipeId, PipeMsg, ServePolicy, pipe,
+};
 pub use storage::{ClaimStorage, MemoryClaimStorage};
-pub use store::{ClaimStore, IngestReport, Provenance, StateVector, StoredClaim};
-pub use value::{BlobHash, BlobRef, ClaimHash, ClaimRef, Path, PathSeg, Value};
+pub use store::{
+    ClaimStore, IngestReport, StateVector, StoredClaim, fingerprint_claim, fingerprint_redaction,
+    redact_target,
+};
+pub use value::{
+    BlobHash, BlobRef, ClaimHash, ClaimRef, Edges, MAX_EMBED_DEPTH, Path, PathSeg, Value,
+};
 pub use writer::Writer;

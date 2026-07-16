@@ -5,8 +5,8 @@
 //! claims on purpose:
 //!
 //! - **Blobs are cache, not convergent state.** Claims sync eagerly and the
-//!   per-log fingerprint covers them; blob presence is local, like
-//!   provenance. A store can be fully synced on claims while missing
+//!   per-log fingerprint covers them; blob presence is local, like arrival
+//!   order. A store can be fully synced on claims while missing
 //!   bytes — the UI shows a placeholder and the want stands forever.
 //! - **Anyone can serve a blob.** Bytes either hash to the pinned value or
 //!   they don't, so every pipe is equally trustworthy and arrival order is
@@ -30,7 +30,7 @@ use crate::value::BlobHash;
 /// Dumb content-addressed byte storage. Implementations store and
 /// retrieve; they never hash, verify, or decide. See [`BlobStore`] for the
 /// logic that drives them.
-pub trait BlobStorage {
+pub trait BlobStorage: Send {
     /// Store bytes under a hash the engine has already verified.
     fn insert(&mut self, hash: BlobHash, bytes: Vec<u8>) -> Result<(), Error>;
 
@@ -109,6 +109,20 @@ impl BlobStore {
 
     pub fn contains(&self, hash: &BlobHash) -> bool {
         self.storage.contains(hash)
+    }
+
+    /// Cache eviction: drop the bytes, keep every claim. The pinning
+    /// claims still reference the hash, so it reappears on the want-list
+    /// (`missing_blobs`) and heals from any pipe that serves the referring
+    /// log — the website model: media is *re-queryable*, never hoarded.
+    /// Storage-pressure policy (what to evict, when) belongs to the app;
+    /// this is just the safe primitive. Returns whether bytes were held.
+    ///
+    /// Contrast [`gc`](Self::gc), which drops only *unreferenced* bytes
+    /// (cooperative deletion); eviction drops *referenced* bytes on
+    /// purpose, trading local disk for a future re-fetch.
+    pub fn evict(&mut self, hash: &BlobHash) -> Result<bool, Error> {
+        self.storage.remove(hash)
     }
 
     /// Drop every blob no live body references, returning what was

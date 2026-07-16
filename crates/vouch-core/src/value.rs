@@ -9,8 +9,19 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::claim::SignedEvent;
+use crate::claim::{Claim, SignedEvent};
 use crate::keys::LogId;
+
+/// How deep embedded claims may nest inside one another.
+///
+/// Each level of a re-vouch chain nests the previous event, so this bounds
+/// the longest endorsement chain indexed in one artifact. ~33 bits suffice
+/// to individually identify every human, so even a maximally viral chain of
+/// re-vouches stays well under 64; the cap is pure headroom over reality
+/// while still bounding adversarial verification work (one signature check
+/// per level). An embed past the cap is skipped — left as opaque signed
+/// bytes, neither verified nor indexed.
+pub const MAX_EMBED_DEPTH: usize = 64;
 
 /// CBOR tag number for a [`ClaimRef`] value.
 ///
@@ -162,6 +173,24 @@ pub type FoundEmbeds = Vec<(Path, SignedEvent)>;
 /// Every [`BlobRef`] found in a body, with where it was found.
 pub type FoundBlobs = Vec<(Path, BlobRef)>;
 
+/// Every outgoing edge of a body, collected *through* its embeds — what the
+/// store indexes for a claim. See [`Value::collect_edges`].
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Edges {
+    /// Claim edges: every [`ClaimRef`] in the body, plus one edge per
+    /// verified embed (a quote is the strongest form of reference, so it
+    /// backlinks like one), plus every ref inside those embeds.
+    pub refs: FoundRefs,
+    /// Blob edges: every [`BlobRef`] in the body, including those inside
+    /// verified embeds — a quote that shows a photo pins that photo.
+    pub blobs: FoundBlobs,
+    /// Embeds whose interiors were NOT indexed: signature or body-hash
+    /// verification failed, or nesting exceeded [`MAX_EMBED_DEPTH`]. The
+    /// container is unaffected (its author signed the garbage; that is
+    /// recorded, not endorsed) — these embeds are simply not edges.
+    pub skipped: usize,
+}
+
 impl Value {
     /// Convenience constructor for text values.
     pub fn text(s: impl Into<String>) -> Value {
@@ -188,7 +217,9 @@ impl Value {
     ///
     /// Walks *into* arrays, maps, and unknown tagged values (unknown
     /// vocabulary still gets its links indexed), but not into embed bytes —
-    /// embedded claims are decoded and walked by the store when ingested.
+    /// this is the *shallow* walk. The store indexes through embeds with
+    /// [`collect_edges`](Self::collect_edges); UI code recurses with
+    /// [`embedded_claims`](Self::embedded_claims).
     pub fn collect_refs(&self) -> (FoundRefs, FoundEmbeds, FoundBlobs) {
         let mut refs = Vec::new();
         let mut embeds = Vec::new();
@@ -196,6 +227,41 @@ impl Value {
         let mut path = Vec::new();
         collect(self, &mut path, &mut refs, &mut embeds, &mut blobs);
         (refs, embeds, blobs)
+    }
+
+    /// Every outgoing edge of this body, collected *through* its embeds:
+    /// the deep walk the store indexes.
+    ///
+    /// An embedded claim is content, not a row — it is part of the speech
+    /// that quotes it, so its edges belong to the quoting claim. Each embed
+    /// is verified (signature, body hash) in place; a verified embed
+    /// contributes one claim edge for itself (path: where the embed sits)
+    /// plus everything inside it, with interior paths appended to the
+    /// embed's path. An embed that fails verification, or nests past
+    /// [`MAX_EMBED_DEPTH`], is skipped whole and counted — opaque signed
+    /// bytes, not edges.
+    ///
+    /// Deterministic: the same body always yields the same edges, in tree
+    /// order — so a backend can recompute them from stored bytes and fsck
+    /// can compare.
+    pub fn collect_edges(&self) -> Edges {
+        let mut edges = Edges::default();
+        let mut path = Vec::new();
+        collect_deep(self, &mut path, 0, &mut edges);
+        edges
+    }
+
+    /// The verified claims embedded in this body, shallow: each is decoded
+    /// and verified (signature, body hash), with the path where it sits.
+    /// Embeds that fail verification are omitted — unrenderable garbage the
+    /// container's author signed. A UI recurses by calling this on each
+    /// returned claim's body; identity is `claim.header.id()`.
+    pub fn embedded_claims(&self) -> Vec<(Path, Claim)> {
+        let (_, embeds, _) = self.collect_refs();
+        embeds
+            .into_iter()
+            .filter_map(|(path, e)| e.verify().ok().map(|c| (path, c)))
+            .collect()
     }
 
     /// The last `Key` segment of a path: the conventional "rel" of a link
@@ -234,6 +300,53 @@ fn collect(
             }
         }
         Value::Tagged(_, inner) => collect(inner, path, refs, embeds, blobs),
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Bytes(_) | Value::Text(_) => {}
+    }
+}
+
+/// The deep walk behind [`Value::collect_edges`]. `depth` counts embed
+/// layers entered so far; entering another requires `depth < MAX_EMBED_DEPTH`
+/// (one signature check per layer is the work being bounded).
+fn collect_deep(value: &Value, path: &mut Path, depth: usize, edges: &mut Edges) {
+    match value {
+        Value::ClaimRef(r) => edges.refs.push((path.clone(), *r)),
+        Value::BlobRef(b) => edges.blobs.push((path.clone(), b.clone())),
+        Value::Embed(e) => {
+            if depth >= MAX_EMBED_DEPTH {
+                edges.skipped += 1;
+                return;
+            }
+            match e.verify() {
+                Ok(claim) => {
+                    edges.refs.push((
+                        path.clone(),
+                        ClaimRef {
+                            log_id: claim.header.log_id,
+                            hash: e.id(),
+                        },
+                    ));
+                    if let Some(body) = &claim.body {
+                        collect_deep(body, path, depth + 1, edges);
+                    }
+                }
+                Err(_) => edges.skipped += 1,
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(i));
+                collect_deep(item, path, depth, edges);
+                path.pop();
+            }
+        }
+        Value::Map(entries) => {
+            for (k, v) in entries {
+                path.push(PathSeg::Key(k.clone()));
+                collect_deep(v, path, depth, edges);
+                path.pop();
+            }
+        }
+        Value::Tagged(_, inner) => collect_deep(inner, path, depth, edges),
         Value::Null | Value::Bool(_) | Value::Int(_) | Value::Bytes(_) | Value::Text(_) => {}
     }
 }

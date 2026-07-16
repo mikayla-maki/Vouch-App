@@ -17,6 +17,14 @@
 //!   Only a signed redact claim makes bodilessness permanent — so a peer
 //!   stripping bodies is a recoverable nuisance, not a censor.
 //!
+//! Embedded claims are *content, not rows*: a quote is part of the speech
+//! that carries it, verified in place and read by recursion
+//! ([`StoredClaim::embeds`]), never extracted into the store. Its edges —
+//! the embed itself, and every ref and blob inside it — index under the
+//! *quoting* claim, so redacting the quote removes the quote, interior and
+//! all, with nothing left behind. The store's rows are exactly the
+//! top-level events its logs delivered.
+//!
 //! `ClaimStore` is the *logic*; rows live behind the
 //! [`ClaimStorage`](crate::storage::ClaimStorage) trait (memory for tests,
 //! SQLite in the app), so the invariants above are written exactly once no
@@ -25,37 +33,17 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::blob::BlobStore;
-use crate::claim::{EventHeader, SignedEvent};
+use crate::claim::{Claim, EventHeader, SignedEvent};
 use crate::error::Error;
 use crate::keys::LogId;
 use crate::storage::{ClaimStorage, MemoryClaimStorage};
-use crate::value::{BlobHash, BlobRef, ClaimHash, ClaimRef, Path, Value};
-
-/// How deep embedded claims may nest inside one another.
-///
-/// Each level of a re-vouch chain nests the previous event, so this bounds
-/// the longest endorsement chain we'll verify in one artifact. ~33 bits
-/// suffice to individually identify every human, so even a maximally viral
-/// chain of re-vouches stays well under 64; the cap is pure headroom over
-/// reality while still bounding adversarial verification work (one
-/// signature check per level).
-const MAX_EMBED_DEPTH: usize = 64;
+use crate::value::{BlobHash, BlobRef, ClaimHash, ClaimRef, Edges, Path, Value};
 
 /// Read failures are corruption or misconfiguration, not recoverable
 /// conditions a query caller can act on — so reads panic rather than
 /// infecting every query signature with `Result`. Mutations (`ingest`)
 /// propagate storage errors properly.
 const READ: &str = "claim storage read failed";
-
-/// How a claim got here. Order-insensitive: seeing a claim directly ever
-/// means `Direct`, no matter what arrived first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Provenance {
-    /// Received as a top-level event (from the author's log).
-    Direct,
-    /// Only ever seen embedded inside someone else's claim.
-    Embedded,
-}
 
 /// A claim at rest: original artifact, decoded views, extracted link
 /// metadata. `body: None` means tombstone (if redacted) or body-not-yet-seen
@@ -65,17 +53,20 @@ pub struct StoredClaim {
     pub signed: SignedEvent,
     pub header: EventHeader,
     pub body: Option<Value>,
-    /// Every `ClaimRef` in the body, with the path where it was found.
+    /// Every outgoing claim edge, collected *through* embeds: each
+    /// `ClaimRef` in the body, one edge per verified embed (a quote is the
+    /// strongest form of reference), and every ref inside those embeds —
+    /// all attributed to this claim. See [`Value::collect_edges`].
     pub refs: Vec<(Path, ClaimRef)>,
-    /// Every `BlobRef` in the body, with the path where it was found.
+    /// Every outgoing blob edge, collected the same way: a quote that shows
+    /// a photo pins that photo, under this claim.
     pub blobs: Vec<(Path, BlobRef)>,
-    pub provenance: Provenance,
     /// Position in THIS store's per-log arrival order: "the sequence
     /// number is always the count" — how many claims of this log the store
-    /// held when this one landed. Local metadata, like `provenance`:
-    /// excluded from state vectors and fingerprints, meaningless to any
-    /// other store. This is what sync cursors index — a cursor is just
-    /// "how many of this log's claims I've received from this pipe."
+    /// held when this one landed. Local metadata: excluded from state
+    /// vectors and fingerprints, meaningless to any other store. This is
+    /// what sync cursors index — a cursor is just "how many of this log's
+    /// claims I've received from this pipe."
     pub arrival: u64,
     /// When THIS store first ingested the claim, by the caller's clock
     /// (Unix ms; 0 when no clock was supplied). Local metadata: the
@@ -83,17 +74,34 @@ pub struct StoredClaim {
     pub received_at: i64,
 }
 
+impl StoredClaim {
+    /// The verified claims quoted in this body, shallow, with the path
+    /// where each sits. Embeds are content, not rows — this is how they
+    /// are read. Recurse by calling [`Value::embedded_claims`] on each
+    /// returned claim's body; identity is `claim.header.id()`. Embeds that
+    /// fail verification are omitted (unrenderable garbage the container's
+    /// author signed). Empty for tombstones.
+    pub fn embeds(&self) -> Vec<(Path, Claim)> {
+        match &self.body {
+            Some(b) => b.embedded_claims(),
+            None => Vec::new(),
+        }
+    }
+}
+
 /// What one `ingest` call did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct IngestReport {
-    /// Claims newly added (the event itself and/or claims embedded in it).
-    pub newly_stored: Vec<ClaimHash>,
+    /// The claim's id, if the event was newly added.
+    pub newly_stored: Option<ClaimHash>,
     /// Events that were already fully present.
     pub duplicates: usize,
-    /// Embedded events that failed verification and were skipped. The
-    /// embedding claim is stored regardless (its author signed it; the
-    /// garbage inside is their problem, recorded not replicated).
-    pub rejected_embeds: usize,
+    /// Embeds whose interiors were not indexed: verification failed, or
+    /// nesting exceeded [`MAX_EMBED_DEPTH`](crate::value::MAX_EMBED_DEPTH).
+    /// The containing claim is stored regardless (its author signed the
+    /// garbage; that is recorded, not endorsed) — such embeds just
+    /// contribute no edges and won't render.
+    pub skipped_embeds: usize,
     /// Bodies suppressed because the claim is redacted.
     pub redacted_skips: usize,
     /// Bodies attached to claims previously known only by header.
@@ -111,11 +119,11 @@ pub type ClaimSnapshot = (Vec<u8>, Option<Vec<u8>>);
 /// A canonical snapshot of the store's *convergent* state: exactly the
 /// replicated substance — headers, bodies, redactions — and nothing local.
 ///
-/// Two kinds of metadata are deliberately excluded, because sync exchanges
-/// claims by id and would never propagate them: which valid signature we
-/// hold (an author can produce many; any one of them is equal proof of
-/// authorship), and provenance (how *we* came to know a claim). Including
-/// either would let two fully-synced stores compare unequal forever.
+/// Local metadata (arrival order, receive times, which valid signature we
+/// hold — an author can produce many; any one of them is equal proof of
+/// authorship) is deliberately excluded: sync exchanges claims by id and
+/// would never propagate it, so including it would let two fully-synced
+/// stores compare unequal forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateVector {
     pub claims: BTreeMap<ClaimHash, ClaimSnapshot>,
@@ -162,19 +170,20 @@ impl ClaimStore {
         );
     }
 
-    /// Verify and store one signed event, recursively ingesting anything it
-    /// embeds and applying any redaction its body carries. Order-insensitive
-    /// and idempotent.
+    /// Verify and store one signed event, applying any redaction its body
+    /// carries. Order-insensitive and idempotent.
     ///
-    /// Embed problems and redaction skips are counted in the report, never
-    /// fatal. Verification errors occur before any mutation; storage errors
-    /// surface as [`Error::Storage`].
+    /// Embedded claims are verified in place and indexed as edges of this
+    /// event — never stored as rows of their own. Embed problems and
+    /// redaction skips are counted in the report, never fatal. Verification
+    /// errors occur before any mutation; storage errors surface as
+    /// [`Error::Storage`].
     ///
-    /// The whole call (including embedded claims) is one transaction when
-    /// the backend supports them: on SQLite a crash mid-ingest persists
-    /// nothing. Without transactions, write ordering makes `put_claim` the
-    /// commit point — a partial ingest leaves only idempotent index rows
-    /// that redelivery of the same event completes.
+    /// The whole call is one transaction when the backend supports them: on
+    /// SQLite a crash mid-ingest persists nothing. Without transactions,
+    /// write ordering makes `put_claim` the commit point — a partial ingest
+    /// leaves only idempotent index rows that redelivery of the same event
+    /// completes.
     pub fn ingest(&mut self, event: SignedEvent) -> Result<IngestReport, Error> {
         self.ingest_at(event, 0)
     }
@@ -191,7 +200,7 @@ impl ClaimStore {
         self.storage.begin()?;
         self.poisoned = true;
         let mut report = IngestReport::default();
-        let outcome = self.ingest_inner(event, Provenance::Direct, 0, received_at, &mut report);
+        let outcome = self.ingest_inner(event, received_at, &mut report);
         match outcome {
             Ok(()) => match self.storage.commit() {
                 Ok(()) => {
@@ -221,14 +230,9 @@ impl ClaimStore {
     fn ingest_inner(
         &mut self,
         event: SignedEvent,
-        provenance: Provenance,
-        depth: usize,
         received_at: i64,
         report: &mut IngestReport,
     ) -> Result<(), Error> {
-        if depth > MAX_EMBED_DEPTH {
-            return Err(Error::EmbedTooDeep);
-        }
         let claim = event.verify()?;
         let id = event.id();
 
@@ -243,33 +247,6 @@ impl ClaimStore {
             && self.apply_redaction(target, id)?
         {
             report.redactions_applied += 1;
-        }
-
-        // Embedded claims are INDEPENDENT signed artifacts: extract and
-        // ingest them from the verified body unconditionally — before the
-        // suppression and duplicate short-circuits below. If we deferred to
-        // after them, a container that is already redacted (body suppressed)
-        // or a re-delivered tombstone would silently drop its embeds, and
-        // two stores fed the same artifacts in different orders would
-        // diverge permanently. A backend (Storage) error here must abort the
-        // whole transaction; only verification-class garbage inside an embed
-        // counts as a rejected embed.
-        if let Some(b) = &claim.body {
-            let (_, embeds, _) = b.collect_refs();
-            for (_path, embedded) in embeds {
-                if let Err(e) = self.ingest_inner(
-                    embedded,
-                    Provenance::Embedded,
-                    depth + 1,
-                    received_at,
-                    report,
-                ) {
-                    if matches!(e, Error::Storage(_)) {
-                        return Err(e);
-                    }
-                    report.rejected_embeds += 1;
-                }
-            }
         }
 
         // A redact claim's body is pure machinery (a hash pointer, no user
@@ -290,25 +267,22 @@ impl ClaimStore {
             // (and is excluded from StateVector accordingly).
             if c.body.is_some() || body.is_none() {
                 report.duplicates += 1;
-                if provenance < c.provenance {
-                    let mut c = existing.expect("checked above");
-                    c.provenance = provenance;
-                    self.storage.put_claim(c)?;
-                }
                 return Ok(());
             }
             // Fall through: we hold a header-only claim and now have a
             // verified body for it.
         }
 
-        // The container's own outgoing edges (embeds were handled above).
-        let (refs, blobs) = match &body {
-            Some(b) => {
-                let (refs, _embeds, blobs) = b.collect_refs();
-                (refs, blobs)
-            }
-            None => (Vec::new(), Vec::new()),
+        // The claim's outgoing edges, collected THROUGH its embeds: a quote
+        // is content, not a row, so everything it references — including
+        // the quoted claim itself — indexes under this claim, and dies with
+        // it on redaction.
+        let edges = match &body {
+            Some(b) => b.collect_edges(),
+            None => Edges::default(),
         };
+        report.skipped_embeds += edges.skipped;
+        let Edges { refs, blobs, .. } = edges;
 
         for (_path, target) in &refs {
             self.storage.add_backlink(target.hash, id)?;
@@ -319,9 +293,6 @@ impl ClaimStore {
 
         match existing {
             Some(mut c) => {
-                if provenance < c.provenance {
-                    c.provenance = provenance;
-                }
                 c.signed.body_bytes = event.body_bytes;
                 c.body = body;
                 c.refs = refs;
@@ -346,11 +317,10 @@ impl ClaimStore {
                     body,
                     refs,
                     blobs,
-                    provenance,
                     arrival,
                     received_at,
                 })?;
-                report.newly_stored.push(id);
+                report.newly_stored = Some(id);
             }
         }
         Ok(())
@@ -548,21 +518,21 @@ impl ClaimStore {
     /// reconciliation. Like the cursor itself this is advisory — an XOR of
     /// per-claim digests detects drift between cooperating clients, it is
     /// not a defense against liars.
+    ///
+    /// Built by XOR-folding [`fingerprint_claim`] and
+    /// [`fingerprint_redaction`] digests — and XOR makes it *homomorphic*:
+    /// knowing a peer's fingerprint and the one claim they just ingested,
+    /// you can compute their new fingerprint without asking (vouch-sync's
+    /// push path lives on this).
     pub fn fingerprint(&self, log_id: &LogId) -> [u8; 32] {
         self.guard();
         let mut acc = [0u8; 32];
-        let mix = |acc: &mut [u8; 32], hash: blake3::Hash| {
-            for (a, b) in acc.iter_mut().zip(hash.as_bytes()) {
-                *a ^= b;
-            }
-        };
         self.storage
             .scan_log(log_id, &mut |c| {
-                let mut h = blake3::Hasher::new();
-                h.update(b"claim");
-                h.update(&c.signed.id().0);
-                h.update(&[c.body.is_some() as u8]);
-                mix(&mut acc, h.finalize());
+                xor_into(
+                    &mut acc,
+                    fingerprint_claim(&c.signed.id(), c.body.is_some()),
+                );
             })
             .expect(READ);
         let mut redactions = Vec::new();
@@ -576,14 +546,30 @@ impl ClaimStore {
                 .expect(READ)
                 .map(|c| c.header.log_id);
             if redactor_log == Some(*log_id) {
-                let mut h = blake3::Hasher::new();
-                h.update(b"redaction");
-                h.update(&target.0);
-                h.update(&by.0);
-                mix(&mut acc, h.finalize());
+                xor_into(&mut acc, fingerprint_redaction(&target, &by));
             }
         }
         acc
+    }
+
+    /// Everything we hold for one log as `(id, has_body)` pairs, ascending
+    /// by id — the hash-list half of full set reconciliation. When
+    /// fingerprints still disagree after a catch-up, two stores exchange
+    /// these lists and diff them: ids the peer lacks are offered, ids we
+    /// lack are fetched, and a body the peer holds for a claim we hold
+    /// bodiless (and unredacted) is fetched too — "have" means "have the
+    /// body", so this is also where stripped bodies heal. Redactions need
+    /// no entry of their own: every redaction is carried by an ordinary
+    /// redact claim, so syncing the claim diff converges the redaction
+    /// sets as well.
+    pub fn log_hashes(&self, log_id: &LogId) -> Vec<(ClaimHash, bool)> {
+        self.guard();
+        let mut out = Vec::new();
+        self.storage
+            .scan_log(log_id, &mut |c| out.push((c.signed.id(), c.body.is_some())))
+            .expect(READ);
+        out.sort_by_key(|(id, _)| *id);
+        out
     }
 
     /// The merged timeline across all logs (content-bearing claims only),
@@ -683,9 +669,9 @@ impl ClaimStore {
             if c.body.is_some() && self.storage.redaction(&id).expect(READ).is_some() {
                 problems.push(format!("claim {id:?} is redacted but still has a body"));
             }
-            let (refs, _embeds, blobs) = match &c.body {
-                Some(b) => b.collect_refs(),
-                None => Default::default(),
+            let Edges { refs, blobs, .. } = match &c.body {
+                Some(b) => b.collect_edges(),
+                None => Edges::default(),
             };
             if refs != c.refs {
                 problems.push(format!("claim {id:?}: stored refs disagree with body"));
@@ -793,7 +779,43 @@ fn body_at(body: &Option<Value>) -> Option<i64> {
 /// Engine-recognized redaction: `{type: "redact", redacts: ClaimRef}` where
 /// the target is in the author's *own* log. Anyone else's "redact" is mere
 /// speech, stored like any claim but with no engine effect.
-fn redact_target(author: LogId, body: Option<&Value>) -> Option<ClaimHash> {
+/// XOR one digest into a fingerprint accumulator.
+fn xor_into(acc: &mut [u8; 32], digest: [u8; 32]) {
+    for (a, b) in acc.iter_mut().zip(&digest) {
+        *a ^= b;
+    }
+}
+
+/// One claim's contribution to a log [`fingerprint`](ClaimStore::fingerprint):
+/// BLAKE3 over `("claim", id, has-body bit)`. Public because the fingerprint
+/// is an XOR fold of these, so sync layers can update a remembered peer
+/// fingerprint claim-by-claim instead of re-asking for it.
+pub fn fingerprint_claim(id: &ClaimHash, has_body: bool) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"claim");
+    h.update(&id.0);
+    h.update(&[has_body as u8]);
+    *h.finalize().as_bytes()
+}
+
+/// One redaction's contribution to its redactor-log
+/// [`fingerprint`](ClaimStore::fingerprint): BLAKE3 over
+/// `("redaction", target, redacting claim)`. See [`fingerprint_claim`].
+pub fn fingerprint_redaction(target: &ClaimHash, by: &ClaimHash) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"redaction");
+    h.update(&target.0);
+    h.update(&by.0);
+    *h.finalize().as_bytes()
+}
+
+/// What this body redacts, if it is a well-formed redact claim by `author`:
+/// `{ type: "redact", redacts: ClaimRef }` pointing into the author's own
+/// log (redaction is own-log-only; anything else is an ordinary claim that
+/// happens to mention a redaction). This is the engine's recognizer —
+/// public so sync layers judging a redact claim's effect apply exactly the
+/// rule ingest applies.
+pub fn redact_target(author: LogId, body: Option<&Value>) -> Option<ClaimHash> {
     let Some(Value::Map(m)) = body else {
         return None;
     };

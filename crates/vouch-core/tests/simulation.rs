@@ -1,10 +1,10 @@
 //! Multi-client simulation: several writers, several databases, events
 //! exchanged in arbitrary orders. This is the engine's contract under test —
-//! convergence, cross-path dedup, provenance verification — with no I/O
+//! convergence, cross-path dedup, embed verification — with no I/O
 //! anywhere. Two [`Database`]s exchanging `serve_since` streams are a
 //! complete sync session.
 
-use vouch_core::{ClaimHash, ClaimRef, Database, Provenance, SignedEvent, Value, Writer};
+use vouch_core::{ClaimHash, ClaimRef, Database, SignedEvent, Value, Writer};
 
 /// Tiny deterministic PRNG (xorshift64*) so shuffles are reproducible
 /// without a rand dependency.
@@ -74,35 +74,44 @@ fn vouch_chain_verifies_without_subscribing_to_the_source() {
     let mut carol = Database::new();
     let report = carol.ingest(bob_vouch.clone()).unwrap();
 
-    // Carol holds both claims: Bob's vouch (direct) and Alice's rec
-    // (embedded), with Alice's signature verified along the way.
-    assert_eq!(report.newly_stored.len(), 2);
-    assert_eq!(report.rejected_embeds, 0);
+    // Carol's store gains exactly one row: Bob's vouch. Alice's rec is
+    // content INSIDE it — verified (signature, body hash) at the walk,
+    // never extracted into a row of its own.
+    assert_eq!(report.newly_stored, Some(id_of(&bob_vouch)));
+    assert_eq!(report.skipped_embeds, 0);
 
     let alice_id = id_of(&alice_rec);
-    let stored = carol
-        .claims()
-        .get(&alice_id)
-        .expect("alice's rec is queryable");
-    assert_eq!(stored.provenance, Provenance::Embedded);
-    assert_eq!(
-        carol.claims().get(&id_of(&bob_vouch)).unwrap().provenance,
-        Provenance::Direct
+    assert!(
+        carol.claims().get(&alice_id).is_none(),
+        "a quote is content, not a row"
     );
 
-    // Later, Carol subscribes to Alice directly: the same artifact arrives,
-    // dedup kicks in, provenance upgrades.
-    let report = carol.ingest(alice_rec).unwrap();
-    assert!(report.newly_stored.is_empty());
-    assert_eq!(report.duplicates, 1);
+    // The quote reads by recursion: the verified embedded claim, with
+    // Alice's authorship intact.
+    let stored = carol.claims().get(&id_of(&bob_vouch)).unwrap();
+    let embeds = stored.embeds();
+    assert_eq!(embeds.len(), 1);
+    let (_, quoted) = &embeds[0];
+    assert_eq!(quoted.header.id(), alice_id);
     assert_eq!(
-        carol.claims().get(&alice_id).unwrap().provenance,
-        Provenance::Direct
+        quoted.header.log_id,
+        alice_rec.header().unwrap().log_id,
+        "the quoted claim verifies as ALICE's speech"
     );
+
+    // And the quote IS a reference: "who quotes Alice's rec" answers
+    // through the backlink index, attributed to Bob's vouch.
+    assert_eq!(carol.claims().backlinks(&alice_id), vec![id_of(&bob_vouch)]);
+
+    // Later, Carol subscribes to Alice directly: the rec arrives as its own
+    // top-level event and stores as its own row, independent of the quote.
+    let report = carol.ingest(alice_rec).unwrap();
+    assert_eq!(report.newly_stored, Some(alice_id));
+    assert!(carol.claims().contains(&alice_id));
 }
 
 #[test]
-fn tampered_embed_is_rejected_but_recorded() {
+fn tampered_embed_is_skipped_but_recorded() {
     let mut alice = Writer::from_seed([1; 32]);
     let mut mallory = Writer::from_seed([6; 32]);
 
@@ -122,11 +131,18 @@ fn tampered_embed_is_rejected_but_recorded() {
     let mut db = Database::new();
     let report = db.ingest(mallory_vouch.clone()).unwrap();
 
-    // Mallory's own claim is hers and stores fine; the forgery does not.
-    assert_eq!(report.newly_stored.len(), 1);
-    assert_eq!(report.rejected_embeds, 1);
+    // Mallory's own claim is hers and stores fine; the forgery inside is
+    // recorded (she signed it), but it is not an edge and will not render.
+    assert_eq!(report.newly_stored, Some(id_of(&mallory_vouch)));
+    assert_eq!(report.skipped_embeds, 1);
     assert!(db.claims().contains(&id_of(&mallory_vouch)));
     assert!(!db.claims().contains(&id_of(&alice_rec)));
+
+    // Not an edge: no backlink to the forged claim's id, and the embed
+    // accessor verifies and omits it — the UI never sees the forgery.
+    let stored = db.claims().get(&id_of(&mallory_vouch)).unwrap();
+    assert!(stored.refs.is_empty(), "a forged embed is not a reference");
+    assert!(stored.embeds().is_empty(), "a forged embed never renders");
 }
 
 #[test]
@@ -323,9 +339,12 @@ fn fingerprint_flags_silent_divergence_that_cursors_cannot_see() {
 }
 
 #[test]
-fn cross_path_dedup_gives_one_claim_many_endorsements() {
-    // Alice's rec reaches a reader via three paths: directly, and embedded
-    // in two different vouches. Dedup is by content hash.
+fn one_claim_many_endorsements_share_one_identity() {
+    // Alice's rec reaches a reader via three paths: directly, and quoted in
+    // two different vouches. Rows are top-level events only — the quotes
+    // carry copies as content — but identity is the content hash, so all
+    // three paths agree on WHICH claim is being endorsed: the backlink
+    // index answers "who vouches for Alice's rec" across both quotes.
     let mut alice = Writer::from_seed([1; 32]);
     let mut bob = Writer::from_seed([2; 32]);
     let mut dana = Writer::from_seed([4; 32]);
@@ -334,28 +353,37 @@ fn cross_path_dedup_gives_one_claim_many_endorsements() {
     let alice_id = id_of(&alice_rec);
 
     let mut db = Database::new();
-    db.ingest(vouch(&mut bob, 200, &alice_rec)).unwrap();
-    db.ingest(vouch(&mut dana, 300, &alice_rec)).unwrap();
+    let bob_vouch = vouch(&mut bob, 200, &alice_rec);
+    let dana_vouch = vouch(&mut dana, 300, &alice_rec);
+    db.ingest(bob_vouch.clone()).unwrap();
+    db.ingest(dana_vouch.clone()).unwrap();
     db.ingest(alice_rec).unwrap();
 
-    // Three events referencing the same content → exactly one stored copy
-    // of Alice's claim (plus the two vouches).
+    // Three rows: the two vouches and Alice's own rec.
     assert_eq!(db.claims().len(), 3);
     assert_eq!(db.claims().log(&alice.id()).len(), 1);
-    assert_eq!(
-        db.claims().get(&alice_id).unwrap().provenance,
-        Provenance::Direct
-    );
     assert_eq!(db.claims().by_type("vouch").len(), 2);
+
+    // Both quotes backlink to the same identity, and each renders its own
+    // verified copy of the same content.
+    let mut endorsers = db.claims().backlinks(&alice_id);
+    endorsers.sort();
+    let mut expected = vec![id_of(&bob_vouch), id_of(&dana_vouch)];
+    expected.sort();
+    assert_eq!(endorsers, expected);
+    for vid in &expected {
+        let embeds = db.claims().get(vid).unwrap().embeds();
+        assert_eq!(embeds[0].1.header.id(), alice_id);
+    }
 }
 
 #[test]
 fn absurd_embed_nesting_is_contained_not_fatal() {
     // One writer russian-dolls 80 vouches around a rec — past the 64-deep
     // cap (itself generous headroom over any chain humanity could produce).
-    // Ingest succeeds: the outer claims store down to the depth cap, the
-    // rest is one rejected embed — never an error, never a partially-failed
-    // ingest.
+    // Ingest succeeds: one row (the top-level event), the quote chain
+    // indexed down to the depth cap, and one skipped embed where the walk
+    // stopped descending — never an error, never a partially-failed ingest.
     let mut writer = Writer::from_seed([7; 32]);
     let mut event = rec(&mut writer, 0, "the bottom");
     for i in 0..80 {
@@ -365,18 +393,19 @@ fn absurd_embed_nesting_is_contained_not_fatal() {
     let mut db = Database::new();
     let report = db.ingest(event.clone()).unwrap();
     assert!(db.claims().contains(&id_of(&event)));
-    assert_eq!(report.rejected_embeds, 1);
-    assert_eq!(report.newly_stored.len(), 65); // depths 0..=64 inclusive
+    assert_eq!(report.newly_stored, Some(id_of(&event)));
+    assert_eq!(report.skipped_embeds, 1);
+    // One edge per layer the walk entered: MAX_EMBED_DEPTH quote edges.
+    let stored = db.claims().get(&id_of(&event)).unwrap();
+    assert_eq!(stored.refs.len(), vouch_core::MAX_EMBED_DEPTH);
 }
 
 #[test]
-fn local_metadata_is_not_convergent_state() {
-    // Database A learns Alice's rec only via Bob's vouch (provenance:
-    // Embedded). Database B subscribes to Alice too and gets it directly
-    // (provenance: Direct). Sync exchanges claims by id, so this difference
-    // can never be reconciled — which is exactly why it must not be part of
-    // the convergent state. Substance (headers + bodies + redactions) is
-    // equal, so the databases must compare equal.
+fn quotes_are_content_not_rows() {
+    // Database A learns Alice's rec only as a quote inside Bob's vouch.
+    // Database B subscribes to Alice too and holds the rec as a row. The
+    // store's rows are exactly the top-level events its logs delivered —
+    // a quote changes nothing about what A "has" for sync purposes.
     let mut alice = Writer::from_seed([1; 32]);
     let mut bob = Writer::from_seed([2; 32]);
 
@@ -387,18 +416,48 @@ fn local_metadata_is_not_convergent_state() {
     a.ingest(bob_vouch.clone()).unwrap();
 
     let mut b = Database::new();
-    b.ingest(bob_vouch).unwrap();
+    b.ingest(bob_vouch.clone()).unwrap();
     b.ingest(alice_rec.clone()).unwrap();
 
-    // The local views genuinely differ...
+    // A holds one row and no trace of Alice's log; B holds two rows.
+    assert!(a.claims().get(&id_of(&alice_rec)).is_none());
+    assert_eq!(a.claims().log_len(&alice.id()), 0);
+    assert_eq!(a.claims().fingerprint(&alice.id()), [0u8; 32]);
+    assert!(b.claims().contains(&id_of(&alice_rec)));
+
+    // Yet both READ the same content for the quote — A through Bob's
+    // vouch, B either way.
+    let a_quote = a.claims().get(&id_of(&bob_vouch)).unwrap().embeds();
+    assert_eq!(a_quote[0].1.header.id(), id_of(&alice_rec));
+
+    // And on Bob's log — the one they both follow — they fully agree.
     assert_eq!(
-        a.claims().get(&id_of(&alice_rec)).unwrap().provenance,
-        Provenance::Embedded
+        a.claims().fingerprint(&bob.id()),
+        b.claims().fingerprint(&bob.id())
     );
-    assert_eq!(
-        b.claims().get(&id_of(&alice_rec)).unwrap().provenance,
-        Provenance::Direct
+}
+
+#[test]
+fn log_hashes_reports_ids_and_body_bits_in_canonical_order() {
+    let mut alice = Writer::from_seed([40; 32]);
+    let log = alice.id();
+    let full = rec(&mut alice, 1, "with body");
+    let stripped = rec(&mut alice, 2, "body withheld");
+
+    let mut db = Database::new();
+    db.ingest(full.clone()).unwrap();
+    db.ingest(stripped.without_body()).unwrap();
+
+    let mut expected = vec![(full.id(), true), (stripped.id(), false)];
+    expected.sort_by_key(|(id, _)| *id);
+    assert_eq!(db.claims().log_hashes(&log), expected);
+    // The list is the reconciliation view of "what do you hold": same set,
+    // different bodies → different lists, exactly like the fingerprint.
+    let mut other = Database::new();
+    other.ingest(full).unwrap();
+    other.ingest(stripped).unwrap();
+    assert_ne!(
+        other.claims().log_hashes(&log),
+        db.claims().log_hashes(&log)
     );
-    // ...but the convergent state does not.
-    assert_eq!(a.claims().state_vector(), b.claims().state_vector());
 }

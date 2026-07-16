@@ -7129,6 +7129,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
+ "futures",
  "getrandom 0.3.4",
  "thiserror 2.0.18",
 ]
@@ -7138,6 +7139,8 @@ name = "vouch-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "futures",
+ "getrandom 0.3.4",
  "rusqlite",
  "vouch-core",
 ]

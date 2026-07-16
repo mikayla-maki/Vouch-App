@@ -166,10 +166,15 @@ Rules:
 2. **Tagged values are validated leniently.** A malformed `ClaimRef` drops
    out of the index; the claim itself is stored and re-gossiped regardless.
    Signed bytes are never discarded (see Forward Compatibility).
-3. **`Embed` is the engine's business.** Verifying an embedded author's
-   signature is a byte-level concern no vocabulary can express, so embedded
-   originals are verified, deduplicated, and indexed by the engine itself,
-   wherever in a body they appear.
+3. **`Embed` is the engine's business — and embeds are content, not rows.**
+   Verifying an embedded author's signature is a byte-level concern no
+   vocabulary can express, so the engine verifies embeds in place, wherever
+   in a body they appear. A quote is part of the speech that carries it: it
+   is never extracted into a store row of its own. Its edges — the embed
+   itself (a quote is the strongest form of reference), plus every ref and
+   blob inside it — index under the *quoting* claim, and readers recurse
+   into the quote (`StoredClaim::embeds()`) to render it. Store rows are
+   exactly the top-level events your logs delivered.
 
 ### The vocabulary
 
@@ -226,9 +231,10 @@ petname model applied to subjects. Your merge is yours; nobody has to agree.
 A claim's canonical identity is its `ClaimHash`; a `ClaimRef` pairs it with
 the `LogId` so referenced claims are locatable, not just nameable.
 Rehosted copies carry the embedded original, so the same rec seen via three
-paths (the author directly, plus two friends' vouches) deduplicates to one
-item with three endorsements — and a disavowal of the original matches all
-three paths, because every path hashes to the same id.
+paths (the author directly, plus two friends' vouches) agrees on one
+*identity* with three endorsements: every path hashes to the same id, the
+quotes backlink it, and the UI deduplicates by id at render — and a
+disavowal of the original matches all three paths for the same reason.
 
 ### Vouch semantics
 
@@ -266,9 +272,9 @@ The claim-graph model makes this structural rather than clever:
   for "new since you last looked" and cursors, never part of state.
 - **Local metadata is not state.** Convergent state is exactly the
   replicated substance: headers, bodies, redactions. Which valid signature a
-  store holds (an author can mint many; each is equal proof) and how a claim
-  was learned (directly vs. embedded) are local facts that id-based sync can
-  never reconcile — so they are defined out of the state surface rather than
+  store holds (an author can mint many; each is equal proof), arrival order,
+  and receive times are local facts that id-based sync can never
+  reconcile — so they are defined out of the state surface rather than
   papered over with tiebreaks.
 
 This invariant is the engine's contract and gets enforced by property tests:
@@ -291,7 +297,7 @@ it, when they claim they said it, what they said. Sync coordinates live
 where the knowledge actually is: each store keeps its own **arrival
 order** — a claim's position is simply the count of that log's claims the
 store held when it landed ("the sequence number is always the count").
-This is local metadata, the sibling of provenance: recorded in the claim
+This is local metadata: recorded in the claim
 row in the same transaction as the insert (so it's atomic, durable, and
 rolls back with it), excluded from state vectors and fingerprints,
 meaningless to any other store. A **cursor** is then just "how many of
@@ -484,7 +490,7 @@ logical inconsistency, never UB — there is no unsafe code):
 - *Transactions are required backend API* (`begin/commit/rollback` — no
   defaults; a backend without atomicity must write its no-ops out loud).
   Both shipped backends are atomic: SQLite via its journal, memory via an
-  undo log. One ingest (embeds included) is one transaction — a crash,
+  undo log. One ingest (edge indexing included) is one transaction — a crash,
   kill, or power loss mid-ingest persists nothing, and a failed ingest
   *never happened* (pinned by a zero-debris fault-injection sweep). SQLite
   runs `synchronous=FULL` so a *committed* ingest survives power loss too,
@@ -499,6 +505,11 @@ logical inconsistency, never UB — there is no unsafe code):
 - *Panic poisoning*, like `Mutex`: a panic unwinding mid-ingest marks the
   store poisoned and every later call fails loudly, so caught panics can't
   observe half-applied state.
+- *The network gets the same treatment* (see Sync & Transports): the sync
+  engine is sans-io, so dropped connections, duplicated frames, lying
+  pipes, and sessions killed at every message boundary are all plain
+  deterministic tests in core::sync — same exhaustive-prefix trick as the
+  storage crash sweep, lifted to messages.
 
 Conceptually there are **two SQLite databases**: the engine's (claim
 storage, owned by vouch-core's schema via vouch-store) and the app's
@@ -514,55 +525,233 @@ is just another pipe (see Transports).
 
 ## Sync & Transports
 
-### Transport is a trait; everything is a pipe
+### The engine is sans-io; everything is a pipe (core::sync, BUILT)
+
+The same cut as storage, applied to the network: *logic under invariants,
+dumb plumbing at the edge*. The protocol is plain data — `Request` and
+`Response` enums in `core::sync` ARE the wire format. The engine is a pure
+state machine (`SyncSession`) that produces requests and consumes
+responses; the server half is one stateless function
+(`respond(db, instance, now, request)`). A **transport** is anything that
+moves a `Request` to a peer and brings a `Response` back — an HTTP client,
+an iroh stream, a function call into another `Database` in the same
+process — and carries no protocol logic to get wrong:
 
 ```rust
-trait Transport {
-    /// Publish events to a log you own (auth: signature challenge).
-    async fn publish(&self, db: LogId, events: Vec<Envelope>) -> Result<()>;
-    /// Incremental pull: "I have `have` of this log from you — the rest."
-    /// The cursor is pipe-local: a count against THIS transport's arrival
-    /// order, advanced by the number of events returned.
-    async fn fetch_since(&self, log: LogId, have: u64) -> Result<Vec<Envelope>>;
-    /// Live tail for reactive sync.
-    async fn stream(&self, db: LogId, from: u64) -> Result<EventStream>;
-    /// Drift check: the peer's set fingerprint for a log (see Drift
-    /// detection). Mismatch after a catch-up → full set reconciliation.
-    async fn fingerprint(&self, db: LogId) -> Result<[u8; 32]>;
-    /// Blob bytes by hash (verified against the pin on arrival). Publish
-    /// uploads blobs BEFORE the claims that pin them, so wherever a claim
-    /// came from almost certainly has its media.
-    async fn blob(&self, hash: BlobHash) -> Result<Vec<u8>>;
+let mut session = SyncSession::new(&mut db, &mut cursors, "relay", now, pull, push);
+while let Some(request) = session.next_request() {
+    let response = transport.exchange(request)?; // the ONLY I/O in sync
+    session.feed(response)?;
 }
 ```
 
-Planned implementations, in order:
+No async runtime, no clock, no sockets in the engine crate: GPUI's executor
+drives it in the app, tokio will drive it in the relay, a `while let` loop
+drives it in tests — which is why every network fault is a plain
+deterministic unit test (see Robustness below).
 
-1. **Relay** — a dumb store-and-forward server, for networking ease. Owners
-   authenticate via signature challenge (the relay sends a nonce; the client
-   signs it; `LogId` is the verification key). Fetching requires no auth.
+The message vocabulary (all answerable from a `Database` alone — peers hold
+no conversation state):
+
+```text
+Status { log }            → count, fingerprint, instance      (open + settle)
+Since { log, have, max }  → events                            (cursor pull, paged)
+Hashes { log }            → [(id, has_body)]                  (reconciliation)
+Claims { ids }            → events                            (reconciliation fetch)
+Publish { events }        → ack { stored, rejected }          (idempotent push)
+GetBlob { hash }          → bytes?                            (THE media transfer: pull)
+PutBlob { bytes }         → ack                               (fast-track: pre-answered pull)
+```
+
+One session, per log: **Status** (an unfamiliar `instance` means the peer's
+arrival order was reborn — reset cursors, re-pull, dedup flattens it) →
+**pull** `Since` batches → **push** `Publish` from our own arrival order →
+**settle**: fingerprint match means done; a mismatch equal to the
+remembered `settled` fingerprint is the *known benign difference* (claims
+we hold that this peer won't take — e.g. a relay only the owner may
+publish to) and is skipped; anything else reconciles via `Hashes`/`Claims`,
+healing stripped bodies in both directions. An idle re-sync is exactly one
+message per log: the settle rides the opening `Status` answer.
+
+**Sessions never carry media.** Blobs are non-syncing by default: a claim
+arrives, its `BlobRef` becomes a want, and the want sits until something
+asks — the UI demanding a render (`fetch_blob` → one `GetBlob`), an
+eager-media pipe taking the photos while a p2p friend is reachable, or a
+relay keeping itself stocked (eager by role: claims land via `Publish`,
+it pulls their media back up the same duct — which is also how it
+restocks bytes it culled under storage pressure). `PutBlob` survives as
+the fast-track, exactly as `Notify` is for claims: conceptually still
+pull-based, the holder just answers the `GetBlob` it knows is coming (a
+p2p mint is two frames — the claim, then its bytes). Advisory and
+droppable: the receiver accepts iff its own want-list asks, so the pull
+path is the only thing correctness rests on.
+
+The engine's only persistent state is one cursor row per `(peer, log)`:
+`(instance, pull, push, settled)` — behind a `SyncState` trait (memory in
+tests; `SqliteSyncState` at `dir/sync.db` in vouch-store, which also mints
+and keeps the database's own `InstanceId`: durable claims run
+`synchronous=FULL`, so arrival order — and therefore the instance — is a
+property of the files, not the process). Losing sync.db is always safe:
+zero cursors mean a full re-pull that dedup flattens.
+
+Authentication is deliberately not in the protocol. A relay restricting who
+may `Publish`/`PutBlob` (signature challenge: nonce signed by the `LogId`
+key) enforces it around `respond()`, at the transport layer. Between
+friends, gossiping third-party logs is legitimate; published garbage fails
+verification at ingest, which is the real gate.
+
+### Push: a fat hint, not a second protocol
+
+Real-time delivery is layered *on* the coordinates above, never woven into
+the session machinery. When a `Publish` lands, a sender with a live channel
+(WebSocket, SSE, iroh stream) fans out a `Notify` frame — **an unsolicited
+`Status` with the new events attached**:
+
+```text
+Notify { log, events, count, fingerprint, instance }
+```
+
+Applying it (`apply_notify`) is "ingest, then settle", and the outcome
+ladder only ever degrades gracefully:
+
+1. **Fingerprints equal** → we provably hold the sender's exact set; the
+   pull cursor fast-forwards to `count`. The claim is on screen with
+   **zero round trips** — redactions included, so takedowns land at push
+   speed.
+2. **Matches the remembered `settled` fingerprint** → the known benign
+   difference (we hold extras the sender won't take), kept fresh through
+   pushes *homomorphically*: the fingerprint is an XOR fold, so the
+   sender's new fingerprint is computable from the cached one plus the
+   pushed claim — still zero round trips, and the cursor fast-forwards
+   here too (a cache match proves the sender's set is one we reconciled to
+   and then tracked: a subset of ours).
+3. **Anything else** → the frame degrades into a doorbell with a free
+   claim attached: hold what was pushed, run an ordinary session.
+
+Safety needs no new machinery: events verify at ingest (a forged frame
+can't poison, only be rejected and counted), the coordinates are advisory
+(the cursor moves only on fingerprint match; the next session's settle
+catches real divergence), and a wrong homomorphic guess just fails the
+equality check and costs one session. A `Notify` with no events is a
+heartbeat — a cheap anti-entropy ping that confirms an idle subscriber is
+still settled, or tells it to ring the doorbell. Media is deliberately not
+pushed: a claim pinning a blob lands as content plus a want
+(`missing_blobs` in the report); the bytes come by `GetBlob` from any
+pipe. **Correctness never depends on the push channel; it only makes the
+pull path's answer arrive sooner.**
+
+Planned transports, in order:
+
+1. **Relay** — a dumb store-and-forward server: a peer with no pen, no
+   follows, and `ServePolicy::Everything`, behind an HTTP/WebSocket shim
+   that shuttles `PipeMsg`s per connection, plus owner auth on publishes.
+   Fetching requires no auth; watch state is per-connection and ephemeral.
 2. **iroh p2p** — [iroh](https://github.com/n0-computer/iroh)'s
    dial-by-public-key QUIC maps directly onto `LogId`-is-a-pubkey, and an
    iroh relay node is literally "the relay as just another pipe." Strong
-   candidate to be the relay's implementation substrate rather than a separate
-   transport; decided by prototyping behind the trait.
+   candidate to be the relay's implementation substrate rather than a
+   separate transport; decided by prototyping.
 3. **Files** — a serialized log is a valid transport: backups, sneakernet,
    attach-your-log-to-an-email.
 
-### Sync flow
+### Sync invariants
 
-- **Publish**: create → sign → append locally → index/materialize → push via
-  any transport when available.
-- **Subscribe**: `fetch_since(cursor)` → verify signatures → store →
-  index/materialize → advance the cursor by what arrived (only after
-  successful ingest — that's the client's half of the monotonicity bargain)
-  → compare fingerprints; mismatch kicks off a full reconciliation in the
-  background.
-- **Offline is the normal case**: the app is fully functional on local data;
-  claims are idempotent, so replays and duplicates are harmless.
-- **"Have" means "have the body"**: when peers compare what they hold, a
-  tombstoned-or-stripped claim counts as wanted — exchanging bare ids would
-  leave healable bodies unhealed forever.
+- **Abandoning a session anywhere is free.** Cursors advance only after the
+  data they describe has ingested; peers hold no conversation state; ingest
+  is idempotent. The recovery story for every crash, timeout, and
+  disconnect is the same: start a fresh session. Pinned by fault injection:
+  a scenario exercising every phase is killed after every possible message
+  prefix, resumed, and must converge bit-identically with a clean fsck.
+- **`next_request()` is an idempotent peek** — a transport may retry the
+  same request after a timeout without confusing the session.
+- **A pipe cannot smuggle logs you didn't subscribe to**: top-level events
+  outside the asked-for log are dropped and counted (`off_plan`). Embedded
+  claims still ride inside subscribed claims — quoting is the author's
+  speech.
+- **Peer misbehavior never aborts a session** (it's counted in the
+  `SyncReport`: rejected events, corrupt blobs, off-plan artifacts); only
+  *local* storage failure does. A want never expires — a blob rejected from
+  one pipe heals from the next.
+- **Offline is the normal case**: the app is fully functional on local
+  data; claims are idempotent, so replays and duplicates are harmless.
+- **"Have" means "have the body"**: hash lists carry body bits, fingerprints
+  hash them, and reconciliation requests a body the peer holds for a claim
+  we hold stripped (unless redacted) — exchanging bare ids would leave
+  healable bodies unhealed forever.
+
+### The Peer (core::peer, BUILT): the composition with a name on the network
+
+Everything above is machinery; the **Peer** is what a consumer holds. One
+peer == one database == one identity context — multiple personas are
+multiple peers, which makes the identity boundary process-shaped: a
+persona's pipes can never learn the other persona exists. The user model
+is the API: *build a useful database — write claims, get claims — and only
+your words leave the house.*
+
+```rust
+let (peer, actor) = vouch_store::open_peer(dir, Some(writer), ServePolicy::Owned)?;
+executor.spawn(actor.run());                 // touched once, forgotten
+
+peer.claim(Draft::new("rec")                 // speech: body + attachments,
+        .text("subject", "Joe's Pizza")      // minted atomically (blob-
+        .attach("photo", jpeg, "image/jpeg") // before-claim is internal)
+        .embed("original", their_event))     // quoting carries the chain
+    .await?;
+let p = peer.connect("mom-relay", end).await?;  // host plumbing: a duct
+peer.follow(mom_log, p).await?;       // consumption: private, directional
+peer.firehose().await?;               // local-only tap: everything (the UI)
+peer.authored().await?;               // the ONLY network-facing stream
+peer.fetch_blob(hash).await?;         // media on demand (lazy by default;
+peer.evict_blob(hash).await?;         //   cull freely — claims keep the want)
+```
+
+Media policy is per-pipe: lazy by default (`connect`), eager where it
+matters (`connect_with(.., PipeConfig { eager_media: true })` for p2p
+pipes — take the photos while the phone is reachable; relays are eager by
+role). See "Sessions never carry media" above.
+
+**Input is a relationship; output is a broadcast.** `follow(log, pipe)` is
+the one configured relationship — catch-up session now, live frames after,
+healing forever. There is no inverse verb: output is two taps
+(`firehose()` for the UI, `authored()` for whoever shows up), and the peer
+holds no subscriber list — *watches* accumulate from inbound
+announcements, ephemeral, gone with the connection. **Publishing is
+following your own log somewhere**: the session's push half engages
+exactly when the followed log is the one you write, so the push direction
+emerges from holding the pen, not from a verb.
+
+**The actor.** All state lives in one task selecting over a command
+channel and an inbox of pipes — no locks, nothing held across an await
+(the sans-io session never blocks, so it slots into the event loop one
+`feed` at a time, sessions on different pipes interleaving freely). Pipes
+carry *typed protocol messages* (`PipeMsg`: correlated request/response,
+`Notify` frames, watch announcements); sockets and serialization live in
+transport tasks, so the actor does no I/O and a test pipe is a pair of
+channels. Three tables and their joins are the whole behavior:
+
+| table | meaning | configured by |
+| ----- | ------- | ------------- |
+| `follows: LogId → {PipeId}` | what I consume, from where | `follow()` |
+| the writer (≤ 1) | my voice | construction |
+| `watches: PipeId → {LogId}` | others' follows of me | inbound announcements |
+
+Sessions = follows ⋈ pipes. Fan-out = watches ⋈ pipes. A **relay is a peer
+with no pen, no follows, and `ServePolicy::Everything`** — same actor, one
+constructor argument apart from the app.
+
+**Consumption is private.** With `ServePolicy::Owned` (the app default)
+the peer serves — and accepts watches for — only the log it writes. Your
+follow graph, your merged database, your reading: structurally not
+servable, so not leakable by syncing with you. The one sanctioned path for
+third-party content through you is the embed: quoting is speech with your
+name on it. The deliberate trade: availability of a log depends on
+author-controlled infrastructure (her peer, her relays) — replication for
+availability is the author's opt-in, never ambient through readers.
+
+**Scheduling owns when, never what.** Frames dropped under backpressure,
+congested pipes aborting sessions, dead connections — all degrade to "a
+later session catches up", because convergence lives in the layers below.
+The actor's failure budget is latency, not correctness.
 
 ### Invitations
 
@@ -652,11 +841,17 @@ Rules that keep it convergent and honest:
 - **Monotone.** There is no un-redact; republish the content as a new claim
   instead. Content-then-redact and redact-then-content converge to the same
   tombstone, in any arrival order.
-- **Seen is applied.** A redaction takes effect whenever its verified body is
-  seen — and embedded claims it carries are ingested even when the container
-  itself is suppressed (they are independent signed artifacts; dropping them
-  would diverge stores by arrival order). A claim can't redact itself (its
-  body would have to contain its own hash).
+- **Seen is applied — top-level only.** A redaction takes effect whenever
+  its verified body is seen as an event of its author's log. A redact claim
+  arriving *inside a quote* is mere quotation — quoting is speech, and
+  redaction authority flows only through the author's own log, which sync
+  delivers anyway. A claim can't redact itself (its body would have to
+  contain its own hash).
+- **Redacting a quote takes the quoted content with it.** A quote was never
+  a row — it is content of the quoting claim — so redacting the quote drops
+  the copy, its backlinks, and its media pins in one stroke, with nothing
+  orphaned and nothing to clean up. The quoted author's own claim, and
+  every other quote of it, are untouched.
 - **Redact bodies are never dropped.** A `redact` body is pure machinery — a
   hash pointer, no user content — and the *only* carrier of the fact it
   encodes. Suppressing it would erase that fact from the wire, so a peer
@@ -667,10 +862,11 @@ Rules that keep it convergent and honest:
 - **Own log only.** Anyone else's "redact" is mere speech — stored like any
   claim, no engine effect.
 - **Best-effort by design.** Bytes embedded inside other people's vouches
-  live inside *their* signed claims and cannot be removed — conformant
-  stores suppress them from display and indexing, and vouchers can supersede
-  their vouches, but this is etiquette backed by good defaults, not
-  cryptography. The permanence position above still tells the whole truth.
+  live inside *their* signed claims and cannot be removed by the quoted
+  author — a conformant UI checks the redaction registry for quoted ids and
+  dims or hides them, and vouchers can redact their own quotes, but this is
+  etiquette backed by good defaults, not cryptography. The permanence
+  position above still tells the whole truth.
   (V2+: per-epoch encryption keys allow crypto-shredding — delete the key,
   not the data.)
 
@@ -686,12 +882,16 @@ bytes, not megapixels), logs stay full-syncable, and `size`/`mime` let a UI
 render placeholders and budget fetches before holding a single byte.
 
 **Blobs are cache, not convergent state.** Claims sync eagerly; the per-log
-fingerprint covers them. Blob presence is local, like provenance: a store
+fingerprint covers them. Blob presence is local, like arrival order: a store
 can be fully synced on claims while missing bytes, and the UI shows a
 placeholder. The claim store derives the **want-list** — blobs referenced by
 live bodies and not yet held — and wants never expire; bytes verify against
 the pinned hash on arrival, so *any* pipe can serve them and a lying pipe
 can't poison the cache. Missing media heals exactly like stripped bodies.
+Edges collect *through* quotes: a vouch that shows a photo pins that photo
+under the vouch itself, so quoted media is wanted, demanded, and served
+wherever the quote travels — a reader who follows only the voucher still
+gets the picture, and the voucher's own pipes can serve it.
 
 **Fetching is lazy, locality-first.** Publish discipline makes locality
 work: a publisher uploads blobs *before* the claim that pins them, so the
@@ -708,15 +908,19 @@ cooperative deletion extends to media. Conversely a GC'd blob is not
 
 The composition boundary: `ClaimStore` and `BlobStore` are *adjacent pure
 state* in vouch-core — no I/O, no opinion about provenance of bytes, no
-authoring. The knowledge of *where* to fetch a want from (which relay had
-the claim, which peers are online, retry schedules) belongs to the engine
-layer that owns long-lived transports. **Claim authoring is the engine's
-too**: it mints claims and blobs from app data — put the bytes, pin them in
-a body, sign with the writer, ingest, queue the publish — composing the
-signing primitive (`Writer`) and the two stores, which otherwise
-never touch. One owner for minting also means one owner for sequencing:
-blobs land before the claims that pin them (locally and on publish), so GC
-never races authoring. The stores hold; the engine composes.
+authoring. **Claim authoring is `Database`'s** (vouch-core's composition):
+it mints claims and blobs from app data — put the bytes, pin them in a
+body, sign with the writer, ingest, hand back the event for publishing —
+composing the signing primitive (`Writer`) and the two stores, which
+otherwise never touch. One owner for minting also means one owner for
+sequencing: locally, blobs land before the claims that pin them, so GC
+never races authoring. (On the wire there is no ordering to preserve at
+all: sessions move claims only, and media is pulled by whoever wants it,
+whenever it wants it — the claim's `BlobRef` IS the want.) The knowledge
+of *where* to fetch a want from (which relay had the claim, which peers
+are online, retry schedules) belongs above, to the peer actor (see The
+Peer). The stores hold; the database composes; the session moves; the
+peer talks.
 
 ## Keys, Identity & Devices
 
@@ -741,17 +945,19 @@ Credential Manager, iOS Keychain, Android Keystore).
 ## The Library Boundary
 
 ```text
-vouch-core    claim types, canonical encoding, sign/verify, embed verification,
-              fold invariants, claim store + adjacent blob store (pure state).
-              No I/O. (this crate + the test vectors IS the cross-language spec)
-vouch-store   durable backends for core's storage traits: SQLite claim
-              storage, file blob storage; later the materializer framework,
-              reactive queries
-vouch-sync    the engine: composes writer + claim store + blob store (mints
-              claims/blobs from app data), owns transports, cursors, fetch
-              policy. Transport trait + sync sessions (relay, iroh, files)
+vouch-core    the entire engine, I/O-free. Layered as modules: claim types,
+              canonical encoding, sign/verify, stores (pure state under
+              invariants); sync (the wire protocol as data, the sans-io
+              session, the stateless responder, notify frames); peer (the
+              actor: one task, channel pipes, follows/watches, the taps).
+              No sockets, no clock, no runtime — channels only. (this
+              crate + the test vectors IS the cross-language spec)
+vouch-store   the I/O: SQLite claim storage, file blob storage, SQLite
+              cursor store, open_peer(dir) wiring it all with the system
+              clock; later the materializer framework, reactive queries
 vouch-vocab   the vocabulary: well-known types, fields, rels + lenient parsers
-vouch-app     vocabulary-driven UI, naming, invitations UX, GPUI state
+vouch-app     vocabulary-driven UI, naming, invitations UX, GPUI state;
+              holds Vec<Peer> (one per persona) and the transport tasks
 ```
 
 **Cross-language strategy**: spec-first, not FFI-first. Other-language clients
@@ -761,10 +967,13 @@ consumer shows up.
 
 **Genericness rule**: a seam gets a trait only when it has two real consumers
 today. Claim bodies — dynamic by design (the app's vocabulary, the engine's
-reserved keys). Transport — trait (relay, iroh, files; all near-term).
-Storage — traits under the invariants (memory for tests/simulation, SQLite
-and files for the app; both real today). The store's *logic* — concrete,
-exactly one implementation, on purpose.
+reserved keys). Transport — not even a trait: a pipe is a pair of channels
+carrying typed protocol messages, so any duct qualifies without
+implementing anything (a socket transport is a task that shuttles
+`PipeMsg`s; a test transport is the channels themselves). Storage — traits
+under the invariants (memory for tests/simulation, SQLite and files for
+the app; both real today). The store's *logic*, the session's, and the
+actor's — concrete, exactly one implementation, on purpose.
 
 **The litmus test**: could a trustdown-shaped tool
 ([mitchellh/vouch](https://github.com/mitchellh/vouch)) be built on this
@@ -816,7 +1025,7 @@ constitutionally neither.
 | **ClaimHash**    | A claim's identity: BLAKE3 of its canonical header bytes        |
 | **Body**        | A claim's deterministic-CBOR map; fully freeform                 |
 | **ClaimRef**     | A tagged CBOR value referencing a claim by `(LogId, ClaimHash)`; legal anywhere in a body |
-| **Embed**        | Another author's `SignedEvent` carried as a tagged value; verified by the engine |
+| **Embed**        | Another author's `SignedEvent` carried as a tagged value; verified in place by the engine — content of the quoting claim, not a row; read by recursion |
 | **BlobRef**      | Bulk bytes (media) pinned by hash from a body; the bytes are cache, fetched lazily from any pipe |
 | **Vocabulary**   | The normative set of well-known claim types, fields, and rels  |
 | **Log**          | The network unit: an append-only claim sequence with a single keypair identity |
@@ -831,10 +1040,18 @@ constitutionally neither.
 | **Fingerprint**  | Per-log XOR of per-claim digests; equal iff two honest stores hold the same state |
 | **Arrival**      | A claim's position in one store's per-log insertion order ("the count when it landed"); local metadata, never signed |
 | **Cursor**       | "How many of this log's claims I've received from this pipe" — pipe-local, advanced only after successful ingest |
+| **Peer**         | One database + one identity + the protocol machinery, behind one handle; the thing with a name on the network |
+| **Follow**       | The one configured relationship: "this log, from this source" — directional, private, two-way only for the log you write |
+| **Watch**        | A follow seen from the serving end: ephemeral, per-connection, never persisted |
+| **Pipe**         | A duct carrying typed protocol messages; sockets and serialization live in transport tasks, never in the engine |
+| **Draft**        | A claim under construction: body fields plus attachments, minted atomically |
+| **Frame**        | A `Notify` push: an unsolicited Status with the events attached — advisory, droppable, zero-round-trip when fingerprints agree |
+| **Firehose**     | The local-only tap: everything that lands, for the UI. Never leaves the process |
+| **Authored**     | The only network-facing stream: claims from your own writer |
 | **Subscription** | Following a log, replicating it locally              |
 | **Petname**      | Your local, private name for a log (or entity)            |
-| **Transport**    | Any pipe that moves envelopes: relay, iroh, files              |
-| **Relay**        | A dumb store-and-forward server; one transport among several   |
+| **Transport**    | Any task that moves `PipeMsg`s: relay shim, iroh stream, files |
+| **Relay**        | A peer with no pen, no follows, serving everything published to it; one transport among several |
 
 ## References
 

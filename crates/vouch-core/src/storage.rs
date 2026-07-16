@@ -29,7 +29,7 @@ use crate::value::{BlobHash, ClaimHash};
 /// Storage primitive for claims and their indexes. See the module docs for
 /// the contract; see [`ClaimStore`](crate::ClaimStore) for the logic that
 /// drives it.
-pub trait ClaimStorage {
+pub trait ClaimStorage: Send {
     // ── claims ──────────────────────────────────────────────────────────
     fn get_claim(&self, id: &ClaimHash) -> Result<Option<StoredClaim>, Error>;
     /// Upsert by `claim.signed.id()`.
@@ -102,7 +102,7 @@ struct State {
     redactions: HashMap<ClaimHash, ClaimHash>,
 }
 
-type Undo = Box<dyn FnOnce(&mut State)>;
+type Undo = Box<dyn FnOnce(&mut State) + Send>;
 
 fn add_edge<K: std::hash::Hash + Eq + Copy>(
     map: &mut HashMap<K, BTreeSet<ClaimHash>>,

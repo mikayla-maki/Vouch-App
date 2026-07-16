@@ -41,10 +41,6 @@ pub enum Error {
     #[error("unsupported wire version {0}")]
     UnsupportedVersion(u64),
 
-    /// Embeds nested deeper than the recursion cap.
-    #[error("embed nesting exceeds maximum depth")]
-    EmbedTooDeep,
-
     /// OS randomness was unavailable (key generation only).
     #[error("system randomness unavailable")]
     Randomness,

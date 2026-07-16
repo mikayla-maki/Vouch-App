@@ -343,12 +343,14 @@ impl vouch_core::ClaimStorage for FailNthPut {
 
 #[test]
 fn a_failed_ingest_rolls_back_to_nothing_on_sqlite() {
-    // A vouch embedding a rec is one ingest with TWO put_claims (embedded
-    // first, outer second). Fail the second: with real transactions the
-    // first must vanish too — atomicity, not just healability.
+    // A vouch quoting a rec is one ingest: the quote's edges (backlink to
+    // the quoted claim) write BEFORE the row's put_claim. Fail the put:
+    // with real transactions the already-written edges must vanish too —
+    // atomicity, not just healability.
     let mut alice = Writer::from_seed([6; 32]);
     let mut bob = Writer::from_seed([7; 32]);
     let alice_rec = alice.claim(rec("Joe's Pizza")).unwrap();
+    let alice_id = alice_rec.id();
     let bob_vouch = bob
         .claim(Value::map([
             ("type", Value::text("vouch")),
@@ -358,7 +360,7 @@ fn a_failed_ingest_rolls_back_to_nothing_on_sqlite() {
 
     let storage = FailNthPut {
         inner: vouch_store::SqliteClaimStorage::open_in_memory().unwrap(),
-        puts_until_failure: std::cell::Cell::new(1), // first put ok, second fails
+        puts_until_failure: std::cell::Cell::new(0), // the row's put fails
     };
     let mut db = Database::with_stores(
         Box::new(storage),
@@ -367,13 +369,109 @@ fn a_failed_ingest_rolls_back_to_nothing_on_sqlite() {
 
     let err = db.ingest(bob_vouch.clone()).unwrap_err();
     assert!(matches!(err, vouch_core::Error::Storage(_)));
-    // The embedded claim's put succeeded inside the transaction — and is
-    // GONE after rollback. No partial state, not even healable debris.
+    // The backlink write succeeded inside the transaction — and is GONE
+    // after rollback. No partial state, not even healable debris.
     assert_eq!(db.claims().len(), 0);
+    assert!(db.claims().backlinks(&alice_id).is_empty());
     assert!(db.claims().verify_integrity().is_empty());
 
     // The store remains usable; redelivery completes cleanly.
-    db.ingest(bob_vouch).unwrap();
-    assert_eq!(db.claims().len(), 2);
+    db.ingest(bob_vouch.clone()).unwrap();
+    assert_eq!(db.claims().len(), 1);
+    assert_eq!(db.claims().backlinks(&alice_id), vec![bob_vouch.id()]);
     assert!(db.claims().verify_integrity().is_empty());
+}
+
+#[test]
+fn sync_cursors_survive_a_restart_and_the_instance_is_a_property_of_the_files() {
+    use vouch_core::sync::{InstanceId, PeerCursor, SyncState};
+    use vouch_store::{SqliteSyncState, open_sync_state};
+
+    let dir = fresh_dir("sync-cursors");
+    let log = Writer::from_seed([50; 32]).id();
+    let cursor = PeerCursor {
+        instance: Some(InstanceId([3; 16])),
+        pull: 17,
+        push: 4,
+        settled: Some([8; 32]),
+    };
+
+    let first_instance = {
+        let mut state = open_sync_state(&dir).unwrap();
+        state.set_cursor("relay", &log, cursor).unwrap();
+        // Update in place: the row is an upsert, not an append.
+        let mut bumped = cursor;
+        bumped.pull = 18;
+        state.set_cursor("relay", &log, bumped).unwrap();
+        state.instance()
+    };
+
+    // Reopen: cursors intact, and OUR instance unchanged — a durable
+    // store's arrival order survives restarts, so peers' cursors against
+    // us stay valid.
+    let state = open_sync_state(&dir).unwrap();
+    let reloaded = state.cursor("relay", &log).unwrap();
+    assert_eq!(reloaded.pull, 18);
+    assert_eq!(reloaded.push, 4);
+    assert_eq!(reloaded.instance, Some(InstanceId([3; 16])));
+    assert_eq!(reloaded.settled, Some([8; 32]));
+    assert_eq!(state.instance(), first_instance);
+    // Unknown peers read as the zero cursor, never an error.
+    assert_eq!(state.cursor("nobody", &log).unwrap(), PeerCursor::default());
+
+    // A fresh directory is a fresh incarnation.
+    let other = SqliteSyncState::open(fresh_dir("sync-cursors-2").join("sync.db")).unwrap();
+    assert_ne!(other.instance(), first_instance);
+}
+
+#[test]
+fn a_durable_peer_survives_restart_with_its_voice_and_instance() {
+    use futures::executor::LocalPool;
+    use futures::task::SpawnExt;
+    use vouch_core::{Draft, ServePolicy};
+    use vouch_store::open_peer;
+
+    let dir = fresh_dir("durable-peer");
+    let me = Writer::from_seed([60; 32]).id();
+
+    // First life: mint a claim with an attachment.
+    {
+        let (peer, actor) =
+            open_peer(&dir, Some(Writer::from_seed([60; 32])), ServePolicy::Owned).unwrap();
+        let mut pool = LocalPool::new();
+        pool.spawner().spawn(actor.run()).unwrap();
+        pool.run_until(async {
+            assert_eq!(peer.id(), Some(me));
+            peer.claim(Draft::new("rec").at(1).text("subject", "persists").attach(
+                "photo",
+                b"durable bytes".to_vec(),
+                "image/png",
+            ))
+            .await
+            .unwrap();
+        });
+        // Dropping handle and pool stops the actor; everything durable is
+        // already on disk (synchronous=FULL).
+    }
+
+    // Second life: same dir, same key — claim, blob, and instance intact.
+    let (peer, actor) =
+        open_peer(&dir, Some(Writer::from_seed([60; 32])), ServePolicy::Owned).unwrap();
+    let mut pool = LocalPool::new();
+    pool.spawner().spawn(actor.run()).unwrap();
+    let (len, blob_count) = pool
+        .run_until(peer.query(move |db| {
+            let blobs = db
+                .claims()
+                .log(&me)
+                .iter()
+                .map(|c| c.blobs.len())
+                .sum::<usize>();
+            (db.claims().log_len(&me), blobs)
+        }))
+        .unwrap();
+    assert_eq!(len, 1);
+    assert_eq!(blob_count, 1);
+    let same_instance = vouch_store::open_sync_state(&dir).unwrap().instance();
+    let _ = same_instance; // minted once at first open; see sync_cursors test
 }

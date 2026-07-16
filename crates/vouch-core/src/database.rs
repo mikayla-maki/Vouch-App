@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use crate::blob::{BlobStorage, BlobStore};
 use crate::claim::SignedEvent;
+use crate::draft::Draft;
 use crate::error::Error;
 use crate::keys::LogId;
 use crate::storage::ClaimStorage;
@@ -116,6 +117,21 @@ impl Database {
         Ok(event)
     }
 
+    /// Mint a [`Draft`]: store its attachments as blobs, pin them in the
+    /// body, sign, ingest — one operation, so media and the claim that
+    /// pins it land together (blob-before-claim by construction).
+    pub fn compose(&mut self, log: &LogId, draft: Draft) -> Result<SignedEvent, Error> {
+        if !self.writers.contains_key(log) {
+            return Err(Error::NotOurLog(*log));
+        }
+        let mut fields = draft.fields;
+        for attachment in draft.attachments {
+            let blob_ref = self.attach(attachment.bytes, attachment.mime)?;
+            fields.push((attachment.key, Value::BlobRef(blob_ref)));
+        }
+        self.claim(log, Value::map(fields))
+    }
+
     // ── The door in ─────────────────────────────────────────────────────
 
     /// Ingest one signed event from any pipe. Order-insensitive,
@@ -165,5 +181,13 @@ impl Database {
     /// Drop blobs no live body references (cooperative deletion for media).
     pub fn gc_blobs(&mut self) -> Result<Vec<BlobHash>, Error> {
         self.blobs.gc(&self.claims)
+    }
+
+    /// Cache eviction under storage pressure: drop a blob's bytes, keep
+    /// every claim. The hash returns to [`missing_blobs`](Self::missing_blobs)
+    /// and re-fetches from whoever serves the pinning claim's log — the
+    /// caller doesn't care whether that's the author's phone or a relay.
+    pub fn evict_blob(&mut self, hash: &BlobHash) -> Result<bool, Error> {
+        self.blobs.evict(hash)
     }
 }

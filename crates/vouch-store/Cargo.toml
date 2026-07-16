@@ -9,3 +9,7 @@ description = "Durable storage backends for vouch-core: SQLite claim storage, fi
 vouch-core = { path = "../vouch-core" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
+getrandom = "0.3"
+
+[dev-dependencies]
+futures = "0.3"
