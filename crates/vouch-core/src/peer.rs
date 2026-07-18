@@ -77,7 +77,7 @@ use crate::sync::{
     self, Error, InstanceId, Notify, Request, Response, SyncSession, SyncState, apply_notify,
     notify_for,
 };
-use crate::value::BlobHash;
+use crate::value::{BlobHash, ClaimHash};
 use crate::writer::Writer;
 
 /// One live connection, as the actor names it. Connection-scoped: a
@@ -195,6 +195,10 @@ enum Command {
         hash: BlobHash,
         reply: oneshot::Sender<Result<bool, Error>>,
     },
+    GcClaims {
+        cutoff: i64,
+        reply: oneshot::Sender<Result<Vec<ClaimHash>, Error>>,
+    },
     Firehose {
         reply: oneshot::Sender<mpsc::Receiver<PeerEvent>>,
     },
@@ -306,6 +310,15 @@ impl Peer {
     pub async fn evict_blob(&self, hash: BlobHash) -> Result<bool, Error> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::EvictBlob { hash, reply }).await?;
+        rx.await.map_err(gone)?
+    }
+
+    /// A relay's retention policy: discard claims received before `cutoff`
+    /// (Unix ms). See [`Database::gc_claims_older_than`] for why this is
+    /// sound only as a bounded promise, never a cursor-driven one.
+    pub async fn gc_claims_older_than(&self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::GcClaims { cutoff, reply }).await?;
         rx.await.map_err(gone)?
     }
 
@@ -552,6 +565,9 @@ impl Core {
             }
             Command::EvictBlob { hash, reply } => {
                 let _ = reply.send(self.db.evict_blob(&hash).map_err(Error::Core));
+            }
+            Command::GcClaims { cutoff, reply } => {
+                let _ = reply.send(self.db.gc_claims_older_than(cutoff).map_err(Error::Core));
             }
             Command::Query(f) => f(&self.db),
         }

@@ -596,3 +596,44 @@ fn quoted_media_routes_through_the_quoters_log() {
         "the demand routed through the QUOTE's log and alice served it"
     );
 }
+
+#[test]
+fn gc_claims_older_than_reaches_through_the_actor() {
+    // The verb a relay's maintenance loop calls: purge by age, through the
+    // same command channel every other operation uses — no back door into
+    // the actor's own Database.
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    let (relay, actor) = make_peer(None, 1, ServePolicy::Everything);
+    spawner.spawn(actor.run()).unwrap();
+
+    let alice_log = pool.run_until(async {
+        let (alice, alice_actor) = make_peer(Some(1), 2, ServePolicy::Owned);
+        spawner.spawn(alice_actor.run()).unwrap();
+        let alice_log = alice.id().unwrap();
+        let (alice_end, relay_end) = pipe(256);
+        let on_relay = relay.connect("alice", relay_end).await.unwrap();
+        alice.connect("relay", alice_end).await.unwrap();
+        alice.follow(alice_log, on_relay).await.unwrap();
+        alice
+            .claim(Draft::new("rec").at(1).text("subject", "old"))
+            .await
+            .unwrap();
+        alice_log
+    });
+    pool.run_until_stalled();
+
+    let count = pool
+        .run_until(relay.query(move |db| db.claims().log_len(&alice_log)))
+        .unwrap();
+    assert_eq!(count, 1, "the relay actually received alice's push");
+
+    let purged = pool.run_until(relay.gc_claims_older_than(5_000)).unwrap();
+    assert_eq!(purged.len(), 1);
+
+    let count = pool
+        .run_until(relay.query(move |db| db.claims().log_len(&alice_log)))
+        .unwrap();
+    assert_eq!(count, 0, "gc reached the actor's own Database");
+}
