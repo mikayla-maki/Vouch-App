@@ -7,9 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::fold::{self, Comment, FieldState};
+use crate::fold::{self, ClaimView, Comment, FieldState};
 use crate::keys::LogId;
-use crate::store::{ClaimStore, StoredClaim};
 use crate::value::{ClaimHash, Value};
 
 pub const ROOT_TYPE: &str = "rec";
@@ -132,12 +131,16 @@ fn as_text(value: &Value) -> Option<&str> {
 
 /// Every `rec` component that still has a `subject` and `body` after
 /// folding — a component missing either (malformed, or every contributor
-/// redacted) isn't a recommendation the UI can show.
+/// redacted) isn't a recommendation the UI can show. Takes the decrypted
+/// view (see [`e2ee::decrypted_view`]): what you can't decrypt, you
+/// can't fold.
+///
+/// [`e2ee::decrypted_view`]: crate::e2ee::decrypted_view
 pub fn recommendations(
-    store: &ClaimStore,
-    accept: &dyn Fn(&StoredClaim) -> bool,
+    view: &[ClaimView],
+    accept: &dyn Fn(&ClaimView) -> bool,
 ) -> Vec<Recommendation> {
-    fold::fold(store, ROOT_TYPE, EDIT_TYPE, COMMENT_TYPE, accept)
+    fold::fold(view, ROOT_TYPE, EDIT_TYPE, COMMENT_TYPE, accept)
         .into_iter()
         .filter_map(|c| {
             let subject = c

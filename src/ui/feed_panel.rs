@@ -6,10 +6,13 @@ use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
 use gpui_component::{Icon, IconName};
+use vouch_core::e2ee::ContentKey;
 use vouch_core::{ClaimHash, LogId, Recommendation};
 
 pub struct FeedPanel {
     feed: Entity<Feed>,
+    /// Our content key, for sealing what the New Vouch dialog authors.
+    key: ContentKey,
     local_log_id: Option<LogId>,
     selected_hash: Option<ClaimHash>,
     search_bar: Entity<SearchBar>,
@@ -20,7 +23,12 @@ pub struct FeedPanel {
 }
 
 impl FeedPanel {
-    pub fn new(feed: Entity<Feed>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        feed: Entity<Feed>,
+        key: ContentKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search_bar = cx.new(|cx| SearchBar::new(window, cx));
 
         cx.subscribe(
@@ -45,6 +53,7 @@ impl FeedPanel {
 
         Self {
             feed,
+            key,
             local_log_id,
             selected_hash: None,
             search_bar,
@@ -141,6 +150,7 @@ impl FeedPanel {
     // in button.rs), so this stays hand-rolled until that is fixed.
     fn render_new_vouch_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let peer = self.feed.read(cx).peer().clone();
+        let key = self.key;
 
         div()
             .w_full()
@@ -158,7 +168,7 @@ impl FeedPanel {
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.primary_hover))
                     .on_click(cx.listener(move |_this, _event, window, cx| {
-                        NewRecommendationModal::open(peer.clone(), window, cx);
+                        NewRecommendationModal::open(peer.clone(), key, window, cx);
                     }))
                     .child(
                         div()

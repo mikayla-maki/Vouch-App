@@ -1,18 +1,57 @@
-//! The materializer prototype: `rec` claims plus `edit` claims (source-
-//! author only) that patch individual fields, plus `comment` claims (any
-//! author, never merged) — folded into components with per-field causal
-//! frontiers. No minted ids anywhere: identity is connectivity, and
-//! conflicts are exposed rather than silently resolved.
+//! The materializer over sealed claims — there is no plaintext content in
+//! Vouch, so every fold test writes the way the app does: seal with the
+//! author's content key, mint the envelope, fold through a decrypted
+//! view. `rec` roots plus `edit` patches (source-author only) plus
+//! `comment`s (any author), per-field causal frontiers, no minted IDs.
+//!
+//! Key possession is NOT what these tests probe (e2ee_flow.rs covers
+//! who-can-read-what): the view here holds every participant's key so
+//! the fold semantics themselves are on stage.
 
-use vouch_core::fold::fold;
-use vouch_core::{ClaimRef, Database, Draft, LogId, StoredClaim, Value, Writer};
+use std::collections::BTreeMap;
 
-fn accept_all(_: &StoredClaim) -> bool {
+use vouch_core::e2ee::{self, ContentKey, Identity};
+use vouch_core::fold::{ClaimView, fold};
+use vouch_core::{ClaimRef, Database, Draft, LogId, SignedEvent, Value, Writer};
+
+fn accept_all(_: &ClaimView) -> bool {
     true
 }
 
+/// A database with writers for the given seeds.
+fn db_with(seeds: &[u8]) -> Database {
+    let mut db = Database::new();
+    for &seed in seeds {
+        db.add_writer(Writer::from_seed([seed; 32]));
+    }
+    db
+}
+
+fn log_of(seed: u8) -> LogId {
+    Identity::from_seed([seed; 32]).log_id()
+}
+
+/// Seal `draft` with seed's content key and mint it into their log.
+fn seal(db: &mut Database, seed: u8, draft: Draft) -> SignedEvent {
+    let id = Identity::from_seed([seed; 32]);
+    let sealed = e2ee::seal_draft(&id.content_key(), &draft).unwrap();
+    db.claim(&id.log_id(), sealed.body_value()).unwrap()
+}
+
+/// Every test participant's key, so the fold — not key possession — is
+/// what's under test.
+fn all_keys() -> BTreeMap<LogId, ContentKey> {
+    (1u8..=8)
+        .map(|seed| {
+            let id = Identity::from_seed([seed; 32]);
+            (id.log_id(), id.content_key())
+        })
+        .collect()
+}
+
 fn run(db: &Database) -> Vec<vouch_core::Component> {
-    fold(db.claims(), "rec", "edit", "comment", &accept_all)
+    let view = e2ee::decrypted_view(db.claims(), &all_keys());
+    fold(&view, "rec", "edit", "comment", &accept_all)
 }
 
 fn text(component: &vouch_core::Component, field: &str) -> Vec<String> {
@@ -37,32 +76,30 @@ fn of(refs: impl IntoIterator<Item = ClaimRef>) -> Value {
     Value::Array(refs.into_iter().map(Value::ClaimRef).collect())
 }
 
+fn rec_ref(seed: u8, event: &SignedEvent) -> ClaimRef {
+    ClaimRef {
+        log_id: log_of(seed),
+        hash: event.id(),
+    }
+}
+
 #[test]
 fn a_same_author_edit_sets_an_unambiguous_field() {
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-
-    let rec = db
-        .compose(
-            &alice,
-            Draft::new("rec")
-                .text("subject", "Joe's Pizza")
-                .text("body", "Great!"),
-        )
-        .unwrap();
-    db.compose(
-        &alice,
+    let mut db = db_with(&[1]);
+    let rec = seal(
+        &mut db,
+        1,
+        Draft::new("rec")
+            .text("subject", "Joe's Pizza")
+            .text("body", "Great!"),
+    );
+    seal(
+        &mut db,
+        1,
         Draft::new("edit")
-            .field(
-                "of",
-                of([ClaimRef {
-                    log_id: alice,
-                    hash: rec.id(),
-                }]),
-            )
+            .field("of", of([rec_ref(1, &rec)]))
             .text("address", "123 Main St"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
@@ -74,123 +111,81 @@ fn a_same_author_edit_sets_an_unambiguous_field() {
 
 #[test]
 fn an_edit_from_anyone_else_is_inert() {
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-    let bob = db.add_writer(Writer::from_seed([2; 32]));
-
-    let rec = db
-        .compose(&alice, Draft::new("rec").text("subject", "Joe's Pizza"))
-        .unwrap();
-    // Bob tries to "edit" Alice's rec directly. It's still a real, stored
-    // claim (the debug viewer would show it) — it just doesn't count.
-    db.compose(
-        &bob,
+    let mut db = db_with(&[1, 2]);
+    let rec = seal(&mut db, 1, Draft::new("rec").text("subject", "Joe's Pizza"));
+    // Bob tries to "edit" Alice's rec. Still a real, stored claim — it
+    // just doesn't count toward any field.
+    seal(
+        &mut db,
+        2,
         Draft::new("edit")
-            .field(
-                "of",
-                of([ClaimRef {
-                    log_id: alice,
-                    hash: rec.id(),
-                }]),
-            )
+            .field("of", of([rec_ref(1, &rec)]))
             .text("address", "1 Bob's Way"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
     let c = &components[0];
-    assert_eq!(c.claims.len(), 2); // both claims are still in the component
+    assert_eq!(c.claims.len(), 2); // both claims are in the component
     assert!(text(c, "address").is_empty()); // but the edit didn't take
 }
 
 #[test]
 fn the_same_authors_concurrent_edits_expose_a_conflict() {
-    // The realistic case now that edits are author-scoped: Alice edits
-    // from her phone and her laptop while offline, neither aware of the
-    // other, and syncs both later.
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-
-    let rec = db
-        .compose(&alice, Draft::new("rec").text("subject", "Taco place"))
-        .unwrap();
-    let of_rec = of([ClaimRef {
-        log_id: alice,
-        hash: rec.id(),
-    }]);
-
-    db.compose(
-        &alice,
+    // Alice edits from her phone and her laptop while offline; neither
+    // edit knows about the other. The conflict is exposed, not resolved.
+    let mut db = db_with(&[1]);
+    let rec = seal(&mut db, 1, Draft::new("rec").text("subject", "Taco place"));
+    seal(
+        &mut db,
+        1,
         Draft::new("edit")
-            .field("of", of_rec.clone())
+            .field("of", of([rec_ref(1, &rec)]))
             .text("address", "1 Phone St"),
-    )
-    .unwrap();
-    db.compose(
-        &alice,
+    );
+    seal(
+        &mut db,
+        1,
         Draft::new("edit")
-            .field("of", of_rec)
+            .field("of", of([rec_ref(1, &rec)]))
             .text("address", "2 Laptop Ave"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
-    let addresses = text(&components[0], "address");
-    assert_eq!(addresses, vec!["1 Phone St", "2 Laptop Ave"]);
+    assert_eq!(
+        text(&components[0], "address"),
+        vec!["1 Phone St", "2 Laptop Ave"]
+    );
 }
 
 #[test]
 fn a_reconciling_edit_that_resets_the_field_collapses_the_frontier() {
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-
-    let rec = db
-        .compose(&alice, Draft::new("rec").text("subject", "Taco place"))
-        .unwrap();
-    let rec_ref = ClaimRef {
-        log_id: alice,
-        hash: rec.id(),
-    };
-    let edit_phone = db
-        .compose(
-            &alice,
-            Draft::new("edit")
-                .field("of", of([rec_ref]))
-                .text("address", "1 Phone St"),
-        )
-        .unwrap();
-    let edit_laptop = db
-        .compose(
-            &alice,
-            Draft::new("edit")
-                .field("of", of([rec_ref]))
-                .text("address", "2 Laptop Ave"),
-        )
-        .unwrap();
-
-    // Alice reconciles her own conflict: one more edit referencing both,
-    // re-asserting the field. Nothing special — just an ordinary edit.
-    db.compose(
-        &alice,
+    let mut db = db_with(&[1]);
+    let rec = seal(&mut db, 1, Draft::new("rec").text("subject", "Taco place"));
+    let phone = seal(
+        &mut db,
+        1,
         Draft::new("edit")
-            .field(
-                "of",
-                of([
-                    ClaimRef {
-                        log_id: alice,
-                        hash: edit_phone.id(),
-                    },
-                    ClaimRef {
-                        log_id: alice,
-                        hash: edit_laptop.id(),
-                    },
-                ]),
-            )
+            .field("of", of([rec_ref(1, &rec)]))
+            .text("address", "1 Phone St"),
+    );
+    let laptop = seal(
+        &mut db,
+        1,
+        Draft::new("edit")
+            .field("of", of([rec_ref(1, &rec)]))
+            .text("address", "2 Laptop Ave"),
+    );
+    // One more edit referencing both concurrent edits, re-asserting the
+    // field: an ordinary edit, nothing special — a merge commit.
+    seal(
+        &mut db,
+        1,
+        Draft::new("edit")
+            .field("of", of([rec_ref(1, &phone), rec_ref(1, &laptop)]))
             .text("address", "3 Reconciled Rd"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
@@ -199,54 +194,30 @@ fn a_reconciling_edit_that_resets_the_field_collapses_the_frontier() {
 
 #[test]
 fn a_reconciling_edit_that_ignores_the_field_leaves_its_conflict_standing() {
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-
-    let rec = db
-        .compose(&alice, Draft::new("rec").text("subject", "Taco place"))
-        .unwrap();
-    let rec_ref = ClaimRef {
-        log_id: alice,
-        hash: rec.id(),
-    };
-    let edit_phone = db
-        .compose(
-            &alice,
-            Draft::new("edit")
-                .field("of", of([rec_ref]))
-                .text("address", "1 Phone St"),
-        )
-        .unwrap();
-    let edit_laptop = db
-        .compose(
-            &alice,
-            Draft::new("edit")
-                .field("of", of([rec_ref]))
-                .text("address", "2 Laptop Ave"),
-        )
-        .unwrap();
-
-    // Alice references both but only touches a different field — she
-    // hasn't resolved the address conflict, just added a note.
-    db.compose(
-        &alice,
+    let mut db = db_with(&[1]);
+    let rec = seal(&mut db, 1, Draft::new("rec").text("subject", "Taco place"));
+    let phone = seal(
+        &mut db,
+        1,
         Draft::new("edit")
-            .field(
-                "of",
-                of([
-                    ClaimRef {
-                        log_id: alice,
-                        hash: edit_phone.id(),
-                    },
-                    ClaimRef {
-                        log_id: alice,
-                        hash: edit_laptop.id(),
-                    },
-                ]),
-            )
+            .field("of", of([rec_ref(1, &rec)]))
+            .text("address", "1 Phone St"),
+    );
+    let laptop = seal(
+        &mut db,
+        1,
+        Draft::new("edit")
+            .field("of", of([rec_ref(1, &rec)]))
+            .text("address", "2 Laptop Ave"),
+    );
+    // References both but only adds a note: the address conflict stands.
+    seal(
+        &mut db,
+        1,
+        Draft::new("edit")
+            .field("of", of([rec_ref(1, &phone), rec_ref(1, &laptop)]))
             .text("note", "need to pick one of these"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
@@ -257,73 +228,46 @@ fn a_reconciling_edit_that_ignores_the_field_leaves_its_conflict_standing() {
 
 #[test]
 fn anyone_can_comment_without_affecting_fields() {
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-    let bob = db.add_writer(Writer::from_seed([2; 32]));
-
-    let rec = db
-        .compose(&alice, Draft::new("rec").text("subject", "Taco place"))
-        .unwrap();
-    let rec_ref = ClaimRef {
-        log_id: alice,
-        hash: rec.id(),
-    };
-
-    db.compose(
-        &bob,
+    let mut db = db_with(&[1, 2]);
+    let rec = seal(&mut db, 1, Draft::new("rec").text("subject", "Taco place"));
+    seal(
+        &mut db,
+        2,
         Draft::new("comment")
-            .field("of", of([rec_ref]))
+            .field("of", of([rec_ref(1, &rec)]))
             .text("text", "the address is 123 Main St, I think"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
     let c = &components[0];
     assert!(text(c, "address").is_empty()); // a comment never sets a field
     assert_eq!(c.comments.len(), 1);
-    assert_eq!(c.comments[0].author, bob);
+    assert_eq!(c.comments[0].author, log_of(2));
     assert_eq!(c.comments[0].text, "the address is 123 Main St, I think");
 }
 
 #[test]
 fn two_independently_filed_recs_collate_once_something_links_them() {
-    let mut db = Database::new();
-    let alice = db.add_writer(Writer::from_seed([1; 32]));
-    let bob = db.add_writer(Writer::from_seed([2; 32]));
-    let carol = db.add_writer(Writer::from_seed([3; 32]));
+    let mut db = db_with(&[1, 2, 3]);
+    let rec_a = seal(&mut db, 1, Draft::new("rec").text("subject", "Taco Palace"));
+    let rec_b = seal(
+        &mut db,
+        2,
+        Draft::new("rec").text("subject", "That taco place"),
+    );
 
-    let rec_a = db
-        .compose(&alice, Draft::new("rec").text("subject", "Taco Palace"))
-        .unwrap();
-    let rec_b = db
-        .compose(&bob, Draft::new("rec").text("subject", "That taco place"))
-        .unwrap();
+    assert_eq!(run(&db).len(), 2, "independent until linked");
 
-    // Before anything links them, they're independent.
-    assert_eq!(run(&db).len(), 2);
-
-    // Carol notices they're the same place. Linking isn't an edit (she
-    // owns neither), so it rides in as a comment.
-    db.compose(
-        &carol,
+    // Carol notices they're the same place; linking rides in a comment
+    // (she owns neither, so it can't be an edit).
+    seal(
+        &mut db,
+        3,
         Draft::new("comment")
-            .field(
-                "of",
-                of([
-                    ClaimRef {
-                        log_id: alice,
-                        hash: rec_a.id(),
-                    },
-                    ClaimRef {
-                        log_id: bob,
-                        hash: rec_b.id(),
-                    },
-                ]),
-            )
+            .field("of", of([rec_ref(1, &rec_a), rec_ref(2, &rec_b)]))
             .text("text", "pretty sure these are the same place"),
-    )
-    .unwrap();
+    );
 
     let components = run(&db);
     assert_eq!(components.len(), 1);
@@ -333,33 +277,22 @@ fn two_independently_filed_recs_collate_once_something_links_them() {
 
 #[test]
 fn the_fold_is_independent_of_arrival_order() {
-    let mut forward = Database::new();
-    let alice = forward.add_writer(Writer::from_seed([1; 32]));
-    let bob: LogId = forward.add_writer(Writer::from_seed([2; 32]));
-
-    let rec = forward
-        .compose(&alice, Draft::new("rec").text("subject", "Taco place"))
-        .unwrap();
-    let rec_ref = ClaimRef {
-        log_id: alice,
-        hash: rec.id(),
-    };
-    let edit = forward
-        .compose(
-            &alice,
-            Draft::new("edit")
-                .field("of", of([rec_ref]))
-                .text("address", "1 Main St"),
-        )
-        .unwrap();
-    let comment = forward
-        .compose(
-            &bob,
-            Draft::new("comment")
-                .field("of", of([rec_ref]))
-                .text("text", "love this place"),
-        )
-        .unwrap();
+    let mut forward = db_with(&[1, 2]);
+    let rec = seal(&mut forward, 1, Draft::new("rec").text("subject", "Taco place"));
+    let edit = seal(
+        &mut forward,
+        1,
+        Draft::new("edit")
+            .field("of", of([rec_ref(1, &rec)]))
+            .text("address", "1 Main St"),
+    );
+    let comment = seal(
+        &mut forward,
+        2,
+        Draft::new("comment")
+            .field("of", of([rec_ref(1, &rec)]))
+            .text("text", "love this place"),
+    );
 
     // The same three events, ingested into a fresh store in reverse order.
     let mut backward = Database::new();

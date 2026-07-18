@@ -10,10 +10,12 @@
 use std::path::{Path, PathBuf};
 
 use gpui::Context;
-use vouch_core::{LogId, Peer};
+use vouch_core::e2ee::{self, Identity};
+use vouch_core::{Draft, LogId, Peer, Value};
 
 pub struct Follows {
     peer: Peer,
+    identity: Identity,
     mailbox_url: Option<String>,
     /// Where follows persist. Dropped to `None` for the session if the
     /// existing file couldn't be parsed — we never overwrite a file we
@@ -25,9 +27,10 @@ pub struct Follows {
 impl Follows {
     /// Load the stored follows, connect a mailbox bridge for each, and
     /// fold in any extras (the `VOUCH_FOLLOW` env var) through the same
-    /// path as a UI add — connected and persisted alike.
+    /// path as a UI add — connected, granted, and persisted alike.
     pub fn new(
         peer: Peer,
+        identity: Identity,
         mailbox_url: Option<String>,
         path: Option<PathBuf>,
         extras: Vec<LogId>,
@@ -57,6 +60,7 @@ impl Follows {
 
         let mut this = Self {
             peer,
+            identity,
             mailbox_url,
             path,
             list,
@@ -66,12 +70,14 @@ impl Follows {
         }
         for log in this.list.clone() {
             this.connect(log);
+            this.grant(log);
         }
         let mut added = false;
         for log in extras {
             if !this.list.contains(&log) {
                 this.list.push(log);
                 this.connect(log);
+                this.grant(log);
                 added = true;
             }
         }
@@ -95,6 +101,7 @@ impl Follows {
         }
         self.list.push(log);
         self.connect(log);
+        self.grant(log);
         self.save();
         cx.notify();
         true
@@ -104,6 +111,25 @@ impl Follows {
         if let Some(url) = &self.mailbox_url {
             vouch_transport::connect_mailbox(&self.peer, url, log);
         }
+    }
+
+    /// Auto-grant on follow: seal our content key to them and publish the
+    /// grant into our own log. Sealing is deterministic, so re-granting
+    /// on every launch mints a byte-identical claim that content-address
+    /// dedupes to nothing — no bookkeeping about who's already granted.
+    /// (No `at` field, for the same reason: the body must be stable.)
+    fn grant(&self, log: LogId) {
+        let Some(sealed) = self.identity.grant_for(log) else {
+            eprintln!("cannot grant {log}: not a valid key");
+            return;
+        };
+        let peer = self.peer.clone();
+        let draft = Draft::new(e2ee::GRANT_TYPE).field("sealed", Value::Bytes(sealed));
+        std::thread::spawn(move || {
+            if let Err(e) = futures::executor::block_on(peer.claim(draft)) {
+                eprintln!("failed to publish grant: {e}");
+            }
+        });
     }
 
     fn save(&self) {

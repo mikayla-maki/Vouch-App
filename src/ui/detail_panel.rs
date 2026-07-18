@@ -7,6 +7,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::theme::{ActiveTheme, Theme};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vouch_core::e2ee::{self, ContentKey};
 use vouch_core::{Comment, Draft, LogId, Peer, Recommendation};
 
 // Vouch-chain and related-vouches sections belong here once `vouch` claims
@@ -19,6 +20,9 @@ pub struct DetailPanel {
     selected: Option<Recommendation>,
     local_log_id: Option<LogId>,
     peer: Peer,
+    /// Our content key — everything authored here (edits, comments)
+    /// seals with it before minting.
+    key: ContentKey,
     names: BTreeMap<LogId, String>,
 }
 
@@ -27,12 +31,14 @@ impl DetailPanel {
         selected: Option<Recommendation>,
         local_log_id: Option<LogId>,
         peer: Peer,
+        key: ContentKey,
         names: BTreeMap<LogId, String>,
     ) -> Self {
         Self {
             selected,
             local_log_id,
             peer,
+            key,
             names,
         }
     }
@@ -90,6 +96,7 @@ impl DetailPanel {
         is_own: bool,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        key: ContentKey,
         names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
@@ -109,6 +116,7 @@ impl DetailPanel {
                 rec,
                 local_log_id,
                 peer,
+                key,
                 names,
                 window,
                 cx,
@@ -119,6 +127,7 @@ impl DetailPanel {
                 is_own,
                 local_log_id,
                 peer,
+                key,
                 theme,
             ))
     }
@@ -203,6 +212,7 @@ impl DetailPanel {
         rec: &Recommendation,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        key: ContentKey,
         names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
@@ -221,6 +231,7 @@ impl DetailPanel {
                 rec,
                 local_log_id,
                 peer,
+                key,
                 names,
                 window,
                 cx,
@@ -288,6 +299,7 @@ impl DetailPanel {
         rec: &Recommendation,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        key: ContentKey,
         names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
@@ -359,7 +371,7 @@ impl DetailPanel {
             .when(!items.is_empty(), |this| {
                 this.child(div().flex().flex_col().gap_2().children(items))
             })
-            .child(Self::render_comment_composer(rec, peer, &comment_state, theme))
+            .child(Self::render_comment_composer(rec, peer, key, &comment_state, theme))
     }
 
     fn render_comment(
@@ -415,6 +427,7 @@ impl DetailPanel {
     fn render_comment_composer(
         rec: &Recommendation,
         peer: &Peer,
+        key: ContentKey,
         comment_state: &Entity<InputState>,
         theme: &Theme,
     ) -> Div {
@@ -454,13 +467,18 @@ impl DetailPanel {
 
                         // Comments are open to anyone (no source-author gate)
                         // and never touch `fields`; fire-and-forget, same as
-                        // authoring any other claim.
+                        // authoring any other claim. Sealed with OUR key —
+                        // a comment is our speech in our log, readable by
+                        // our granted audience.
                         cx.spawn(async move |_cx| {
                             let draft = Draft::new("comment")
                                 .at(at_ms)
                                 .field("of", of_value)
                                 .text("text", text);
-                            let _ = peer.claim(draft).await;
+                            let Ok(sealed) = e2ee::seal_draft(&key, &draft) else {
+                                return;
+                            };
+                            let _ = peer.claim(sealed).await;
                         })
                         .detach();
 
@@ -483,6 +501,7 @@ impl DetailPanel {
         is_own: bool,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        key: ContentKey,
         theme: &Theme,
     ) -> Div {
         let not_implemented_border = gpui::red();
@@ -513,7 +532,7 @@ impl DetailPanel {
             ))
             .child(Self::render_history_button(rec, local_log_id, theme))
             .when(is_own, |this| {
-                this.child(Self::render_edit_button(rec, peer, theme))
+                this.child(Self::render_edit_button(rec, peer, key, theme))
             })
     }
 
@@ -554,7 +573,12 @@ impl DetailPanel {
             )
     }
 
-    fn render_edit_button(rec: &Recommendation, peer: &Peer, theme: &Theme) -> Stateful<Div> {
+    fn render_edit_button(
+        rec: &Recommendation,
+        peer: &Peer,
+        key: ContentKey,
+        theme: &Theme,
+    ) -> Stateful<Div> {
         let peer = peer.clone();
         let rec = rec.clone();
 
@@ -574,7 +598,7 @@ impl DetailPanel {
             .shadow_sm()
             .hover(|style| style.bg(theme.list_hover))
             .on_click(move |_event, window, cx| {
-                EditRecommendationModal::open(peer.clone(), rec.clone(), window, cx);
+                EditRecommendationModal::open(peer.clone(), key, rec.clone(), window, cx);
             })
             .child(div().text_sm().child("✏️"))
             .child(
@@ -629,6 +653,7 @@ impl RenderOnce for DetailPanel {
                     is_own,
                     self.local_log_id,
                     &self.peer,
+                    self.key,
                     &self.names,
                     window,
                     cx,

@@ -15,12 +15,13 @@ use gpui_component::theme::ActiveTheme;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vouch_core::e2ee::{self, ContentKey};
 use vouch_core::{Draft, Peer, profile};
 
 pub struct WelcomeModal;
 
 impl WelcomeModal {
-    pub fn open(peer: Peer, window: &mut Window, cx: &mut App) {
+    pub fn open(peer: Peer, key: ContentKey, window: &mut Window, cx: &mut App) {
         let address = peer
             .id()
             .map(|log| log.to_string())
@@ -50,8 +51,13 @@ impl WelcomeModal {
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
                     cx.spawn(async move |_cx| {
+                        // Sealed like all speech: your name resolves for
+                        // people you've granted, and nobody else.
                         let draft = Draft::new("profile").at(at_ms).text("name", name);
-                        let _ = peer.claim(draft).await;
+                        let Ok(sealed) = e2ee::seal_draft(&key, &draft) else {
+                            return;
+                        };
+                        let _ = peer.claim(sealed).await;
                     })
                     .detach();
                     true

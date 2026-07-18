@@ -7,11 +7,17 @@ description = "Vouch engine core: claims, canonical CBOR, signing, in-memory cla
 
 [dependencies]
 blake3 = "1"
-ed25519-dalek = "2"
+ed25519-dalek = "2.2"
 getrandom = "0.3"
 thiserror = "2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"], optional = true }
+# E2EE: XChaCha20-Poly1305 body envelopes, X25519 sealed-box grants
+# (converted from the Ed25519 identity keys), HKDF for every derivation.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
 
 [features]
 # Wire (de)serialization of the sync protocol types, for transports outside

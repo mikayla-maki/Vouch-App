@@ -43,8 +43,38 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::keys::LogId;
-use crate::store::{ClaimStore, StoredClaim};
 use crate::value::{ClaimHash, Fields, Value};
+
+/// A claim as the fold sees it: body already resolved to plaintext.
+///
+/// This is the seam end-to-end encryption slots under: plaintext claims
+/// pass into the view unchanged, encrypted envelopes are resolved by
+/// whoever holds the key (see [`e2ee::decrypted_view`]), and the fold
+/// itself never knows the difference. Its `refs` are recomputed from the
+/// resolved body — an encrypted claim's references are invisible to
+/// ingest-time indexes by design.
+///
+/// [`e2ee::decrypted_view`]: crate::e2ee::decrypted_view
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimView {
+    pub id: ClaimHash,
+    pub author: LogId,
+    pub received_at: i64,
+    /// The plaintext body map.
+    pub body: BTreeMap<String, Value>,
+    /// Outgoing claim references of the plaintext body.
+    pub refs: Vec<ClaimHash>,
+}
+
+impl ClaimView {
+    /// The body's vocabulary tag.
+    pub fn claim_type(&self) -> Option<&str> {
+        match self.body.get("type") {
+            Some(Value::Text(t)) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -124,24 +154,23 @@ pub struct Component {
 /// "current state" viewer-relative rather than one objective answer — the
 /// same claim set can fold to different results for different policies.
 pub fn fold(
-    store: &ClaimStore,
+    view: &[ClaimView],
     root_type: &str,
     edit_type: &str,
     comment_type: &str,
-    accept: &dyn Fn(&StoredClaim) -> bool,
+    accept: &dyn Fn(&ClaimView) -> bool,
 ) -> Vec<Component> {
-    let mut nodes: HashMap<ClaimHash, StoredClaim> = HashMap::new();
+    let mut nodes: HashMap<ClaimHash, ClaimView> = HashMap::new();
     let mut roles: HashMap<ClaimHash, Role> = HashMap::new();
-    for (claim_type, role) in [
-        (root_type, Role::Root),
-        (edit_type, Role::Edit),
-        (comment_type, Role::Comment),
-    ] {
-        for claim in store.by_type(claim_type).into_iter().filter(|c| accept(c)) {
-            let id = claim.signed.id();
-            roles.insert(id, role);
-            nodes.insert(id, claim);
-        }
+    for claim in view.iter().filter(|c| accept(c)) {
+        let role = match claim.claim_type() {
+            Some(t) if t == root_type => Role::Root,
+            Some(t) if t == edit_type => Role::Edit,
+            Some(t) if t == comment_type => Role::Comment,
+            _ => continue,
+        };
+        roles.insert(claim.id, role);
+        nodes.insert(claim.id, claim.clone());
     }
 
     // Outgoing edges: only references that land on another node we kept —
@@ -153,7 +182,7 @@ pub fn fold(
             let out: Vec<ClaimHash> = claim
                 .refs
                 .iter()
-                .map(|(_, r)| r.hash)
+                .copied()
                 .filter(|h| nodes.contains_key(h))
                 .collect();
             (*id, out)
@@ -167,7 +196,7 @@ pub fn fold(
 }
 
 fn connected_components(
-    nodes: &HashMap<ClaimHash, StoredClaim>,
+    nodes: &HashMap<ClaimHash, ClaimView>,
     edges: &HashMap<ClaimHash, Vec<ClaimHash>>,
 ) -> Vec<BTreeSet<ClaimHash>> {
     let mut undirected: HashMap<ClaimHash, HashSet<ClaimHash>> = HashMap::new();
@@ -206,7 +235,7 @@ fn connected_components(
 }
 
 fn build_component(
-    nodes: &HashMap<ClaimHash, StoredClaim>,
+    nodes: &HashMap<ClaimHash, ClaimView>,
     roles: &HashMap<ClaimHash, Role>,
     edges: &HashMap<ClaimHash, Vec<ClaimHash>>,
     ids: BTreeSet<ClaimHash>,
@@ -230,7 +259,7 @@ fn build_component(
         .iter()
         .filter(|id| roles.get(*id) == Some(&Role::Root))
         .filter_map(|id| nodes.get(id))
-        .map(|c| c.header.log_id)
+        .map(|c| c.author)
         .collect();
 
     // field name -> every root/edit claim in this component that sets it
@@ -242,13 +271,10 @@ fn build_component(
         };
         match role {
             Role::Comment => continue,
-            Role::Edit if !root_authors.contains(&claim.header.log_id) => continue,
+            Role::Edit if !root_authors.contains(&claim.author) => continue,
             Role::Root | Role::Edit => {}
         }
-        let Some(Value::Map(map)) = &claim.body else {
-            continue; // tombstoned or bodiless: contributes to no field
-        };
-        for key in map.keys() {
+        for key in claim.body.keys() {
             if key == "at" || key == "of" || key == "type" {
                 continue; // metadata, not a field of the thing itself
             }
@@ -291,13 +317,10 @@ fn build_component(
         .filter(|id| roles.get(*id) == Some(&Role::Comment))
         .filter_map(|id| {
             let claim = nodes.get(id)?;
-            let Value::Map(map) = claim.body.as_ref()? else {
-                return None;
-            };
-            let fields = Fields::of(map);
+            let fields = Fields::of(&claim.body);
             Some(Comment {
                 claim: *id,
-                author: claim.header.log_id,
+                author: claim.author,
                 text: fields.text("text")?.to_string(),
                 at: fields.int("at").unwrap_or(claim.received_at),
             })
@@ -312,22 +335,18 @@ fn build_component(
     }
 }
 
-/// One claim's contribution to one named field, if it has a body and
-/// actually sets that field.
+/// One claim's contribution to one named field, if it actually sets it.
 fn contribution(
-    nodes: &HashMap<ClaimHash, StoredClaim>,
+    nodes: &HashMap<ClaimHash, ClaimView>,
     field: &str,
     id: ClaimHash,
 ) -> Option<FieldContribution> {
     let claim = nodes.get(&id)?;
-    let Value::Map(map) = claim.body.as_ref()? else {
-        return None;
-    };
-    let value = map.get(field)?.clone();
-    let at = Fields::of(map).int("at").unwrap_or(claim.received_at);
+    let value = claim.body.get(field)?.clone();
+    let at = Fields::of(&claim.body).int("at").unwrap_or(claim.received_at);
     Some(FieldContribution {
         claim: id,
-        author: claim.header.log_id,
+        author: claim.author,
         value,
         at,
     })

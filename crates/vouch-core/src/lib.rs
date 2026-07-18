@@ -54,6 +54,7 @@ pub mod cbor;
 pub mod claim;
 pub mod database;
 pub mod draft;
+pub mod e2ee;
 pub mod error;
 pub mod fold;
 pub mod keys;

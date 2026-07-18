@@ -18,9 +18,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::fold::ClaimView;
 use crate::keys::LogId;
-use crate::store::ClaimStore;
-use crate::value::{ClaimHash, Fields, Value};
+use crate::value::{ClaimHash, Fields};
 
 /// Longest name we'll surface, in characters. A name is display text, not
 /// a payload channel.
@@ -28,14 +28,16 @@ pub const MAX_NAME_LEN: usize = 40;
 
 /// The name each log currently suggests for itself: newest `profile`
 /// claim per log, sanitized. Logs with no (usable) profile claim are
-/// simply absent — callers fall back to the hash prefix.
-pub fn names(store: &ClaimStore) -> BTreeMap<LogId, String> {
+/// simply absent — callers fall back to the hash prefix. Profiles are
+/// plaintext by design (an advertised name's whole job is to be readable
+/// before trust exists), so this reads the same view as everything else.
+pub fn names(view: &[ClaimView]) -> BTreeMap<LogId, String> {
     let mut best: BTreeMap<LogId, (i64, ClaimHash, String)> = BTreeMap::new();
-    for claim in store.by_type("profile") {
-        let Some(Value::Map(map)) = &claim.body else {
+    for claim in view {
+        if claim.claim_type() != Some("profile") {
             continue;
-        };
-        let fields = Fields::of(map);
+        }
+        let fields = Fields::of(&claim.body);
         let Some(name) = fields.text("name").map(sanitize_name) else {
             continue;
         };
@@ -43,14 +45,12 @@ pub fn names(store: &ClaimStore) -> BTreeMap<LogId, String> {
             continue;
         }
         let at = fields.int("at").unwrap_or(claim.received_at);
-        let id = claim.signed.id();
-        let log = claim.header.log_id;
-        let newer = match best.get(&log) {
-            Some((best_at, best_id, _)) => (at, id) > (*best_at, *best_id),
+        let newer = match best.get(&claim.author) {
+            Some((best_at, best_id, _)) => (at, claim.id) > (*best_at, *best_id),
             None => true,
         };
         if newer {
-            best.insert(log, (at, id, name));
+            best.insert(claim.author, (at, claim.id, name));
         }
     }
     best.into_iter().map(|(log, (_, _, name))| (log, name)).collect()

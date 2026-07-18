@@ -6,12 +6,13 @@ use gpui_component::theme::ActiveTheme;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vouch_core::e2ee::{self, ContentKey};
 use vouch_core::{Draft, Peer};
 
 pub struct NewRecommendationModal;
 
 impl NewRecommendationModal {
-    pub fn open(peer: Peer, window: &mut Window, cx: &mut App) {
+    pub fn open(peer: Peer, key: ContentKey, window: &mut Window, cx: &mut App) {
         window.open_alert_dialog(cx, move |dialog, window, cx| {
             let subject_state = window.use_state(cx, |window, cx| {
                 InputState::new(window, cx).placeholder("What are you recommending?")
@@ -47,13 +48,17 @@ impl NewRecommendationModal {
 
                     // Fire-and-forget: the write lands asynchronously and
                     // the feed picks it up via the firehose, same as any
-                    // other peer's claims.
+                    // other peer's claims. Sealed always — there is no
+                    // plaintext authoring path.
                     cx.spawn(async move |_cx| {
                         let draft = Draft::new("rec")
                             .at(at_ms)
                             .text("subject", subject)
                             .text("body", content);
-                        let _ = peer.claim(draft).await;
+                        let Ok(sealed) = e2ee::seal_draft(&key, &draft) else {
+                            return;
+                        };
+                        let _ = peer.claim(sealed).await;
                     })
                     .detach();
 

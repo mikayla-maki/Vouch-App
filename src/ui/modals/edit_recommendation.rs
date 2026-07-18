@@ -7,6 +7,7 @@ use gpui_component::theme::ActiveTheme;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vouch_core::e2ee::{self, ContentKey};
 use vouch_core::{ClaimHash, ClaimRef, Draft, LogId, Peer, Recommendation, Value};
 
 /// Every claim this edit/comment must reference to causally dominate the
@@ -43,7 +44,13 @@ impl EditRecommendationModal {
     /// offering this when the local writer is the source author (an `edit`
     /// from anyone else is inert), matching the `is_own` gate in the detail
     /// panel.
-    pub fn open(peer: Peer, rec: Recommendation, window: &mut Window, cx: &mut App) {
+    pub fn open(
+        peer: Peer,
+        key: ContentKey,
+        rec: Recommendation,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         window.open_alert_dialog(cx, move |dialog, window, cx| {
             let subject_state = window.use_state(cx, {
                 let subject = rec.subject.clone();
@@ -93,13 +100,18 @@ impl EditRecommendationModal {
                     // via the firehose. Re-asserting both fields (even the
                     // unchanged one) is intentional — it collapses any live
                     // frontier on each back to this single contribution.
+                    // Sealed always; the reference to the original rides
+                    // inside the ciphertext.
                     cx.spawn(async move |_cx| {
                         let draft = Draft::new("edit")
                             .at(at_ms)
                             .field("of", of_value)
                             .text("subject", subject)
                             .text("body", content);
-                        let _ = peer.claim(draft).await;
+                        let Ok(sealed) = e2ee::seal_draft(&key, &draft) else {
+                            return;
+                        };
+                        let _ = peer.claim(sealed).await;
                     })
                     .detach();
 

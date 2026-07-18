@@ -79,6 +79,13 @@ impl Draft {
         self
     }
 
+    /// The body map this draft would sign — what
+    /// [`e2ee::seal_draft`](crate::e2ee::seal_draft) encrypts. Attachments
+    /// are not included (media doesn't ride the sealed path yet).
+    pub fn body_value(&self) -> Value {
+        Value::map(self.fields.clone())
+    }
+
     /// Media that belongs to this claim: stored as a content-addressed
     /// blob and pinned at `key` as a [`BlobRef`](crate::BlobRef) when the
     /// draft is composed.

@@ -38,9 +38,21 @@ const DEFAULT_MAILBOX_URL: &str = "wss://vouch-app.online";
 /// identity, a database, and cursors that live only for this process —
 /// for running throwaway instances side by side (demos, sync testing)
 /// without leaving files behind or colliding with a real install.
-fn build_peer() -> (Peer, PeerActor, Option<std::path::PathBuf>) {
+///
+/// Both paths return the crypto [`Identity`](vouch_core::e2ee::Identity)
+/// built from the same seed the writer signs with: all user content is
+/// sealed with it, always.
+fn build_peer() -> (
+    Peer,
+    PeerActor,
+    Option<std::path::PathBuf>,
+    vouch_core::e2ee::Identity,
+) {
     if env_flag("VOUCH_EPHEMERAL") {
-        let writer = Writer::generate().expect("generate an ephemeral identity");
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("OS randomness for an ephemeral identity");
+        let writer = Writer::from_seed(seed);
+        let identity = vouch_core::e2ee::Identity::from_seed(seed);
         let db = Database::new();
         let state: Box<dyn SyncState> = Box::new(MemorySyncState::new());
         let mut instance_bytes = [0u8; 16];
@@ -59,13 +71,13 @@ fn build_peer() -> (Peer, PeerActor, Option<std::path::PathBuf>) {
             ServePolicy::Owned,
             clock,
         );
-        (peer, actor, None)
+        (peer, actor, None, identity)
     } else {
         let dir = identity::app_dir();
-        let writer = identity::load_or_create_writer(&dir);
+        let (writer, identity) = identity::load_or_create(&dir);
         let (peer, actor) = vouch_store::open_peer(&dir, Some(writer), ServePolicy::Owned)
             .expect("open local database");
-        (peer, actor, Some(dir))
+        (peer, actor, Some(dir), identity)
     }
 }
 
@@ -94,7 +106,7 @@ fn load_vouch_theme(cx: &mut App) {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let (peer, actor, data_dir) = build_peer();
+    let (peer, actor, data_dir, crypto_identity) = build_peer();
     // Self-update only makes sense for real installs; the module also
     // no-ops for dev builds and non-.app binaries on its own.
     if data_dir.is_some() {
@@ -137,6 +149,7 @@ fn main() {
             })
             .collect();
         let bootstrap = app::Bootstrap {
+            identity: crypto_identity.clone(),
             mailbox_url,
             follows_path: data_dir.as_ref().map(|d| d.join("follows.json")),
             env_follows,

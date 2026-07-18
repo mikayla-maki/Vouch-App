@@ -11,9 +11,11 @@ use std::collections::BTreeMap;
 
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, WeakEntity};
-use vouch_core::{LogId, Peer, Recommendation, StoredClaim};
+use vouch_core::e2ee::{self, Identity};
+use vouch_core::fold::ClaimView;
+use vouch_core::{LogId, Peer, Recommendation};
 
-fn accept_all(_: &StoredClaim) -> bool {
+fn accept_all(_: &ClaimView) -> bool {
     true
 }
 
@@ -21,21 +23,22 @@ pub struct Feed {
     peer: Peer,
     recs: Vec<Recommendation>,
     /// Advertised display names, from each log's newest `profile` claim —
-    /// refreshed on the same firehose events as the recs.
+    /// refreshed on the same firehose events as the recs. Sealed like all
+    /// speech: only logs we hold a key for resolve.
     names: BTreeMap<LogId, String>,
 }
 
 impl Feed {
-    pub fn new(peer: Peer, cx: &mut Context<Self>) -> Self {
+    pub fn new(peer: Peer, identity: Identity, cx: &mut Context<Self>) -> Self {
         cx.spawn({
             let peer = peer.clone();
             async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                Self::reload(&peer, &this, cx).await;
+                Self::reload(&peer, &identity, &this, cx).await;
                 let Ok(mut rx) = peer.firehose().await else {
                     return;
                 };
                 while rx.next().await.is_some() {
-                    Self::reload(&peer, &this, cx).await;
+                    Self::reload(&peer, &identity, &this, cx).await;
                 }
             }
         })
@@ -48,12 +51,18 @@ impl Feed {
         }
     }
 
-    async fn reload(peer: &Peer, this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+    async fn reload(peer: &Peer, identity: &Identity, this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        let identity = identity.clone();
         let Ok((mut recs, names)) = peer
-            .query(|db| {
+            .query(move |db| {
+                // Everything legible to this identity, decrypted once and
+                // shared by both projections: our own key (derived) plus
+                // every grant we can open.
+                let keys = e2ee::collect_keys(db.claims(), &identity);
+                let view = e2ee::decrypted_view(db.claims(), &keys);
                 (
-                    vouch_core::rec::recommendations(db.claims(), &accept_all),
-                    vouch_core::profile::names(db.claims()),
+                    vouch_core::rec::recommendations(&view, &accept_all),
+                    vouch_core::profile::names(&view),
                 )
             })
             .await
@@ -100,6 +109,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use vouch_core::{ClaimRef, Draft, ServePolicy, Value, Writer};
 
+    fn identity_of(seed: u8) -> Identity {
+        Identity::from_seed([seed; 32])
+    }
+
+    /// Seal `draft` the way every real authoring path does.
+    fn sealed(seed: u8, draft: Draft) -> Draft {
+        e2ee::seal_draft(&identity_of(seed).content_key(), &draft).unwrap()
+    }
+
     fn temp_dir() -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -123,16 +141,17 @@ mod tests {
         let (peer, actor, dir) = open_test_peer(7);
         cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
 
-        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        let feed = cx.new(|cx| Feed::new(peer.clone(), identity_of(7), cx));
         cx.run_until_parked();
         feed.read_with(cx, |feed, _| assert!(feed.recs().is_empty()));
 
-        peer.claim(
+        peer.claim(sealed(
+            7,
             Draft::new("rec")
                 .at(1)
                 .text("subject", "Joe's Pizza")
                 .text("body", "Great!"),
-        )
+        ))
         .await
         .unwrap();
         cx.run_until_parked();
@@ -155,13 +174,13 @@ mod tests {
         let (peer, actor, dir) = open_test_peer(9);
         cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
 
-        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        let feed = cx.new(|cx| Feed::new(peer.clone(), identity_of(9), cx));
         cx.run_until_parked();
 
-        peer.claim(Draft::new("profile").text("name", "Me"))
+        peer.claim(sealed(9, Draft::new("profile").text("name", "Me")))
             .await
             .unwrap();
-        peer.claim(Draft::new("rec").text("subject", "No body"))
+        peer.claim(sealed(9, Draft::new("rec").text("subject", "No body")))
             .await
             .unwrap();
         cx.run_until_parked();
@@ -178,11 +197,11 @@ mod tests {
         let (peer, actor, dir) = open_test_peer(15);
         cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
 
-        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        let feed = cx.new(|cx| Feed::new(peer.clone(), identity_of(15), cx));
         cx.run_until_parked();
         feed.read_with(cx, |feed, _| assert!(feed.names().is_empty()));
 
-        peer.claim(Draft::new("profile").at(1).text("name", "Maya"))
+        peer.claim(sealed(15, Draft::new("profile").at(1).text("name", "Maya")))
             .await
             .unwrap();
         cx.run_until_parked();
@@ -202,23 +221,25 @@ mod tests {
         let (peer, actor, dir) = open_test_peer(11);
         cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
 
-        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        let feed = cx.new(|cx| Feed::new(peer.clone(), identity_of(11), cx));
         cx.run_until_parked();
 
-        peer.claim(
+        peer.claim(sealed(
+            11,
             Draft::new("rec")
                 .at(100)
                 .text("subject", "Older")
                 .text("body", "..."),
-        )
+        ))
         .await
         .unwrap();
-        peer.claim(
+        peer.claim(sealed(
+            11,
             Draft::new("rec")
                 .at(200)
                 .text("subject", "Newer")
                 .text("body", "..."),
-        )
+        ))
         .await
         .unwrap();
         cx.run_until_parked();
@@ -243,17 +264,18 @@ mod tests {
         let (peer, actor, dir) = open_test_peer(13);
         cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
 
-        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        let feed = cx.new(|cx| Feed::new(peer.clone(), identity_of(13), cx));
         cx.run_until_parked();
 
         let author = peer.id().unwrap();
         let rec = peer
-            .claim(
+            .claim(sealed(
+                13,
                 Draft::new("rec")
                     .at(1)
                     .text("subject", "Joe's Pizza")
                     .text("body", "Great!"),
-            )
+            ))
             .await
             .unwrap();
         cx.run_until_parked();
@@ -271,13 +293,14 @@ mod tests {
             log_id: author,
             hash: rec.id(),
         })]);
-        peer.claim(
+        peer.claim(sealed(
+            13,
             Draft::new("edit")
                 .at(2)
                 .field("of", of)
                 .text("subject", "Joe's Pizzeria")
                 .text("body", "Still great, now with garlic knots"),
-        )
+        ))
         .await
         .unwrap();
         cx.run_until_parked();
@@ -294,10 +317,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The comment path: a *different* writer comments on someone else's
-    /// rec (comments are open to any author), it syncs across, and it lands
-    /// in `comments` without touching `fields` — the source author's
-    /// subject/body are unchanged.
+    /// The comment path under E2EE, end to end: a *different* writer
+    /// comments on someone else's rec, sealed with HIS key — so alice can
+    /// only read it because bob also granted her. Grant, comment, and rec
+    /// all sync over a real pipe; the comment lands in `comments` without
+    /// touching `fields`.
     #[gpui::test]
     async fn a_comment_from_another_writer_lands_without_touching_fields(cx: &mut TestAppContext) {
         let (alice, alice_actor, alice_dir) = open_test_peer(21);
@@ -317,32 +341,39 @@ mod tests {
         let _on_bob = bob.connect("alice", b_end).await.unwrap();
         alice.follow(bob_log, on_alice).await.unwrap();
 
-        let feed = cx.new(|cx| Feed::new(alice.clone(), cx));
+        let feed = cx.new(|cx| Feed::new(alice.clone(), identity_of(21), cx));
         cx.run_until_parked();
 
-        // Alice posts a rec.
+        // Alice posts a sealed rec.
         let rec = alice
-            .claim(
+            .claim(sealed(
+                21,
                 Draft::new("rec")
                     .at(1)
                     .text("subject", "Taco Truck")
                     .text("body", "The al pastor is unreal"),
-            )
+            ))
             .await
             .unwrap();
         cx.run_until_parked();
 
-        // Bob comments on Alice's rec, referencing it by hash + her log_id.
+        // Bob grants alice (so his sealed speech is legible to her), then
+        // comments on her rec — reference riding inside his ciphertext.
+        let grant = identity_of(22).grant_for(alice_log).unwrap();
+        bob.claim(Draft::new(e2ee::GRANT_TYPE).field("sealed", Value::Bytes(grant)))
+            .await
+            .unwrap();
         let of = Value::Array(vec![Value::ClaimRef(ClaimRef {
             log_id: alice_log,
             hash: rec.id(),
         })]);
-        bob.claim(
+        bob.claim(sealed(
+            22,
             Draft::new("comment")
                 .at(2)
                 .field("of", of)
                 .text("text", "Agreed, best in town!"),
-        )
+        ))
         .await
         .unwrap();
         cx.run_until_parked();

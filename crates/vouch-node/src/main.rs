@@ -22,24 +22,27 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use vouch_core::e2ee::{self, Identity};
 use vouch_core::{Draft, ServePolicy, Writer};
 
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-fn load_or_create_writer(dir: &Path) -> Writer {
+fn load_or_create(dir: &Path) -> (Writer, Identity) {
     let key_path = dir.join("identity.key");
-    if let Ok(bytes) = std::fs::read(&key_path)
+    let seed = if let Ok(bytes) = std::fs::read(&key_path)
         && let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice())
     {
-        return Writer::from_seed(seed);
-    }
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).expect("OS randomness for a new identity");
-    std::fs::create_dir_all(dir).expect("create data directory");
-    std::fs::write(&key_path, seed).expect("persist device identity");
-    Writer::from_seed(seed)
+        seed
+    } else {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("OS randomness for a new identity");
+        std::fs::create_dir_all(dir).expect("create data directory");
+        std::fs::write(&key_path, seed).expect("persist device identity");
+        seed
+    };
+    (Writer::from_seed(seed), Identity::from_seed(seed))
 }
 
 fn now_ms() -> i64 {
@@ -56,7 +59,7 @@ fn main() {
     let seed_claim = env_var("VOUCH_SEED_CLAIM");
 
     let dir = Path::new(&dir);
-    let writer = load_or_create_writer(dir);
+    let (writer, identity) = load_or_create(dir);
     let (peer, actor) =
         vouch_store::open_peer(dir, Some(writer), ServePolicy::Owned).expect("open local database");
     let my_log = peer.id().expect("this node always holds a writer");
@@ -81,10 +84,12 @@ fn main() {
 
     if let Some(text) = seed_claim {
         std::thread::sleep(Duration::from_millis(500));
+        // Sealed like all speech — there is no plaintext content path.
         let draft = Draft::new("rec")
             .at(now_ms())
             .text("subject", text.clone())
             .text("body", format!("seeded by {name}"));
+        let draft = e2ee::seal_draft(&identity.content_key(), &draft).expect("seal seed claim");
         match futures::executor::block_on(peer.claim(draft)) {
             Ok(_) => println!("[{name}] claimed: {text}"),
             Err(e) => eprintln!("[{name}] failed to claim: {e}"),
