@@ -608,21 +608,25 @@ fn gc_claims_older_than_reaches_through_the_actor() {
     let (relay, actor) = make_peer(None, 1, ServePolicy::Everything);
     spawner.spawn(actor.run()).unwrap();
 
-    let alice_log = pool.run_until(async {
+    // `alice` must outlive the drive-to-quiescence below: dropping the
+    // handle closes the actor's command channel, and the actor may then
+    // exit before finishing its publish session to the relay.
+    let (alice, alice_log) = pool.run_until(async {
         let (alice, alice_actor) = make_peer(Some(1), 2, ServePolicy::Owned);
         spawner.spawn(alice_actor.run()).unwrap();
         let alice_log = alice.id().unwrap();
         let (alice_end, relay_end) = pipe(256);
-        let on_relay = relay.connect("alice", relay_end).await.unwrap();
-        alice.connect("relay", alice_end).await.unwrap();
-        alice.follow(alice_log, on_relay).await.unwrap();
+        relay.connect("alice", relay_end).await.unwrap();
+        let on_alice = alice.connect("relay", alice_end).await.unwrap();
+        alice.follow(alice_log, on_alice).await.unwrap();
         alice
             .claim(Draft::new("rec").at(1).text("subject", "old"))
             .await
             .unwrap();
-        alice_log
+        (alice, alice_log)
     });
     pool.run_until_stalled();
+    drop(alice);
 
     let count = pool
         .run_until(relay.query(move |db| db.claims().log_len(&alice_log)))

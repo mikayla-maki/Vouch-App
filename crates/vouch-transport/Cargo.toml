@@ -9,4 +9,6 @@ vouch-core = { path = "../vouch-core", features = ["wire"] }
 futures = "0.3"
 bincode = "1"
 tokio = { version = "1", features = ["rt", "net", "time"] }
-tokio-tungstenite = "0.24"
+# rustls so clients can dial wss:// (the hosted relay sits behind TLS);
+# webpki roots keep it portable — no OpenSSL, no system cert store.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

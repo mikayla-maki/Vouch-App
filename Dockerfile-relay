@@ -1,0 +1,25 @@
+# vouch-relay-server, two-stage (the Zed Dockerfile-collab pattern, scaled
+# way down): compile in a full rust image, ship a slim runtime.
+#
+# The workspace root package is the GPUI desktop app, whose git
+# dependencies include the entire zed repo — none of which a relay needs.
+# So instead of copying the real root manifest, this synthesizes a
+# server-only workspace over crates/ and builds just the relay from it.
+# The checked-in Cargo.lock still pins every version (cargo ignores lock
+# entries for packages outside the graph).
+
+FROM rust:1.95-bookworm AS builder
+WORKDIR /build
+COPY Cargo.lock ./
+COPY crates ./crates
+RUN printf '[workspace]\nresolver = "3"\nmembers = ["crates/vouch-core", "crates/vouch-store", "crates/vouch-relay", "crates/vouch-node", "crates/vouch-transport", "crates/vouch-relay-server"]\n' > Cargo.toml
+RUN cargo build --release -p vouch-relay-server
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/vouch-relay-server /app/vouch-relay-server
+ENV VOUCH_RELAY_BIND=0.0.0.0:9443
+ENV VOUCH_RELAY_DATA_DIR=/data
+VOLUME /data
+EXPOSE 9443
+ENTRYPOINT ["/app/vouch-relay-server"]

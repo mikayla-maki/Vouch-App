@@ -1,0 +1,26 @@
+# The whole production topology: the relay, and Caddy in front of it
+# terminating TLS. Caddy fetches and renews Let's Encrypt certs on its own
+# — the only configuration is the domain, from .env (VOUCH_RELAY_DOMAIN).
+#
+# Disk layout on the host, all under this directory:
+#   ./data   — the relay's mailboxes (one subdir of SQLite files per LogId)
+#   ./caddy  — Caddy's certs and ACME state (losing it just re-issues)
+
+services:
+  relay:
+    image: vouch-relay-server
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - VOUCH_RELAY_DOMAIN=${VOUCH_RELAY_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy:/data

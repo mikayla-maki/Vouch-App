@@ -1,0 +1,6 @@
+# TLS termination for the relay: clients speak wss://<domain>, Caddy
+# proxies plain ws to the relay container. WebSocket upgrade is handled
+# automatically; certificates come from Let's Encrypt, also automatically.
+{$VOUCH_RELAY_DOMAIN}
+
+reverse_proxy relay:9443

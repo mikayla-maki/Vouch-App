@@ -1,0 +1,8 @@
+target
+.git
+docs
+assets
+themes
+src
+scripts
+deploy
