@@ -1,0 +1,10 @@
+[package]
+name = "vouch-transport"
+version = "0.1.0"
+edition = "2024"
+description = "A socket transport for vouch-core's Peer: bridges a PipeEnd to a TCP connection, through a relay or direct."
+
+[dependencies]
+vouch-core = { path = "../vouch-core", features = ["wire"] }
+futures = "0.3"
+bincode = "1"

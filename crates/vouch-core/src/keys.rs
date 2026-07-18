@@ -10,6 +10,7 @@ use crate::error::Error;
 /// You subscribe to logs; merging your subscribed logs gives you your
 /// [`Database`](crate::Database).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct LogId(pub [u8; 32]);
 
 impl LogId {

@@ -136,6 +136,7 @@ pub struct Claim {
 /// A claim as transmitted and stored: canonical header bytes, the signature
 /// over them, and (unless tombstoned) the canonical body bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct SignedEvent {
     pub header_bytes: Vec<u8>,
     pub signature: Signature,

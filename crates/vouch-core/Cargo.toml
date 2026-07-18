@@ -11,3 +11,10 @@ ed25519-dalek = "2"
 getrandom = "0.3"
 thiserror = "2"
 futures = "0.3"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# Wire (de)serialization of the sync protocol types, for transports outside
+# this crate (a socket, a relay). Off by default: this crate stays no-I/O,
+# and callers who never leave one process never pay for it.
+wire = ["dep:serde", "ed25519-dalek/serde"]

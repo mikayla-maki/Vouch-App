@@ -1,0 +1,9 @@
+[package]
+name = "vouch-relay"
+version = "0.1.0"
+edition = "2024"
+description = "A dumb TCP relay: pairs connections and pipes bytes. No protocol knowledge."
+
+[[bin]]
+name = "vouch-relay"
+path = "src/main.rs"

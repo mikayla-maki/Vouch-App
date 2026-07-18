@@ -28,6 +28,7 @@ use crate::{BlobHash, ClaimHash, LogId, SignedEvent};
 /// cursors; the fingerprint exchange remains the *detection* for peers
 /// that get it wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct InstanceId(pub [u8; 16]);
 
 /// How many events a session asks for per `Since` or sends per `Publish` /
@@ -45,6 +46,7 @@ pub const MAX_SERVE_BATCH: u64 = 1024;
 /// lets a session die at any message boundary and a fresh one finish the
 /// job.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub enum Request {
     /// "Where do you stand on this log?" → count, fingerprint, instance.
     /// Opens every per-log exchange and settles it afterward.
@@ -86,6 +88,7 @@ pub enum Request {
 /// The answers. A response carries no question context — the session knows
 /// what it asked.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub enum Response {
     /// Answer to [`Request::Status`].
     Status {
@@ -134,6 +137,7 @@ pub enum Response {
 /// that lets an idle subscriber confirm it is still settled (or discover
 /// it isn't) without sending anything.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct Notify {
     pub log: LogId,
     /// The newly landed events, in the sender's arrival order. Bodies

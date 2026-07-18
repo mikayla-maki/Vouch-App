@@ -1,0 +1,16 @@
+[package]
+name = "vouch-node"
+version = "0.1.0"
+edition = "2024"
+description = "Headless Peer process for exercising sync over a real transport."
+
+[[bin]]
+name = "vouch-node"
+path = "src/main.rs"
+
+[dependencies]
+vouch-core = { path = "../vouch-core", features = ["wire"] }
+vouch-store = { path = "../vouch-store" }
+vouch-transport = { path = "../vouch-transport" }
+futures = "0.3"
+getrandom = "0.3"

@@ -90,6 +90,7 @@ pub struct PipeId(pub u64);
 /// Transports serialize these however they like; the actor never sees
 /// bytes.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub enum PipeMsg {
     /// A protocol request, correlation-tagged (both sides may have
     /// requests in flight on one duct).
