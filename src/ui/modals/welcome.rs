@@ -15,17 +15,17 @@ use gpui_component::theme::ActiveTheme;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vouch_core::e2ee::{self, ContentKey};
+use vouch_core::e2ee::{self, Identity};
 use vouch_core::{Draft, Peer, profile};
 
 pub struct WelcomeModal;
 
 impl WelcomeModal {
-    pub fn open(peer: Peer, key: ContentKey, window: &mut Window, cx: &mut App) {
-        let address = peer
-            .id()
-            .map(|log| log.to_string())
-            .unwrap_or_else(|| "(no writer)".to_string());
+    pub fn open(peer: Peer, identity: Identity, window: &mut Window, cx: &mut App) {
+        // The full capability address: LogId + content key in one string.
+        // Handing it over is what lets a friend follow AND read you.
+        let address = identity.address().to_string();
+        let key = identity.content_key();
 
         window.open_alert_dialog(cx, move |dialog, window, cx| {
             let name_state = window.use_state(cx, |window, cx| {
@@ -126,7 +126,10 @@ impl RenderOnce for WelcomeForm {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("Send this to friends so they can follow you."),
+                            .child(
+                                "Send this to friends so they can follow you — anyone \
+                                 holding it can read what you post.",
+                            ),
                     )
                     .child(
                         div()
@@ -146,7 +149,12 @@ impl RenderOnce for WelcomeForm {
                                     .font_family("monospace")
                                     .text_xs()
                                     .text_color(theme.foreground)
-                                    .child(self.address.clone()),
+                                    // Too long to show whole — the Copy
+                                    // button carries the real thing.
+                                    .child(format!(
+                                        "{}…",
+                                        &self.address[..30.min(self.address.len())]
+                                    )),
                             )
                             .child(
                                 div()

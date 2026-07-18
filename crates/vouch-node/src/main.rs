@@ -14,7 +14,9 @@
 //! Env vars:
 //! - `VOUCH_DATA_DIR` (required): where this node's identity + claims.db live.
 //! - `VOUCH_MAILBOX_URL` (required): relay server to publish through.
-//! - `VOUCH_FOLLOW` (optional): comma-separated hex LogIds to follow.
+//! - `VOUCH_FOLLOW` (optional): comma-separated entries to follow — full
+//!   `vouch:` addresses or bare 64-hex LogIds (this harness only counts
+//!   claims, it never decrypts, so routing alone is enough).
 //! - `VOUCH_NAME` (optional): a label for this node's own log lines.
 //! - `VOUCH_SEED_CLAIM` (optional): if set, mint one `rec` claim with this
 //!   text shortly after startup, so there's something to observe syncing.
@@ -64,6 +66,7 @@ fn main() {
         vouch_store::open_peer(dir, Some(writer), ServePolicy::Owned).expect("open local database");
     let my_log = peer.id().expect("this node always holds a writer");
     println!("[{name}] my log id: {my_log}");
+    println!("[{name}] my address: {}", identity.address());
 
     std::thread::spawn(move || futures::executor::block_on(actor.run()));
 
@@ -71,12 +74,14 @@ fn main() {
     vouch_transport::connect_mailbox(&peer, &url, my_log);
 
     let mut watched: Vec<vouch_core::LogId> = Vec::new();
-    for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
-        if hex.trim().is_empty() {
+    for entry in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
+        if entry.trim().is_empty() {
             continue;
         }
-        let log = vouch_transport::parse_log_id(hex)
-            .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"));
+        let log = e2ee::Address::parse(entry)
+            .map(|a| a.log)
+            .or_else(|| vouch_transport::parse_log_id(entry))
+            .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not an address or LogId: {entry}"));
         println!("[{name}] following {log} via its mailbox");
         vouch_transport::connect_mailbox(&peer, &url, log);
         watched.push(log);

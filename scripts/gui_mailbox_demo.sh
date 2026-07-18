@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Two real Vouch windows through the mailbox relay server — the hosted
 # shape, run locally. Alice publishes to her mailbox; Bob follows her
-# address (grabbed from her startup log). Author a rec in Alice's window
-# and it lands in Bob's via the relay. Deliberately one-way: follows are
-# non-reciprocal in Vouch, and this shows exactly that — nothing Bob
-# writes reaches Alice unless she follows him back.
+# capability address (grabbed from her startup log) — the address carries
+# her read key, so following IS reading. Author a rec in Alice's window
+# and it lands, decrypted, in Bob's via the relay. Still one-way where it
+# matters: nothing Bob writes reaches Alice unless she pastes HIS address,
+# and the relay only ever sees ciphertext plus the routing half.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

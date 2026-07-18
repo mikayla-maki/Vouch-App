@@ -22,7 +22,7 @@ pub struct Bootstrap {
     pub identity: vouch_core::e2ee::Identity,
     pub mailbox_url: Option<String>,
     pub follows_path: Option<PathBuf>,
-    pub env_follows: Vec<LogId>,
+    pub env_follows: Vec<vouch_core::e2ee::Address>,
 }
 
 pub struct VouchApp {
@@ -41,7 +41,18 @@ impl VouchApp {
     pub fn new(peer: Peer, bootstrap: Bootstrap, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let local_log_id = peer.id();
         let identity = bootstrap.identity.clone();
-        let feed = cx.new(|cx| Feed::new(peer.clone(), identity.clone(), cx));
+
+        // Follows before feed: the followed addresses are the feed's
+        // keyring, so the feed observes them.
+        let follows = cx.new(|_| {
+            Follows::new(
+                peer.clone(),
+                bootstrap.mailbox_url.clone(),
+                bootstrap.follows_path.clone(),
+                bootstrap.env_follows.clone(),
+            )
+        });
+        let feed = cx.new(|cx| Feed::new(peer.clone(), identity.clone(), follows.clone(), cx));
 
         let feed_panel =
             cx.new(|cx| FeedPanel::new(feed.clone(), identity.content_key(), window, cx));
@@ -50,16 +61,6 @@ impl VouchApp {
         // peer, listing every claim of any type (see `DebugFeed`).
         let debug = cx.new(|cx| DebugFeed::new(peer.clone(), cx));
         let debug_panel = cx.new(|cx| DebugPanel::new(debug, cx));
-
-        let follows = cx.new(|_| {
-            Follows::new(
-                peer.clone(),
-                identity.clone(),
-                bootstrap.mailbox_url.clone(),
-                bootstrap.follows_path.clone(),
-                bootstrap.env_follows.clone(),
-            )
-        });
 
         // FeedPanel owns the selection, but VouchApp reads it in render to
         // drive the detail panel, so re-render whenever the feed notifies.
@@ -82,16 +83,17 @@ impl VouchApp {
                 let check_identity = identity.clone();
                 let has_profile = peer
                     .query(move |db| {
-                        let keys = vouch_core::e2ee::collect_keys(db.claims(), &check_identity);
+                        // Only our own key matters here — the question is
+                        // whether WE have named ourselves.
+                        let keys = vouch_core::e2ee::keys_for(&check_identity, &[]);
                         let view = vouch_core::e2ee::decrypted_view(db.claims(), &keys);
                         vouch_core::profile::names(&view).contains_key(&me)
                     })
                     .await
                     .unwrap_or(true);
                 if !has_profile {
-                    let key = identity.content_key();
                     let _ = window_handle.update(cx, |_, window, cx| {
-                        WelcomeModal::open(peer.clone(), key, window, cx);
+                        WelcomeModal::open(peer.clone(), identity.clone(), window, cx);
                     });
                 }
             }
@@ -137,14 +139,18 @@ impl Render for VouchApp {
                 .cloned()
         });
         let names = self.feed.read(cx).names().clone();
-        let own_address = self.local_log_id.map(|l| l.to_string());
+        // The full capability address (log + read key) — the string a
+        // friend pastes to follow AND read you.
+        let own_address = self
+            .local_log_id
+            .map(|_| self.identity.address().to_string());
         let own_name = self.local_log_id.and_then(|l| names.get(&l).cloned());
         let followed: Vec<(LogId, Option<String>)> = self
             .follows
             .read(cx)
             .list()
             .iter()
-            .map(|log| (*log, names.get(log).cloned()))
+            .map(|address| (address.log, names.get(&address.log).cloned()))
             .collect();
         let follows_entity = self.follows.clone();
         let theme = cx.theme();

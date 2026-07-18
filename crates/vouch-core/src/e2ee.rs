@@ -1,5 +1,6 @@
 //! Per-log end-to-end encryption: bodies sealed to a log's content key,
-//! the key conveyed to chosen readers by grant claims.
+//! the key conveyed by the [`Address`] itself — sharing your address IS
+//! the grant.
 //!
 //! Everything here is *vocabulary*, not wire format. An encrypted claim
 //! is an ordinary signed claim whose body is the tiny envelope map
@@ -10,30 +11,33 @@
 //! there is deliberately no per-claim visibility state.
 //!
 //! There is no plaintext user content, full stop — profiles and names
-//! included (your name resolves for people you've granted, and nobody
-//! else). The only cleartext vocabulary on the wire is what the engine
-//! itself must read before any key exists: the `grant` wrapper (its
-//! payload is sealed-box ciphertext; the wrapper must be visible or
-//! nobody could ever bootstrap) and `redact` (a relay must honor
+//! included (your name resolves for people holding your address, and
+//! nobody else). The only cleartext vocabulary on the wire is what the
+//! engine must read before any key exists: `redact` (a relay must honor
 //! tombstones it cannot decrypt).
 //!
 //! - **Content key**: derived from the log's signing seed
 //!   (HKDF-SHA256), so every device holding the seed holds the key with
 //!   nothing stored or synced. Rotation is a later, additive concern
 //!   (the reserved `KeyRotation` claim) — which also means revoking a
-//!   reader is deferred: un-granting someone does not un-grant them.
-//! - **Grants**: the content key sealed to a reader's LogId (their
-//!   Ed25519 key converted to X25519, ephemeral-DH sealed-box),
-//!   published as a `{type: "grant", sealed: ...}` claim in the
-//!   granter's own log. Grants name no recipient — readers trial-open
-//!   every grant in logs they follow, so a log's audience list never
-//!   leaks. Sealing is deterministic per (seed, recipient, key), so
-//!   re-granting produces a byte-identical claim that content-address
-//!   dedupes to nothing.
+//!   reader is deferred: an address, once shared, stays legible.
+//! - **Addresses are capabilities**: the pasteable string carries both
+//!   halves — the LogId (routing: which mailbox to follow; the only
+//!   half a relay ever sees) and the content key (reading). Follow ⇒
+//!   read, in one paste, with no round trip back to the author. The
+//!   key half never touches the wire: it lives in the paste and in the
+//!   follower's local state. One-way-ness is preserved where it
+//!   matters — the author learns nothing when someone follows.
+//! - **Sealed-box grants** ([`Identity::grant_for`]): the primitive for
+//!   conveying a content key *in-band* to a specific recipient key.
+//!   Not used by follows (the address does that job out of band); kept
+//!   as the building block device delegation and key rotation will
+//!   ride on.
 //! - **No forward secrecy, on purpose**: recommendations are durable
 //!   speech; a ratchet's lost-phone-lost-history trade is wrong here.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -50,11 +54,59 @@ use crate::value::Value;
 
 /// The vocabulary type of an encrypted-body envelope.
 pub const ENC_TYPE: &str = "enc";
-/// The vocabulary type of a key grant.
-pub const GRANT_TYPE: &str = "grant";
 
 /// A log's symmetric content key.
 pub type ContentKey = [u8; 32];
+
+/// A shareable address: the LogId to follow plus the content key to
+/// read what you find there. The string form (`vouch:` + 128 hex) is
+/// the thing you text a friend — handing it over is the grant, so
+/// following someone implies reading them. Share it where you'd share
+/// the speech it unlocks: a log posted publicly is a public log, by
+/// choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Address {
+    pub log: LogId,
+    pub key: ContentKey,
+}
+
+impl Address {
+    /// Parse the string form: an optional `vouch:` prefix, then the
+    /// LogId and content key as 128 hex characters. `None` for
+    /// anything else — including a bare 64-hex LogId, which routes but
+    /// cannot read and so is not an address.
+    pub fn parse(text: &str) -> Option<Address> {
+        let hex = text.trim();
+        let hex = hex.strip_prefix("vouch:").unwrap_or(hex);
+        if hex.len() != 128 {
+            return None;
+        }
+        let mut bytes = [0u8; 64];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(Address {
+            log: LogId(bytes[..32].try_into().expect("split of 64 bytes")),
+            key: bytes[32..].try_into().expect("split of 64 bytes"),
+        })
+    }
+}
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vouch:{}", self.log)?;
+        for b in &self.key {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Address({})", self.log.short())
+    }
+}
 
 fn hkdf(ikm: &[u8], info_parts: &[&[u8]]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, ikm);
@@ -93,6 +145,16 @@ impl Identity {
         hkdf(&self.seed, &[b"vouch content key v1"])
     }
 
+    /// The address you hand to friends: LogId + content key in one
+    /// string. Publishing the key half reveals nothing about the
+    /// signing seed (HKDF is one-way) — read ≠ write.
+    pub fn address(&self) -> Address {
+        Address {
+            log: self.log_id(),
+            key: self.content_key(),
+        }
+    }
+
     /// Seal this log's content key to a reader. Deterministic per
     /// (seed, recipient, key): the ephemeral secret is derived rather
     /// than random, so re-granting yields identical bytes (and a later
@@ -128,8 +190,8 @@ impl Identity {
     }
 
     /// Try to open a sealed grant addressed to this identity. `None`
-    /// means "not for me" — the normal case while trial-decrypting a
-    /// followed log's grants.
+    /// means "not for me" — the normal case while trial-decrypting,
+    /// since grants name no recipient.
     pub fn open_grant(&self, sealed: &[u8]) -> Option<ContentKey> {
         if sealed.len() < 32 {
             return None;
@@ -187,31 +249,22 @@ pub fn seal_draft(key: &ContentKey, draft: &Draft) -> Result<Draft, crate::Error
     Ok(out)
 }
 
-/// Every content key this identity can currently use: its own (derived)
-/// plus one per grant it can open, trial-decrypting every `grant` claim
-/// in the store. Grants name no recipient, so "not for me" is the
-/// silent, normal case.
-pub fn collect_keys(store: &ClaimStore, identity: &Identity) -> BTreeMap<LogId, ContentKey> {
+/// Every content key a reader can currently use: their own (derived)
+/// plus one per followed address. This is what an app builds from its
+/// follows list and passes to [`decrypted_view`].
+pub fn keys_for(identity: &Identity, follows: &[Address]) -> BTreeMap<LogId, ContentKey> {
     let mut keys = BTreeMap::new();
     keys.insert(identity.log_id(), identity.content_key());
-    for claim in store.by_type(GRANT_TYPE) {
-        let Some(Value::Map(map)) = &claim.body else {
-            continue;
-        };
-        let Some(Value::Bytes(sealed)) = map.get("sealed") else {
-            continue;
-        };
-        if let Some(key) = identity.open_grant(sealed) {
-            keys.entry(claim.header.log_id).or_insert(key);
-        }
+    for address in follows {
+        keys.entry(address.log).or_insert(address.key);
     }
     keys
 }
 
-/// The fold's input: exactly the envelopes this identity can open, and
+/// The fold's input: exactly the envelopes these keys open, and
 /// nothing else. There is no plaintext-content concept — user speech is
 /// always sealed on the wire, so an unencrypted claim is either engine
-/// vocabulary (`grant`, `redact` — read by the machinery, not the fold)
+/// vocabulary (`redact` — read by the machinery, not the fold)
 /// or noise, and neither belongs in the view. Ciphertext you lack the
 /// key for is likewise absent: not part of your perceptible truth.
 /// References are recomputed from the decrypted plaintext — a sealed
@@ -292,6 +345,25 @@ mod tests {
         // Deterministic: re-granting is byte-identical, so the resulting
         // claim content-address dedupes instead of accumulating.
         assert_eq!(alice.grant_for(bob.log_id()).unwrap(), sealed);
+    }
+
+    #[test]
+    fn addresses_roundtrip_and_reject_malformed_input() {
+        let alice = Identity::from_seed([1; 32]);
+        let address = alice.address();
+        let text = address.to_string();
+        assert!(text.starts_with("vouch:"));
+        assert_eq!(text.len(), "vouch:".len() + 128);
+
+        assert_eq!(Address::parse(&text), Some(address));
+        // Prefix optional, surrounding whitespace tolerated — the paste
+        // survives a text message.
+        assert_eq!(Address::parse(&format!("  {}  ", &text["vouch:".len()..])), Some(address));
+
+        // A bare LogId routes but cannot read: not an address.
+        assert_eq!(Address::parse(&alice.log_id().to_string()), None);
+        assert_eq!(Address::parse(""), None);
+        assert_eq!(Address::parse(&format!("{}zz", &text[..text.len() - 2])), None);
     }
 
     #[test]

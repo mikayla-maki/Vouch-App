@@ -155,7 +155,10 @@ impl Sidebar {
         let Some(address) = own_address else {
             return div();
         };
-        let short = format!("{}…", &address[..8.min(address.len())]);
+        // Show the hex prefix past the `vouch:` scheme; copy the whole
+        // capability string.
+        let hex = address.strip_prefix("vouch:").unwrap_or(&address);
+        let short = format!("{}…", &hex[..8.min(hex.len())]);
         let display_name = own_name.unwrap_or_else(|| "You".to_string());
 
         div()

@@ -1,8 +1,8 @@
-//! Follow someone: paste the 64-hex address they sent you.
+//! Follow someone: paste the `vouch:` address they sent you.
 //!
-//! Following is non-reciprocal and private — this adds the address to
-//! your local follows file and opens a bridge to their mailbox; they
-//! learn nothing unless they follow you back.
+//! Following is private, and the pasted address is the whole deal: it
+//! carries the log to sync AND the key to read it, so follow ⇒ read
+//! with no round trip. The person you follow learns nothing.
 
 use gpui::*;
 use gpui_component::WindowExt;
@@ -18,7 +18,7 @@ impl AddFollowModal {
     pub fn open(follows: Entity<Follows>, window: &mut Window, cx: &mut App) {
         window.open_alert_dialog(cx, move |dialog, window, cx| {
             let address_state = window.use_state(cx, |window, cx| {
-                InputState::new(window, cx).placeholder("Paste an address (64 hex characters)")
+                InputState::new(window, cx).placeholder("Paste an address (starts with vouch:)")
             });
 
             let address_state_clone = address_state.clone();
@@ -34,11 +34,13 @@ impl AddFollowModal {
                 )
                 .on_ok(move |_, _window, cx| {
                     let text = address_state_clone.read(cx).text().to_string();
-                    match vouch_transport::parse_log_id(&text) {
+                    match vouch_core::e2ee::Address::parse(&text) {
                         // Close only if the follow actually took — your own
                         // address, a duplicate, or garbage all keep the
                         // dialog open rather than silently vanishing.
-                        Some(log) => follows.update(cx, |follows, cx| follows.add(log, cx)),
+                        Some(address) => {
+                            follows.update(cx, |follows, cx| follows.add(address, cx))
+                        }
                         None => false,
                     }
                 })
@@ -72,9 +74,9 @@ impl RenderOnce for AddFollowForm {
                     .text_sm()
                     .text_color(theme.muted_foreground)
                     .child(
-                        "An address is a 64-character code someone sends you — their \
-                         recommendations will show up in your feed, and only you know \
-                         you follow them.",
+                        "An address is a vouch: code someone sends you — it carries \
+                         both where their recommendations live and the key to read \
+                         them. Only you know you follow them.",
                     ),
             )
             .child(Input::new(&self.address_state))

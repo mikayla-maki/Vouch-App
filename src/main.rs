@@ -133,17 +133,19 @@ fn main() {
             .or_else(|| data_dir.is_some().then(|| DEFAULT_MAILBOX_URL.to_string()));
         if let Some(url) = &mailbox_url {
             let my_log = peer.id().expect("the app peer always holds a writer");
-            eprintln!("my address: {my_log}");
+            // The full capability address: what a friend pastes to
+            // follow AND read this instance.
+            eprintln!("my address: {}", crypto_identity.address());
             vouch_transport::connect_mailbox(&peer, url, my_log);
         }
-        let env_follows: Vec<vouch_core::LogId> = env_var("VOUCH_FOLLOW")
+        let env_follows: Vec<vouch_core::e2ee::Address> = env_var("VOUCH_FOLLOW")
             .unwrap_or_default()
             .split(',')
-            .filter(|hex| !hex.trim().is_empty())
-            .filter_map(|hex| {
-                let parsed = vouch_transport::parse_log_id(hex);
+            .filter(|s| !s.trim().is_empty())
+            .filter_map(|s| {
+                let parsed = vouch_core::e2ee::Address::parse(s);
                 if parsed.is_none() {
-                    eprintln!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}");
+                    eprintln!("VOUCH_FOLLOW entry is not a vouch: address: {s}");
                 }
                 parsed
             })
