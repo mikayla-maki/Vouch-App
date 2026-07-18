@@ -58,21 +58,38 @@ if [[ -n "${MACOS_CERTIFICATE:-}" ]]; then
   codesign --force --deep --options runtime --timestamp \
     --sign "$IDENTITY" --keychain "$KEYCHAIN" "$APP_DIR"
 
-  echo "==> notarizing"
+  echo "==> notarizing the app"
   ditto -c -k --keepParent "$APP_DIR" target/release/Vouch-notarize.zip
   xcrun notarytool submit target/release/Vouch-notarize.zip --wait \
     --apple-id "$APPLE_NOTARIZATION_APPLE_ID" \
     --team-id "$APPLE_NOTARIZATION_TEAM_ID" \
     --password "$APPLE_NOTARIZATION_PASSWORD"
+  # Staple the ticket to the .app itself: everything built from it below
+  # (zip for the updater, dmg for humans) then passes Gatekeeper offline.
   xcrun stapler staple "$APP_DIR"
   rm -f target/release/Vouch-notarize.zip
-  security delete-keychain "$KEYCHAIN"
 else
   echo "==> no signing secrets: ad-hoc signature (downloads will hit Gatekeeper)"
   codesign --force --deep --sign - "$APP_DIR"
 fi
 
-echo "==> zipping"
+echo "==> zipping (the auto-updater's artifact)"
 rm -f target/release/Vouch.zip
 ditto -c -k --keepParent "$APP_DIR" target/release/Vouch.zip
-echo "==> done: $APP_DIR and target/release/Vouch.zip"
+
+echo "==> building the DMG (the humans' artifact: drag Vouch into Applications)"
+DMG_STAGE="target/release/dmg-stage"
+rm -rf "$DMG_STAGE" target/release/Vouch.dmg
+mkdir -p "$DMG_STAGE"
+cp -R "$APP_DIR" "$DMG_STAGE/Vouch.app"
+ln -s /Applications "$DMG_STAGE/Applications"
+hdiutil create -volname "Vouch" -srcfolder "$DMG_STAGE" -ov -format UDZO \
+  target/release/Vouch.dmg
+rm -rf "$DMG_STAGE"
+
+if [[ -n "${MACOS_CERTIFICATE:-}" ]]; then
+  codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" target/release/Vouch.dmg
+  security delete-keychain "$KEYCHAIN"
+fi
+
+echo "==> done: $APP_DIR, target/release/Vouch.zip, target/release/Vouch.dmg"

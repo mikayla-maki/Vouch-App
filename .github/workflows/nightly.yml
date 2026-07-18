@@ -42,7 +42,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete nightly --cleanup-tag --yes || true
-          gh release create nightly target/release/Vouch.zip \
+          gh release create nightly \
+            target/release/Vouch.dmg target/release/Vouch.zip \
             --prerelease \
             --title "Nightly $VOUCH_BUILD_STAMP" \
             --notes "stamp: $VOUCH_BUILD_STAMP"
