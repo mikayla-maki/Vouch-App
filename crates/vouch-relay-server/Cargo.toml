@@ -12,6 +12,7 @@ path = "src/main.rs"
 vouch-core = { path = "../vouch-core", features = ["wire"] }
 vouch-store = { path = "../vouch-store" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+getrandom = "0.3"
 tokio-tungstenite = "0.24"
 futures = "0.3"
 bincode = "1"

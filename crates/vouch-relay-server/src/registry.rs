@@ -1,7 +1,9 @@
-//! The mailbox registry: one durable `Peer` per `LogId`, created lazily on
-//! first connection and kept alive for the life of the process — a known
-//! simplification; there's no idle-eviction yet, only claim-level
-//! retention (see `main::gc_loop`).
+//! The mailbox registry: one durable `Peer` per `LogId`, created lazily —
+//! and only ever *created* after the bridge has seen a validly signed
+//! publish for that log. A bare connection (a scanner, a typo, a reader
+//! of an address nobody ever published under) must never be able to cost
+//! this server disk; see `bridge::dormant_phase` for how such
+//! connections are answered without a mailbox.
 //!
 //! Each mailbox is a `Peer` with no writer of its own and
 //! `ServePolicy::Everything`: it holds and serves whatever's published
@@ -32,13 +34,39 @@ impl Registry {
         }
     }
 
-    /// Get or lazily create the mailbox for `log_id`.
-    pub async fn mailbox(&self, log_id: LogId) -> Peer {
+    pub fn dir_of(&self, log_id: &LogId) -> PathBuf {
+        // LogId's Display is pure lowercase hex — no separators, no
+        // traversal, safe as a directory name by construction.
+        self.data_dir.join(log_id.to_string())
+    }
+
+    /// The mailbox for `log_id`, only if it already exists — in memory
+    /// from this process, or on disk from any earlier one. `None` means
+    /// the connection stays dormant at the bridge.
+    pub async fn open_existing(&self, log_id: LogId) -> Option<Peer> {
+        let mut mailboxes = self.mailboxes.lock().await;
+        if let Some(peer) = mailboxes.get(&log_id) {
+            return Some(peer.clone());
+        }
+        if !self.dir_of(&log_id).exists() {
+            return None;
+        }
+        Some(self.open_locked(&mut mailboxes, log_id))
+    }
+
+    /// Create-or-open. Called from exactly one place: the bridge, after
+    /// verifying a signed publish for `log_id` — the single event allowed
+    /// to allocate disk on this server.
+    pub async fn materialize(&self, log_id: LogId) -> Peer {
         let mut mailboxes = self.mailboxes.lock().await;
         if let Some(peer) = mailboxes.get(&log_id) {
             return peer.clone();
         }
-        let dir = self.data_dir.join(log_id.to_string());
+        self.open_locked(&mut mailboxes, log_id)
+    }
+
+    fn open_locked(&self, mailboxes: &mut HashMap<LogId, Peer>, log_id: LogId) -> Peer {
+        let dir = self.dir_of(&log_id);
         std::fs::create_dir_all(&dir).expect("create mailbox directory");
         let (peer, actor) =
             vouch_store::open_peer(&dir, None, ServePolicy::Everything).expect("open mailbox");
@@ -47,11 +75,9 @@ impl Registry {
         peer
     }
 
-    /// Every mailbox currently held in memory — the maintenance loop's
-    /// sweep list. A mailbox never touched since process start (nothing on
-    /// disk from a prior run) simply isn't here yet; that's fine, there's
-    /// nothing in it to garbage-collect either.
-    pub async fn snapshot(&self) -> Vec<(LogId, Peer)> {
+    /// Every mailbox live in memory — swept through the Peer's own GC
+    /// verbs so the sweep serializes with client traffic.
+    pub async fn live_mailboxes(&self) -> Vec<(LogId, Peer)> {
         self.mailboxes
             .lock()
             .await
@@ -59,4 +85,30 @@ impl Registry {
             .map(|(id, peer)| (*id, peer.clone()))
             .collect()
     }
+
+    /// Every mailbox directory on disk — including ones from earlier
+    /// process lifetimes that nothing has connected to since. The GC
+    /// sweep opens dormant ones directly (and drops them after), so old
+    /// mailboxes keep draining without being pinned into memory forever.
+    pub fn on_disk(&self) -> Vec<LogId> {
+        let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| parse_log_id_hex(&e.file_name().to_string_lossy()))
+            .collect()
+    }
+}
+
+/// Parse the 64-hex-char directory-name form of a LogId.
+fn parse_log_id_hex(hex: &str) -> Option<LogId> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(LogId(bytes))
 }
