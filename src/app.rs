@@ -94,8 +94,11 @@ impl Render for VouchApp {
                     // The debug viewer replaces the feed + detail area.
                     this.child(self.debug_panel.clone())
                 } else {
-                    this.child(self.feed_panel.clone())
-                        .child(DetailPanel::new(selected, self.local_log_id))
+                    this.child(self.feed_panel.clone()).child(DetailPanel::new(
+                        selected,
+                        self.local_log_id,
+                        self.feed.read(cx).peer().clone(),
+                    ))
                 }
             })
             .when_some(Root::render_dialog_layer(window, cx), |this, layer| {

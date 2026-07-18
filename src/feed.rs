@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use vouch_core::{Draft, ServePolicy, Writer};
+    use vouch_core::{ClaimRef, Draft, ServePolicy, Value, Writer};
 
     fn temp_dir() -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -191,5 +191,136 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The edit path the detail panel drives: the source author edits their
+    /// own `rec`, and the folded `Recommendation` in the feed shows the new
+    /// subject/body — one component still, not a second post. Mirrors the
+    /// `Draft::new("edit").field("of", …).text(…)` shape the edit modal
+    /// builds.
+    #[gpui::test]
+    async fn a_source_author_edit_updates_the_folded_recommendation(cx: &mut TestAppContext) {
+        let (peer, actor, dir) = open_test_peer(13);
+        cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
+
+        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        cx.run_until_parked();
+
+        let author = peer.id().unwrap();
+        let rec = peer
+            .claim(
+                Draft::new("rec")
+                    .at(1)
+                    .text("subject", "Joe's Pizza")
+                    .text("body", "Great!"),
+            )
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        feed.read_with(cx, |feed, _| {
+            let recs = feed.recs();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].subject, "Joe's Pizza");
+            assert_eq!(recs[0].body, "Great!");
+        });
+
+        // An `edit` from the same writer, referencing the original claim so
+        // it causally dominates it — exactly what the modal assembles.
+        let of = Value::Array(vec![Value::ClaimRef(ClaimRef {
+            log_id: author,
+            hash: rec.id(),
+        })]);
+        peer.claim(
+            Draft::new("edit")
+                .at(2)
+                .field("of", of)
+                .text("subject", "Joe's Pizzeria")
+                .text("body", "Still great, now with garlic knots"),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        feed.read_with(cx, |feed, _| {
+            let recs = feed.recs();
+            assert_eq!(recs.len(), 1, "the edit folds in, it is not a new rec");
+            assert_eq!(recs[0].subject, "Joe's Pizzeria");
+            assert_eq!(recs[0].body, "Still great, now with garlic knots");
+            assert_eq!(recs[0].claims.len(), 2, "rec + edit in one component");
+            assert!(recs[0].comments.is_empty());
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The comment path: a *different* writer comments on someone else's
+    /// rec (comments are open to any author), it syncs across, and it lands
+    /// in `comments` without touching `fields` — the source author's
+    /// subject/body are unchanged.
+    #[gpui::test]
+    async fn a_comment_from_another_writer_lands_without_touching_fields(cx: &mut TestAppContext) {
+        let (alice, alice_actor, alice_dir) = open_test_peer(21);
+        let (bob, bob_actor, bob_dir) = open_test_peer(22);
+        cx.update(|cx| {
+            cx.background_executor().spawn(alice_actor.run()).detach();
+            cx.background_executor().spawn(bob_actor.run()).detach();
+        });
+
+        let alice_log = alice.id().unwrap();
+        let bob_log = bob.id().unwrap();
+
+        // Link the two peers; alice follows bob's log so his comment reaches
+        // her (bob serves his own log automatically under ServePolicy::Owned).
+        let (a_end, b_end) = vouch_core::pipe(256);
+        let on_alice = alice.connect("bob", a_end).await.unwrap();
+        let _on_bob = bob.connect("alice", b_end).await.unwrap();
+        alice.follow(bob_log, on_alice).await.unwrap();
+
+        let feed = cx.new(|cx| Feed::new(alice.clone(), cx));
+        cx.run_until_parked();
+
+        // Alice posts a rec.
+        let rec = alice
+            .claim(
+                Draft::new("rec")
+                    .at(1)
+                    .text("subject", "Taco Truck")
+                    .text("body", "The al pastor is unreal"),
+            )
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Bob comments on Alice's rec, referencing it by hash + her log_id.
+        let of = Value::Array(vec![Value::ClaimRef(ClaimRef {
+            log_id: alice_log,
+            hash: rec.id(),
+        })]);
+        bob.claim(
+            Draft::new("comment")
+                .at(2)
+                .field("of", of)
+                .text("text", "Agreed, best in town!"),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        feed.read_with(cx, |feed, _| {
+            let recs = feed.recs();
+            assert_eq!(recs.len(), 1);
+            let rec = &recs[0];
+            // Fields untouched by the comment: still alice's originals.
+            assert_eq!(rec.subject, "Taco Truck");
+            assert_eq!(rec.body, "The al pastor is unreal");
+            // The comment shows, authored by bob (a different writer).
+            assert_eq!(rec.comments.len(), 1, "bob's comment synced and folded in");
+            assert_eq!(rec.comments[0].text, "Agreed, best in town!");
+            assert_eq!(rec.comments[0].author, bob_log);
+        });
+
+        let _ = std::fs::remove_dir_all(&alice_dir);
+        let _ = std::fs::remove_dir_all(&bob_dir);
     }
 }
