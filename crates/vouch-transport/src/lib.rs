@@ -79,6 +79,13 @@ pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) -> io::Resu
 
     let url = relay_url.to_string();
     std::thread::spawn(move || {
+        // Pick rustls's crypto backend explicitly, once: with both ring
+        // and aws-lc-rs compiled in (feature unification does this),
+        // rustls panics at the first TLS handshake rather than choose.
+        static CRYPTO: std::sync::Once = std::sync::Once::new();
+        CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

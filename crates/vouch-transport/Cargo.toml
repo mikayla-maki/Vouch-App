@@ -10,5 +10,9 @@ futures = "0.3"
 bincode = "1"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 # rustls so clients can dial wss:// (the hosted relay sits behind TLS);
-# webpki roots keep it portable — no OpenSSL, no system cert store.
+# webpki roots keep it portable — no OpenSSL, no system cert store. The
+# direct rustls dep exists to pick a CryptoProvider explicitly: feature
+# unification can compile in both backends, and rustls panics at first
+# use rather than guess between them.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

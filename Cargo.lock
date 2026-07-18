@@ -7391,6 +7391,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "futures",
+ "rustls",
  "tokio",
  "tokio-tungstenite",
  "vouch-core",
