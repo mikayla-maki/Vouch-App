@@ -199,6 +199,9 @@ enum Command {
         cutoff: i64,
         reply: oneshot::Sender<Result<Vec<ClaimHash>, Error>>,
     },
+    GcBlobs {
+        reply: oneshot::Sender<Result<Vec<BlobHash>, Error>>,
+    },
     Firehose {
         reply: oneshot::Sender<mpsc::Receiver<PeerEvent>>,
     },
@@ -319,6 +322,15 @@ impl Peer {
     pub async fn gc_claims_older_than(&self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::GcClaims { cutoff, reply }).await?;
+        rx.await.map_err(gone)?
+    }
+
+    /// Drop blobs no live body references — the companion sweep to
+    /// [`gc_claims_older_than`](Self::gc_claims_older_than): purging old
+    /// claims orphans their media, and this reclaims it.
+    pub async fn gc_blobs(&self) -> Result<Vec<BlobHash>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::GcBlobs { reply }).await?;
         rx.await.map_err(gone)?
     }
 
@@ -568,6 +580,9 @@ impl Core {
             }
             Command::GcClaims { cutoff, reply } => {
                 let _ = reply.send(self.db.gc_claims_older_than(cutoff).map_err(Error::Core));
+            }
+            Command::GcBlobs { reply } => {
+                let _ = reply.send(self.db.gc_blobs().map_err(Error::Core));
             }
             Command::Query(f) => f(&self.db),
         }

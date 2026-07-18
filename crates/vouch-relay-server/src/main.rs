@@ -89,6 +89,14 @@ async fn gc_loop(registry: Registry, retention_days: i64) {
                 Ok(_) => {}
                 Err(e) => eprintln!("gc failed for {log_id}: {e}"),
             }
+            // Purged claims orphan their media; reclaim the bytes too.
+            match peer.gc_blobs().await {
+                Ok(dropped) if !dropped.is_empty() => {
+                    println!("gc: dropped {} orphaned blob(s) from {log_id}", dropped.len());
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("blob gc failed for {log_id}: {e}"),
+            }
         }
     }
 }
