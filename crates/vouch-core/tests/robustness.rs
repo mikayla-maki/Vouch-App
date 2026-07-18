@@ -107,6 +107,10 @@ impl ClaimStorage for FlakyStorage {
     fn scan_blob_referrers(&self, visit: &mut dyn FnMut(BlobHash, ClaimHash)) -> Result<(), Error> {
         self.inner.scan_blob_referrers(visit)
     }
+    fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        self.spend()?;
+        self.inner.purge_older_than(cutoff)
+    }
     fn begin(&mut self) -> Result<(), Error> {
         if self.transactional {
             self.inner.begin()
@@ -371,6 +375,9 @@ impl ClaimStorage for PanickingStorage {
     }
     fn scan_blob_referrers(&self, visit: &mut dyn FnMut(BlobHash, ClaimHash)) -> Result<(), Error> {
         self.inner.scan_blob_referrers(visit)
+    }
+    fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        self.inner.purge_older_than(cutoff)
     }
     fn begin(&mut self) -> Result<(), Error> {
         self.inner.begin()

@@ -630,6 +630,45 @@ impl ClaimStore {
             .expect(READ);
         out
     }
+
+    /// Discard every claim received before `cutoff` (Unix ms) — a bounded
+    /// *retention* policy, not the redaction mechanism. This is not, and
+    /// can never be, cursor-driven: a cursor only knows about peers this
+    /// store has already talked to, never about who might follow a log a
+    /// year from now expecting its full history. There is no claim count
+    /// or cursor position that proves "safe to delete" in that world.
+    ///
+    /// What makes this safe is the opposite move: stop promising
+    /// permanence. A relay that holds a bounded window and says so plainly
+    /// (this call) is a sound, honest service; a relay that quietly hopes
+    /// cursors will someday justify a delete is not. Permanence is a
+    /// property of *peers* — an always-on device that never calls this —
+    /// not of a relay.
+    pub fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        self.guard();
+        self.storage.begin()?;
+        self.poisoned = true;
+        match self.storage.purge_older_than(cutoff) {
+            Ok(purged) => match self.storage.commit() {
+                Ok(()) => {
+                    self.poisoned = false;
+                    Ok(purged)
+                }
+                Err(e) => {
+                    if self.storage.rollback().is_ok() {
+                        self.poisoned = false;
+                    }
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                if self.storage.rollback().is_ok() {
+                    self.poisoned = false;
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 impl ClaimStore {

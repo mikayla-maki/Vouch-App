@@ -28,7 +28,7 @@ use crate::error::Error;
 use crate::keys::LogId;
 use crate::storage::ClaimStorage;
 use crate::store::{ClaimStore, IngestReport};
-use crate::value::{BlobHash, BlobRef, Value};
+use crate::value::{BlobHash, BlobRef, ClaimHash, Value};
 use crate::writer::Writer;
 
 /// N merged logs, their media, and the writers for the logs you own.
@@ -181,6 +181,13 @@ impl Database {
     /// Drop blobs no live body references (cooperative deletion for media).
     pub fn gc_blobs(&mut self) -> Result<Vec<BlobHash>, Error> {
         self.blobs.gc(&self.claims)
+    }
+
+    /// A relay's retention policy: discard claims received before `cutoff`
+    /// (Unix ms). See [`ClaimStore::purge_older_than`] for why this is
+    /// sound only as a bounded promise, never as a cursor-driven one.
+    pub fn gc_claims_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        self.claims.purge_older_than(cutoff)
     }
 
     /// Cache eviction under storage pressure: drop a blob's bytes, keep

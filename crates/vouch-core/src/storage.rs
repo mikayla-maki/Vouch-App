@@ -58,6 +58,17 @@ pub trait ClaimStorage: Send {
     fn set_redaction(&mut self, target: ClaimHash, by: ClaimHash) -> Result<(), Error>;
     fn scan_redactions(&self, visit: &mut dyn FnMut(ClaimHash, ClaimHash)) -> Result<(), Error>;
 
+    // ── retention ────────────────────────────────────────────────────────
+    /// Discard every claim whose `received_at` is strictly before `cutoff`,
+    /// along with its own outgoing backlink/blob-referrer edges and any
+    /// redaction row naming it as the target. Returns what was purged.
+    ///
+    /// This is a hard delete (header and signature too, unlike redaction's
+    /// tombstone), and it does not scrub edges where a *surviving* claim
+    /// still points at the purged one — a dangling reference to content
+    /// you no longer hold, same as any other peer that never received it.
+    fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error>;
+
     // ── integrity scans (for fsck; see ClaimStore::verify_integrity) ────
     /// Visit every backlink row as `(target, source)`.
     fn scan_backlinks(&self, visit: &mut dyn FnMut(ClaimHash, ClaimHash)) -> Result<(), Error>;
@@ -279,6 +290,66 @@ impl ClaimStorage for MemoryClaimStorage {
             }
         }
         Ok(())
+    }
+
+    fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        let purge_ids: Vec<ClaimHash> = self
+            .state
+            .claims
+            .values()
+            .filter(|c| c.received_at < cutoff)
+            .map(|c| c.signed.id())
+            .collect();
+
+        for &id in &purge_ids {
+            if let Some(prior) = self.state.claims.remove(&id)
+                && self.undo.is_some()
+            {
+                self.record(Box::new(move |s| {
+                    s.claims.insert(id, prior);
+                }));
+            }
+
+            let targets: Vec<ClaimHash> = self
+                .state
+                .backlinks
+                .iter()
+                .filter(|(_, sources)| sources.contains(&id))
+                .map(|(target, _)| *target)
+                .collect();
+            for target in targets {
+                if remove_edge(&mut self.state.backlinks, &target, &id) && self.undo.is_some() {
+                    self.record(Box::new(move |s| {
+                        add_edge(&mut s.backlinks, target, id);
+                    }));
+                }
+            }
+
+            let blobs: Vec<BlobHash> = self
+                .state
+                .blob_referrers
+                .iter()
+                .filter(|(_, sources)| sources.contains(&id))
+                .map(|(blob, _)| *blob)
+                .collect();
+            for blob in blobs {
+                if remove_edge(&mut self.state.blob_referrers, &blob, &id) && self.undo.is_some() {
+                    self.record(Box::new(move |s| {
+                        add_edge(&mut s.blob_referrers, blob, id);
+                    }));
+                }
+            }
+
+            if let Some(prior_by) = self.state.redactions.remove(&id)
+                && self.undo.is_some()
+            {
+                self.record(Box::new(move |s| {
+                    s.redactions.insert(id, prior_by);
+                }));
+            }
+        }
+
+        Ok(purge_ids)
     }
 
     fn begin(&mut self) -> Result<(), Error> {

@@ -424,6 +424,47 @@ impl ClaimStorage for SqliteClaimStorage {
         Ok(())
     }
 
+    fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<ClaimHash>, Error> {
+        let ids: Vec<ClaimHash> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM claims WHERE received_at < ?1")
+                .map_err(storage_err)?;
+            let rows = stmt
+                .query_map(params![cutoff], |r| r.get::<_, [u8; 32]>(0))
+                .map_err(storage_err)?;
+            rows.map(|r| r.map(ClaimHash).map_err(storage_err))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        self.conn
+            .execute(
+                "DELETE FROM backlinks WHERE source IN \
+                 (SELECT id FROM claims WHERE received_at < ?1)",
+                params![cutoff],
+            )
+            .map_err(storage_err)?;
+        self.conn
+            .execute(
+                "DELETE FROM blob_referrers WHERE source IN \
+                 (SELECT id FROM claims WHERE received_at < ?1)",
+                params![cutoff],
+            )
+            .map_err(storage_err)?;
+        self.conn
+            .execute(
+                "DELETE FROM redactions WHERE target IN \
+                 (SELECT id FROM claims WHERE received_at < ?1)",
+                params![cutoff],
+            )
+            .map_err(storage_err)?;
+        self.conn
+            .execute("DELETE FROM claims WHERE received_at < ?1", params![cutoff])
+            .map_err(storage_err)?;
+
+        Ok(ids)
+    }
+
     // Real transactions: a crash, kill, or power loss mid-ingest leaves no
     // trace — WAL discards the uncommitted transaction on next open.
     fn begin(&mut self) -> Result<(), Error> {

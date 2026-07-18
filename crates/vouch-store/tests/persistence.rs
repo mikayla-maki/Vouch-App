@@ -330,6 +330,9 @@ impl vouch_core::ClaimStorage for FailNthPut {
     ) -> Result<(), vouch_core::Error> {
         self.inner.scan_blob_referrers(visit)
     }
+    fn purge_older_than(&mut self, cutoff: i64) -> Result<Vec<vouch_core::ClaimHash>, vouch_core::Error> {
+        self.inner.purge_older_than(cutoff)
+    }
     fn begin(&mut self) -> Result<(), vouch_core::Error> {
         self.inner.begin()
     }
@@ -474,4 +477,33 @@ fn a_durable_peer_survives_restart_with_its_voice_and_instance() {
     assert_eq!(blob_count, 1);
     let same_instance = vouch_store::open_sync_state(&dir).unwrap().instance();
     let _ = same_instance; // minted once at first open; see sync_cursors test
+}
+
+/// The same retention contract vouch-core pins against the memory backend
+/// (`gc_claims_older_than`), over real SQLite: a hard delete keyed on local
+/// `received_at`, never on cursor state.
+#[test]
+fn a_relays_retention_gc_reaches_sqlite() {
+    let dir = fresh_dir("retention");
+    let mut minter = Database::new();
+    let alice = minter.add_writer(Writer::from_seed([70; 32]));
+    let old = minter.claim(&alice, rec("old")).unwrap();
+    let new = minter.claim(&alice, rec("new")).unwrap();
+
+    let mut relay = vouch_store::open(&dir).unwrap();
+    relay.ingest_at(old.clone(), 1_000).unwrap();
+    relay.ingest_at(new.clone(), 9_000).unwrap();
+    assert!(relay.claims().contains(&old.id()));
+    assert!(relay.claims().contains(&new.id()));
+
+    let purged = relay.gc_claims_older_than(5_000).unwrap();
+    assert_eq!(purged, vec![old.id()]);
+    assert!(!relay.claims().contains(&old.id()));
+    assert!(relay.claims().contains(&new.id()));
+
+    // Durable: reopening the same directory sees the purge too.
+    drop(relay);
+    let reopened = vouch_store::open(&dir).unwrap();
+    assert!(!reopened.claims().contains(&old.id()));
+    assert!(reopened.claims().contains(&new.id()));
 }
