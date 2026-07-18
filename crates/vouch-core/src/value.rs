@@ -40,6 +40,7 @@ pub const TAG_BLOB_REF: u64 = 33003;
 /// Content-addressed identity is what makes forks a non-concept: two
 /// different claims are just two different claims, with nothing to collide.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClaimHash(pub [u8; 32]);
 
 impl ClaimHash {
@@ -81,6 +82,7 @@ pub struct ClaimRef {
 
 /// The identity of a blob: the BLAKE3 hash of its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlobHash(pub [u8; 32]);
 
 impl BlobHash {
@@ -348,6 +350,52 @@ fn collect_deep(value: &Value, path: &mut Path, depth: usize, edges: &mut Edges)
         }
         Value::Tagged(_, inner) => collect_deep(inner, path, depth, edges),
         Value::Null | Value::Bool(_) | Value::Int(_) | Value::Bytes(_) | Value::Text(_) => {}
+    }
+}
+
+/// A quick, no-ceremony way to pull typed fields out of a claim body —
+/// the alternative to hand-writing a `match` per field, or to a
+/// derive-macro schema system this crate doesn't have (and doesn't need
+/// yet: bodies are deliberately schemaless, so there's no fixed type to
+/// generate a decoder from — this just reads whichever of the expected
+/// shape happens to be there).
+#[derive(Clone, Copy)]
+pub struct Fields<'a>(pub &'a BTreeMap<String, Value>);
+
+impl<'a> Fields<'a> {
+    pub fn of(map: &'a BTreeMap<String, Value>) -> Fields<'a> {
+        Fields(map)
+    }
+
+    pub fn text(&self, key: &str) -> Option<&'a str> {
+        match self.0.get(key) {
+            Some(Value::Text(t)) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn int(&self, key: &str) -> Option<i64> {
+        match self.0.get(key) {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Every `ClaimRef` under `key`, whether it's a single ref or an array
+    /// of them — the shape an "of"/"references" field takes in an `edit`
+    /// or `comment` claim.
+    pub fn refs(&self, key: &str) -> Vec<ClaimRef> {
+        match self.0.get(key) {
+            Some(Value::ClaimRef(r)) => vec![*r],
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::ClaimRef(r) => Some(*r),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 

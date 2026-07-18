@@ -1,27 +1,18 @@
-use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::WindowExt;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState};
 use gpui_component::theme::ActiveTheme;
 
-use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::data::MockData;
+use vouch_core::{Draft, Peer};
 
 pub struct NewRecommendationModal;
 
 impl NewRecommendationModal {
-    pub fn open(data: Rc<MockData>, window: &mut Window, cx: &mut App) {
-        let subject_suggestions: Vec<SharedString> = data
-            .recommendations
-            .iter()
-            .map(|r| r.subject_name.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        window.open_dialog(cx, move |dialog, window, cx| {
+    pub fn open(peer: Peer, window: &mut Window, cx: &mut App) {
+        window.open_alert_dialog(cx, move |dialog, window, cx| {
             let subject_state = window.use_state(cx, |window, cx| {
                 InputState::new(window, cx).placeholder("What are you recommending?")
             });
@@ -34,10 +25,11 @@ impl NewRecommendationModal {
 
             let subject_state_clone = subject_state.clone();
             let content_state_clone = content_state.clone();
+            let peer = peer.clone();
 
             dialog
                 .title("New Recommendation")
-                .w(px(500.))
+                .width(px(500.))
                 .button_props(DialogButtonProps::default().show_cancel(true))
                 .on_ok(move |_, _window, cx| {
                     let subject = subject_state_clone.read(cx).text().to_string();
@@ -47,18 +39,28 @@ impl NewRecommendationModal {
                         return false;
                     }
 
-                    // TODO(data-layer): persist the new recommendation (subject,
-                    // content) once a mutable data store exists; for now the
-                    // input is validated and then discarded.
+                    let peer = peer.clone();
+                    let at_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+
+                    // Fire-and-forget: the write lands asynchronously and
+                    // the feed picks it up via the firehose, same as any
+                    // other peer's claims.
+                    cx.spawn(async move |_cx| {
+                        let draft = Draft::new("rec")
+                            .at(at_ms)
+                            .text("subject", subject)
+                            .text("body", content);
+                        let _ = peer.claim(draft).await;
+                    })
+                    .detach();
+
                     true
                 })
                 .child(
-                    NewRecommendationForm::new(
-                        subject_state,
-                        content_state,
-                        subject_suggestions.clone(),
-                    )
-                    .into_any_element(),
+                    NewRecommendationForm::new(subject_state, content_state).into_any_element(),
                 )
         });
     }
@@ -68,19 +70,13 @@ impl NewRecommendationModal {
 pub struct NewRecommendationForm {
     subject_state: Entity<InputState>,
     content_state: Entity<InputState>,
-    subject_suggestions: Vec<SharedString>,
 }
 
 impl NewRecommendationForm {
-    pub fn new(
-        subject_state: Entity<InputState>,
-        content_state: Entity<InputState>,
-        subject_suggestions: Vec<SharedString>,
-    ) -> Self {
+    pub fn new(subject_state: Entity<InputState>, content_state: Entity<InputState>) -> Self {
         Self {
             subject_state,
             content_state,
-            subject_suggestions,
         }
     }
 }
@@ -106,23 +102,7 @@ impl RenderOnce for NewRecommendationForm {
                             .text_color(theme.foreground)
                             .child("Subject"),
                     )
-                    .child(Input::new(&self.subject_state))
-                    .when(!self.subject_suggestions.is_empty(), |this: Div| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Existing subjects: ")
-                                .child(
-                                    self.subject_suggestions
-                                        .iter()
-                                        .take(3)
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", "),
-                                ),
-                        )
-                    }),
+                    .child(Input::new(&self.subject_state)),
             )
             .child(
                 div()

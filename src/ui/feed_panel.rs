@@ -1,4 +1,4 @@
-use crate::data::{MockData, RecommendationId};
+use crate::feed::Feed;
 use crate::ui::modals::NewRecommendationModal;
 use crate::ui::record_card::RecordCard;
 use crate::ui::search_bar::{SearchBar, SearchBarEvent};
@@ -6,27 +6,21 @@ use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
 use gpui_component::{Icon, IconName};
-use std::rc::Rc;
-
-// TODO: When recommendations can change (add/edit/delete), we need to invalidate
-// the cached filtered IDs. Options to consider:
-// - Add a version/generation number to MockData that increments on changes
-// - Use an event subscription pattern to listen for data changes
-// - Store a hash of recommendation IDs to detect changes cheaply
-// Comparing the full Vec<Recommendation> is expensive and should be avoided.
+use vouch_core::{ClaimHash, LogId, Recommendation};
 
 pub struct FeedPanel {
-    data: Rc<MockData>,
-    selected_id: Option<RecommendationId>,
+    feed: Entity<Feed>,
+    local_log_id: Option<LogId>,
+    selected_hash: Option<ClaimHash>,
     search_bar: Entity<SearchBar>,
     search_query: SharedString,
-    /// Cached list of recommendation IDs, filtered and sorted.
-    /// Recomputed when search_query changes.
-    filtered_ids: Vec<RecommendationId>,
+    /// Cached list of matching claim hashes, filtered by search query.
+    /// Recomputed when the query changes or the feed reports new claims.
+    filtered_hashes: Vec<ClaimHash>,
 }
 
 impl FeedPanel {
-    pub fn new(data: Rc<MockData>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(feed: Entity<Feed>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_bar = cx.new(|cx| SearchBar::new(window, cx));
 
         cx.subscribe(
@@ -34,86 +28,75 @@ impl FeedPanel {
             |this, _search_bar, event: &SearchBarEvent, cx| {
                 let SearchBarEvent::QueryChanged(query) = event;
                 this.search_query = query.clone();
-                this.recompute_filtered_ids();
+                this.recompute_filtered_hashes(cx);
                 cx.notify();
             },
         )
         .detach();
 
-        let filtered_ids = Self::compute_filtered_ids(&data, "");
+        cx.observe(&feed, |this, _feed, cx| {
+            this.recompute_filtered_hashes(cx);
+            cx.notify();
+        })
+        .detach();
+
+        let local_log_id = feed.read(cx).peer().id();
+        let filtered_hashes = Self::compute_filtered_hashes(feed.read(cx).recs(), "");
 
         Self {
-            data,
-            selected_id: None,
+            feed,
+            local_log_id,
+            selected_hash: None,
             search_bar,
             search_query: SharedString::default(),
-            filtered_ids,
+            filtered_hashes,
         }
     }
 
-    pub fn selected_id(&self) -> Option<RecommendationId> {
-        self.selected_id
+    pub fn selected_hash(&self) -> Option<ClaimHash> {
+        self.selected_hash
     }
 
-    fn compute_filtered_ids(data: &MockData, query: &str) -> Vec<RecommendationId> {
+    fn compute_filtered_hashes(recs: &[Recommendation], query: &str) -> Vec<ClaimHash> {
         let query = query.to_lowercase();
-
-        let mut results: Vec<&crate::data::Recommendation> = if query.is_empty() {
-            data.recommendations.iter().collect()
-        } else {
-            data.recommendations
-                .iter()
-                .filter(|rec| {
-                    let subject_match = rec.subject_name.to_lowercase().contains(&query);
-                    let content_match = rec.content.to_lowercase().contains(&query);
-                    let author_name = data.get_contact_name(rec.source.original_author);
-                    let author_match = author_name.to_lowercase().contains(&query);
-
-                    subject_match || content_match || author_match
-                })
-                .collect()
-        };
-
-        // Sort by timestamp, newest first
-        results.sort_by(|a, b| b.source.timestamp.cmp(&a.source.timestamp));
-
-        results.into_iter().map(|rec| rec.id).collect()
+        recs.iter()
+            .filter(|rec| {
+                query.is_empty()
+                    || rec.subject.to_lowercase().contains(&query)
+                    || rec.body.to_lowercase().contains(&query)
+            })
+            .map(|rec| rec.id)
+            .collect()
     }
 
-    fn recompute_filtered_ids(&mut self) {
-        self.filtered_ids = Self::compute_filtered_ids(&self.data, &self.search_query);
+    fn recompute_filtered_hashes(&mut self, cx: &mut Context<Self>) {
+        self.filtered_hashes =
+            Self::compute_filtered_hashes(self.feed.read(cx).recs(), &self.search_query);
     }
 
     fn render_feed_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut cards: Vec<Stateful<Div>> = Vec::new();
+        let recs = self.feed.read(cx).recs();
 
-        for recommendation_id in &self.filtered_ids {
-            let recommendation = self
-                .data
-                .recommendations
-                .iter()
-                .find(|r| r.id == *recommendation_id);
-
-            let Some(recommendation) = recommendation else {
+        for hash in &self.filtered_hashes {
+            let Some(rec) = recs.iter().find(|r| r.id == *hash) else {
                 continue;
             };
 
-            let is_selected = self.selected_id == Some(recommendation.id);
-            let recommendation_id = recommendation.id;
+            let is_selected = self.selected_hash == Some(rec.id);
+            let hash = rec.id;
 
             let card = div()
-                .id(ElementId::Name(
-                    format!("feed-item-{}", recommendation.id.0).into(),
-                ))
+                .id(ElementId::Name(format!("feed-item-{}", hash).into()))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.selected_id = Some(recommendation_id);
+                    this.selected_hash = Some(hash);
                     cx.notify();
                 }))
                 .child(RecordCard::render_card(
-                    recommendation,
+                    rec,
                     is_selected,
-                    &self.data,
+                    self.local_log_id,
                     cx.theme(),
                 ));
 
@@ -154,7 +137,7 @@ impl FeedPanel {
     // but its released hover style paints the label `red_400()` (upstream bug
     // in button.rs), so this stays hand-rolled until that is fixed.
     fn render_new_vouch_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let data = self.data.clone();
+        let peer = self.feed.read(cx).peer().clone();
 
         div()
             .w_full()
@@ -172,7 +155,7 @@ impl FeedPanel {
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.primary_hover))
                     .on_click(cx.listener(move |_this, _event, window, cx| {
-                        NewRecommendationModal::open(data.clone(), window, cx);
+                        NewRecommendationModal::open(peer.clone(), window, cx);
                     }))
                     .child(
                         div()

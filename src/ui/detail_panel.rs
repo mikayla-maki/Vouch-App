@@ -1,27 +1,27 @@
-use crate::data::{ContactId, MockData, Recommendation, RecommendationId};
-use crate::ui::format::{TimeStyle, format_relative_time, truncate};
+use crate::ui::format::{TimeStyle, format_relative_time};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
-use std::rc::Rc;
+use std::time::{Duration, UNIX_EPOCH};
+use vouch_core::{LogId, Recommendation};
+
+// Vouch-chain and related-vouches sections belong here once `vouch` claims
+// and `rec.about -> entity` linking exist end to end: real relatedness is
+// `ClaimStore::backlinks` + `by_type("vouch"/"rec")`, not string-matching a
+// subject name.
 
 #[derive(IntoElement)]
 pub struct DetailPanel {
-    selected_id: Option<RecommendationId>,
-    data: Rc<MockData>,
+    selected: Option<Recommendation>,
+    local_log_id: Option<LogId>,
 }
 
 impl DetailPanel {
-    pub fn new(data: Rc<MockData>) -> Self {
+    pub fn new(selected: Option<Recommendation>, local_log_id: Option<LogId>) -> Self {
         Self {
-            selected_id: None,
-            data,
+            selected,
+            local_log_id,
         }
-    }
-
-    pub fn selected(mut self, id: Option<RecommendationId>) -> Self {
-        self.selected_id = id;
-        self
     }
 
     fn render_empty_state(theme: &Theme) -> Stateful<Div> {
@@ -73,13 +73,10 @@ impl DetailPanel {
     }
 
     fn render_recommendation_detail(
-        recommendation: &Recommendation,
-        data: &MockData,
+        rec: &Recommendation,
+        is_own: bool,
         theme: &Theme,
     ) -> Stateful<Div> {
-        let is_own = recommendation.source.original_author == MockData::local_user_id();
-        let related_records = Self::find_related_records(recommendation, data);
-
         div()
             .id("detail-panel")
             .flex()
@@ -89,19 +86,16 @@ impl DetailPanel {
             .min_w_0()
             .overflow_hidden()
             .bg(theme.background)
-            .child(Self::render_subject_header(recommendation, theme))
-            .child(Self::render_scrollable_content(
-                recommendation,
-                data,
-                &related_records,
-                theme,
-            ))
+            .child(Self::render_subject_header(rec, theme))
+            .child(Self::render_scrollable_content(rec, theme))
             .child(Self::render_action_bar(is_own, theme))
     }
 
-    fn render_subject_header(recommendation: &Recommendation, theme: &Theme) -> Div {
-        let (subject_emoji, subject_category) =
-            Self::classify_subject(&recommendation.subject_name);
+    fn render_subject_header(rec: &Recommendation, theme: &Theme) -> Div {
+        let timestamp = format_relative_time(
+            UNIX_EPOCH + Duration::from_millis(rec.at_ms().max(0) as u64),
+            TimeStyle::Verbose,
+        );
 
         div()
             .flex()
@@ -124,7 +118,7 @@ impl DetailPanel {
                     .justify_center()
                     .items_center()
                     .shadow_md()
-                    .child(div().text_3xl().child(subject_emoji)),
+                    .child(div().text_3xl().child("📍")),
             )
             .child(
                 div()
@@ -133,23 +127,18 @@ impl DetailPanel {
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.foreground)
                     .text_center()
-                    .child(recommendation.subject_name.clone()),
+                    .child(rec.subject.clone()),
             )
             .child(
                 div()
                     .mt_1()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(subject_category),
+                    .child(timestamp),
             )
     }
 
-    fn render_scrollable_content(
-        recommendation: &Recommendation,
-        data: &MockData,
-        related_records: &[&Recommendation],
-        theme: &Theme,
-    ) -> Stateful<Div> {
+    fn render_scrollable_content(rec: &Recommendation, theme: &Theme) -> Stateful<Div> {
         div()
             .id("detail-scroll-content")
             .flex()
@@ -158,12 +147,10 @@ impl DetailPanel {
             .w_full()
             .min_w_0()
             .overflow_y_scroll()
-            .child(Self::render_recommendation_content(recommendation, theme))
-            .child(Self::render_vouch_chain(recommendation, data, theme))
-            .child(Self::render_related_section(related_records, data, theme))
+            .child(Self::render_recommendation_content(rec, theme))
     }
 
-    fn render_recommendation_content(recommendation: &Recommendation, theme: &Theme) -> Div {
+    fn render_recommendation_content(rec: &Recommendation, theme: &Theme) -> Div {
         div()
             .flex()
             .flex_col()
@@ -211,292 +198,7 @@ impl DetailPanel {
                             .overflow_hidden()
                             .text_base()
                             .text_color(theme.foreground)
-                            .child(div().size_full().child(recommendation.content.clone())),
-                    ),
-            )
-    }
-
-    fn render_vouch_chain(recommendation: &Recommendation, data: &MockData, theme: &Theme) -> Div {
-        let original_author_id = recommendation.source.original_author;
-        let original_author_name = data.get_contact_name(original_author_id);
-        let is_own_recommendation = original_author_id == MockData::local_user_id();
-
-        let timestamp = format_relative_time(recommendation.source.timestamp, TimeStyle::Verbose);
-
-        let mut chain_items: Vec<Div> = Vec::new();
-
-        chain_items.push(Self::render_chain_item(
-            "✨",
-            "Original Author",
-            &original_author_name,
-            if is_own_recommendation {
-                Some("You wrote this")
-            } else {
-                None
-            },
-            &timestamp,
-            theme.primary,
-            theme,
-            true,
-        ));
-
-        if let Some(via_id) = recommendation.source.received_via {
-            let via_name = data.get_contact_name(via_id);
-            chain_items.push(Self::render_chain_item(
-                "📬",
-                "Received via",
-                &via_name,
-                None,
-                "",
-                theme.secondary,
-                theme,
-                false,
-            ));
-        }
-
-        if !recommendation.source.revouched_by.is_empty() {
-            let revouchers = Self::format_revouchers(&recommendation.source.revouched_by, data);
-            chain_items.push(Self::render_chain_item(
-                "🔄",
-                "Revouched by",
-                &revouchers,
-                None,
-                "",
-                theme.accent,
-                theme,
-                false,
-            ));
-        }
-
-        div()
-            .flex()
-            .flex_col()
-            .px_4()
-            .py_3()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .mb_2()
-                    .child(
-                        div()
-                            .w_6()
-                            .h_6()
-                            .rounded_full()
-                            .bg(theme.secondary)
-                            .flex()
-                            .justify_center()
-                            .items_center()
-                            .child(div().text_xs().text_color(theme.foreground).child("🔗")),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child("Vouch Chain"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .pl_2()
-                    .border_l_2()
-                    .border_color(theme.border)
-                    .children(chain_items),
-            )
-    }
-
-    fn render_chain_item(
-        emoji: &'static str,
-        label: &'static str,
-        value: &str,
-        subtitle: Option<&'static str>,
-        timestamp: &str,
-        accent_color: Hsla,
-        theme: &Theme,
-        is_primary: bool,
-    ) -> Div {
-        div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap_3()
-            .p_3()
-            .ml_2()
-            .bg(if is_primary {
-                theme.muted
-            } else {
-                theme.background
-            })
-            .rounded_md()
-            .when(is_primary, |this| {
-                this.border_1().border_color(theme.border)
-            })
-            .child(
-                div()
-                    .w_8()
-                    .h_8()
-                    .rounded_full()
-                    .bg(accent_color)
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .flex_shrink_0()
-                    .child(div().text_sm().child(emoji.to_string())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(label)),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .child(SharedString::from(value.to_string())),
-                    )
-                    .when_some(subtitle, |this, sub| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .mt_1()
-                                .child(SharedString::from(sub)),
-                        )
-                    })
-                    .when(!timestamp.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .mt_1()
-                                .child(SharedString::from(timestamp.to_string())),
-                        )
-                    }),
-            )
-    }
-
-    fn render_related_section(
-        related_records: &[&Recommendation],
-        data: &MockData,
-        theme: &Theme,
-    ) -> Div {
-        let count = related_records.len();
-
-        div()
-            .flex()
-            .flex_col()
-            .px_4()
-            .py_3()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .mb_3()
-                    .child(
-                        div()
-                            .w_6()
-                            .h_6()
-                            .rounded_full()
-                            .bg(theme.primary)
-                            .flex()
-                            .justify_center()
-                            .items_center()
-                            .child(div().text_xs().text_color(theme.foreground).child("📚")),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(format!("Related Vouches ({})", count)),
-                    ),
-            )
-            .map(|this| {
-                if related_records.is_empty() {
-                    this.child(
-                        div().p_4().bg(theme.muted).rounded_md().child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .text_center()
-                                .child("No other vouches for this subject yet"),
-                        ),
-                    )
-                } else {
-                    let items: Vec<Div> = related_records
-                        .iter()
-                        .map(|rec| Self::render_related_item(rec, data, theme))
-                        .collect();
-                    this.child(div().flex().flex_col().gap_2().children(items))
-                }
-            })
-    }
-
-    fn render_related_item(recommendation: &Recommendation, data: &MockData, theme: &Theme) -> Div {
-        let author_name = data.get_contact_name(recommendation.source.original_author);
-        let excerpt = truncate(&recommendation.content, 80);
-
-        div()
-            .p_3()
-            .bg(theme.colors.list)
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.list_hover))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w_5()
-                                    .h_5()
-                                    .rounded_full()
-                                    .bg(theme.secondary)
-                                    .flex()
-                                    .justify_center()
-                                    .items_center()
-                                    .child(div().text_xs().child("👤")),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(author_name.to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(excerpt),
+                            .child(div().size_full().child(rec.body.clone())),
                     ),
             )
     }
@@ -569,90 +271,15 @@ impl DetailPanel {
                     .child(label.to_string()),
             )
     }
-
-    fn find_related_records<'a>(
-        current: &Recommendation,
-        data: &'a MockData,
-    ) -> Vec<&'a Recommendation> {
-        let current_subject = current.subject_name.to_lowercase();
-
-        data.recommendations
-            .iter()
-            .filter(|rec| {
-                rec.id != current.id && rec.subject_name.to_lowercase() == current_subject
-            })
-            .collect()
-    }
-
-    fn format_revouchers(revouchers: &[ContactId], data: &MockData) -> String {
-        let names: Vec<String> = revouchers
-            .iter()
-            .map(|id| {
-                if *id == MockData::local_user_id() {
-                    "You".to_string()
-                } else {
-                    data.get_contact_name(*id).to_string()
-                }
-            })
-            .collect();
-
-        match names.as_slice() {
-            [] => String::new(),
-            [only] => only.clone(),
-            [first, second] => format!("{} and {}", first, second),
-            [rest @ .., last] => format!("{}, and {}", rest.join(", "), last),
-        }
-    }
-
-    /// Classifies a subject by keyword, returning `(emoji, category label)`.
-    fn classify_subject(subject_name: &str) -> (&'static str, &'static str) {
-        let lower = subject_name.to_lowercase();
-
-        if lower.contains("restaurant")
-            || lower.contains("thai")
-            || lower.contains("bakery")
-            || lower.contains("food")
-            || lower.contains("cafe")
-        {
-            ("🍜", "Restaurant / Food")
-        } else if lower.contains("auto") || lower.contains("car") || lower.contains("repair") {
-            ("🚗", "Auto Services")
-        } else if lower.contains("doctor")
-            || lower.contains("dentist")
-            || lower.contains("dr.")
-            || lower.contains("medical")
-        {
-            ("🏥", "Healthcare")
-        } else if lower.contains("trail")
-            || lower.contains("hike")
-            || lower.contains("park")
-            || lower.contains("nature")
-        {
-            ("🥾", "Outdoor / Recreation")
-        } else if lower.contains("library") || lower.contains("book") || lower.contains("study") {
-            ("📚", "Library / Education")
-        } else if lower.contains("plant") || lower.contains("garden") || lower.contains("flower") {
-            ("🌱", "Garden / Plants")
-        } else if lower.contains("shop") || lower.contains("store") {
-            ("🏪", "Shopping")
-        } else {
-            ("📍", "Place")
-        }
-    }
 }
 
 impl RenderOnce for DetailPanel {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
-
-        match self.selected_id {
-            Some(id) => {
-                if let Some(recommendation) = self.data.recommendations.iter().find(|r| r.id == id)
-                {
-                    Self::render_recommendation_detail(recommendation, &self.data, &theme)
-                } else {
-                    Self::render_empty_state(&theme)
-                }
+        match &self.selected {
+            Some(rec) => {
+                let is_own = self.local_log_id.is_some() && self.local_log_id == rec.author();
+                Self::render_recommendation_detail(rec, is_own, &theme)
             }
             None => Self::render_empty_state(&theme),
         }

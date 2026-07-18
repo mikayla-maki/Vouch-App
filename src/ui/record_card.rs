@@ -1,28 +1,25 @@
-use crate::data::{MockData, Recommendation};
 use crate::ui::format::{TimeStyle, format_relative_time, truncate};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::theme::Theme;
+use std::time::{Duration, UNIX_EPOCH};
+use vouch_core::{LogId, Recommendation};
 
 pub struct RecordCard;
 
 impl RecordCard {
-    fn format_attribution(source: &crate::data::RecordSource, data: &MockData) -> String {
-        let author_name = data.get_contact_name(source.original_author);
-        if source.original_author == MockData::local_user_id() {
-            "by you".to_string()
-        } else if let Some(via_id) = source.received_via {
-            let via_name = data.get_contact_name(via_id);
-            format!("via {}", via_name)
-        } else {
-            format!("by {}", author_name)
+    fn format_attribution(rec: &Recommendation, local_log_id: Option<LogId>) -> String {
+        match rec.author() {
+            Some(author) if Some(author) == local_log_id => "by you".to_string(),
+            Some(author) => format!("by {}", author.short()),
+            None => "by someone".to_string(),
         }
     }
 
     pub fn render_card(
-        recommendation: &Recommendation,
+        rec: &Recommendation,
         is_selected: bool,
-        data: &MockData,
+        local_log_id: Option<LogId>,
         theme: &Theme,
     ) -> impl IntoElement {
         let background = if is_selected {
@@ -31,15 +28,16 @@ impl RecordCard {
             theme.colors.list
         };
 
-        let subject_name = recommendation.subject_name.clone();
-        let content_preview = truncate(&recommendation.content, 80);
-        let attribution = Self::format_attribution(&recommendation.source, data);
-        let timestamp = format_relative_time(recommendation.source.timestamp, TimeStyle::Compact);
+        let subject_name = rec.subject.clone();
+        let content_preview = truncate(&rec.body, 80);
+        let attribution = Self::format_attribution(rec, local_log_id);
+        let timestamp = format_relative_time(
+            UNIX_EPOCH + Duration::from_millis(rec.at_ms().max(0) as u64),
+            TimeStyle::Compact,
+        );
 
         div()
-            .id(ElementId::Name(
-                format!("card-{}", recommendation.id.0).into(),
-            ))
+            .id(ElementId::Name(format!("card-{}", rec.id).into()))
             .w_full()
             .p_3()
             .bg(background)

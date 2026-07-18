@@ -55,8 +55,10 @@ pub mod claim;
 pub mod database;
 pub mod draft;
 pub mod error;
+pub mod fold;
 pub mod keys;
 pub mod peer;
+pub mod rec;
 pub mod storage;
 pub mod store;
 pub mod sync;
@@ -69,6 +71,8 @@ pub use claim::{
 };
 pub use database::Database;
 pub use draft::Draft;
+pub use fold::{Comment, Component, FieldContribution, FieldState};
+pub use rec::Recommendation;
 pub use ed25519_dalek::Signature;
 pub use error::Error;
 pub use keys::LogId;
@@ -81,6 +85,6 @@ pub use store::{
     redact_target,
 };
 pub use value::{
-    BlobHash, BlobRef, ClaimHash, ClaimRef, Edges, MAX_EMBED_DEPTH, Path, PathSeg, Value,
+    BlobHash, BlobRef, ClaimHash, ClaimRef, Edges, Fields, MAX_EMBED_DEPTH, Path, PathSeg, Value,
 };
 pub use writer::Writer;
