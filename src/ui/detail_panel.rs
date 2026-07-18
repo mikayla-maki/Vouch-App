@@ -1,6 +1,6 @@
 use crate::ui::format::{TimeStyle, format_relative_time};
-use crate::ui::modals::EditRecommendationModal;
 use crate::ui::modals::edit_recommendation::dominating_refs;
+use crate::ui::modals::{EditRecommendationModal, HistoryModal};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
@@ -104,7 +104,13 @@ impl DetailPanel {
                 cx,
                 theme,
             ))
-            .child(Self::render_action_bar(rec, is_own, peer, theme))
+            .child(Self::render_action_bar(
+                rec,
+                is_own,
+                local_log_id,
+                peer,
+                theme,
+            ))
     }
 
     fn render_subject_header(rec: &Recommendation, theme: &Theme) -> Div {
@@ -458,7 +464,13 @@ impl DetailPanel {
             )
     }
 
-    fn render_action_bar(rec: &Recommendation, is_own: bool, peer: &Peer, theme: &Theme) -> Div {
+    fn render_action_bar(
+        rec: &Recommendation,
+        is_own: bool,
+        local_log_id: Option<LogId>,
+        peer: &Peer,
+        theme: &Theme,
+    ) -> Div {
         let not_implemented_border = gpui::red();
 
         div()
@@ -485,9 +497,47 @@ impl DetailPanel {
                 theme,
                 not_implemented_border,
             ))
+            .child(Self::render_history_button(rec, local_log_id, theme))
             .when(is_own, |this| {
                 this.child(Self::render_edit_button(rec, peer, theme))
             })
+    }
+
+    /// Open to anyone, unlike Edit — seeing what happened isn't gated on
+    /// being the source author.
+    fn render_history_button(
+        rec: &Recommendation,
+        local_log_id: Option<LogId>,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        let rec = rec.clone();
+
+        div()
+            .id("history-btn")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(theme.colors.list)
+            .rounded_lg()
+            .cursor_pointer()
+            .border_1()
+            .border_color(theme.border)
+            .shadow_sm()
+            .hover(|style| style.bg(theme.list_hover))
+            .on_click(move |_event, window, cx| {
+                HistoryModal::open(rec.clone(), local_log_id, window, cx);
+            })
+            .child(div().text_sm().child("🕘"))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child("History"),
+            )
     }
 
     fn render_edit_button(rec: &Recommendation, peer: &Peer, theme: &Theme) -> Stateful<Div> {

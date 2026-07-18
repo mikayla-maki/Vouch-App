@@ -72,7 +72,7 @@ pub use claim::{
 pub use database::Database;
 pub use draft::Draft;
 pub use fold::{Comment, Component, FieldContribution, FieldState};
-pub use rec::Recommendation;
+pub use rec::{Recommendation, TimelineEntry};
 pub use ed25519_dalek::Signature;
 pub use error::Error;
 pub use keys::LogId;

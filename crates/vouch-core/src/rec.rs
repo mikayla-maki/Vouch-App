@@ -48,6 +48,79 @@ impl Recommendation {
             .map(|c| c.at)
             .unwrap_or(0)
     }
+
+    /// Every claim that shaped this recommendation, oldest first: each
+    /// field's full history (superseded entries included, marked
+    /// `current: false`) interleaved with comments by claimed time. The
+    /// raw material for a "see edits/changes" view — unlike `subject`/
+    /// `body`, nothing here is folded away.
+    pub fn timeline(&self) -> Vec<TimelineEntry> {
+        let mut entries: Vec<TimelineEntry> = Vec::new();
+        for (field, state) in &self.fields {
+            let current: BTreeSet<ClaimHash> = state.frontier.iter().map(|c| c.claim).collect();
+            for c in &state.history {
+                entries.push(TimelineEntry::Field {
+                    claim: c.claim,
+                    author: c.author,
+                    at: c.at,
+                    field: field.clone(),
+                    value: c.value.clone(),
+                    current: current.contains(&c.claim),
+                });
+            }
+        }
+        for c in &self.comments {
+            entries.push(TimelineEntry::Comment {
+                claim: c.claim,
+                author: c.author,
+                at: c.at,
+                text: c.text.clone(),
+            });
+        }
+        entries.sort_by(|a, b| a.at().cmp(&b.at()).then_with(|| a.claim().cmp(&b.claim())));
+        entries
+    }
+}
+
+/// One entry in a recommendation's timeline — a fact about a single claim,
+/// not a folded conclusion. `current` on a `Field` entry says whether it's
+/// still part of the live frontier or has since been superseded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TimelineEntry {
+    Field {
+        claim: ClaimHash,
+        author: LogId,
+        at: i64,
+        field: String,
+        value: Value,
+        current: bool,
+    },
+    Comment {
+        claim: ClaimHash,
+        author: LogId,
+        at: i64,
+        text: String,
+    },
+}
+
+impl TimelineEntry {
+    pub fn at(&self) -> i64 {
+        match self {
+            TimelineEntry::Field { at, .. } | TimelineEntry::Comment { at, .. } => *at,
+        }
+    }
+
+    pub fn claim(&self) -> ClaimHash {
+        match self {
+            TimelineEntry::Field { claim, .. } | TimelineEntry::Comment { claim, .. } => *claim,
+        }
+    }
+
+    pub fn author(&self) -> LogId {
+        match self {
+            TimelineEntry::Field { author, .. } | TimelineEntry::Comment { author, .. } => *author,
+        }
+    }
 }
 
 fn as_text(value: &Value) -> Option<&str> {

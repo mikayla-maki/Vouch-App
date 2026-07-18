@@ -69,7 +69,13 @@ pub struct FieldContribution {
 /// more than one is an exposed, unreconciled conflict.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FieldState {
+    /// The causal frontier: what's currently live (undominated).
     pub frontier: Vec<FieldContribution>,
+    /// Every contribution ever made to this field, oldest first —
+    /// including ones a later edit has since dominated. This is the raw
+    /// material for a "history of edits" view; `frontier` alone can't
+    /// answer "what did this used to say."
+    pub history: Vec<FieldContribution>,
 }
 
 impl FieldState {
@@ -243,7 +249,7 @@ fn build_component(
             continue; // tombstoned or bodiless: contributes to no field
         };
         for key in map.keys() {
-            if key == "at" || key == "of" {
+            if key == "at" || key == "of" || key == "type" {
                 continue; // metadata, not a field of the thing itself
             }
             candidates.entry(key.clone()).or_default().push(id);
@@ -263,25 +269,21 @@ fn build_component(
             })
             .copied()
             .collect();
-        let frontier: Vec<FieldContribution> = claim_ids
-            .into_iter()
-            .filter(|id| !dominated.contains(id))
-            .filter_map(|id| {
-                let claim = nodes.get(&id)?;
-                let Value::Map(map) = claim.body.as_ref()? else {
-                    return None;
-                };
-                let value = map.get(&field)?.clone();
-                let at = Fields::of(map).int("at").unwrap_or(claim.received_at);
-                Some(FieldContribution {
-                    claim: id,
-                    author: claim.header.log_id,
-                    value,
-                    at,
-                })
-            })
+        // Every contribution, oldest first — the field's full history, not
+        // just what's currently winning. `at` is self-reported (display
+        // only), so the tie-break by claim hash is what keeps this
+        // deterministic when two contributions claim the same time.
+        let mut history: Vec<FieldContribution> = claim_ids
+            .iter()
+            .filter_map(|id| contribution(nodes, &field, *id))
             .collect();
-        fields.insert(field, FieldState { frontier });
+        history.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.claim.cmp(&b.claim)));
+        let frontier: Vec<FieldContribution> = history
+            .iter()
+            .filter(|c| !dominated.contains(&c.claim))
+            .cloned()
+            .collect();
+        fields.insert(field, FieldState { frontier, history });
     }
 
     let comments: Vec<Comment> = ids
@@ -308,4 +310,25 @@ fn build_component(
         fields,
         comments,
     }
+}
+
+/// One claim's contribution to one named field, if it has a body and
+/// actually sets that field.
+fn contribution(
+    nodes: &HashMap<ClaimHash, StoredClaim>,
+    field: &str,
+    id: ClaimHash,
+) -> Option<FieldContribution> {
+    let claim = nodes.get(&id)?;
+    let Value::Map(map) = claim.body.as_ref()? else {
+        return None;
+    };
+    let value = map.get(field)?.clone();
+    let at = Fields::of(map).int("at").unwrap_or(claim.received_at);
+    Some(FieldContribution {
+        claim: id,
+        author: claim.header.log_id,
+        value,
+        at,
+    })
 }
