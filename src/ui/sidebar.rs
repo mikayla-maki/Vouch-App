@@ -1,4 +1,5 @@
 use crate::theme::{is_dark_mode, toggle_theme};
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
 use gpui_component::{Icon, IconName};
@@ -11,19 +12,30 @@ use gpui_component::{Icon, IconName};
 #[derive(IntoElement)]
 pub struct Sidebar {
     is_collapsed: bool,
+    debug_active: bool,
     on_toggle: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_debug: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl Sidebar {
     pub fn new() -> Self {
         Self {
             is_collapsed: false,
+            debug_active: false,
             on_toggle: None,
+            on_debug: None,
         }
     }
 
     pub fn collapsed(mut self, collapsed: bool) -> Self {
         self.is_collapsed = collapsed;
+        self
+    }
+
+    /// Whether the raw-claims debug view is currently open (drives the toggle
+    /// button's highlight).
+    pub fn debug_active(mut self, active: bool) -> Self {
+        self.debug_active = active;
         self
     }
 
@@ -33,6 +45,71 @@ impl Sidebar {
     ) -> Self {
         self.on_toggle = Some(Box::new(handler));
         self
+    }
+
+    /// Toggle the raw-claims debug viewer (a dev tool for inspecting the
+    /// underlying database, wired up in `VouchApp`).
+    pub fn on_debug(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_debug = Some(Box::new(handler));
+        self
+    }
+
+    /// A "raw claims" toggle button. `compact` renders just the glyph (for the
+    /// collapsed rail); otherwise a labeled row.
+    fn render_debug_button(
+        active: bool,
+        compact: bool,
+        theme: &Theme,
+        on_debug: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    ) -> Stateful<Div> {
+        let color = if active {
+            theme.primary_hover
+        } else {
+            theme.muted_foreground
+        };
+
+        let mut btn = div()
+            .id("debug-toggle")
+            .cursor_pointer()
+            .rounded_md()
+            .hover(|style| style.bg(theme.list_hover))
+            .when(active, |this| this.bg(theme.list_active));
+
+        btn = if compact {
+            btn.p_2().child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child("{}"),
+            )
+        } else {
+            btn.w_full().px_3().py_2().child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(color)
+                            .child("{}"),
+                    )
+                    .child(div().text_sm().text_color(theme.foreground).child("Raw claims")),
+            )
+        };
+
+        if let Some(on_debug) = on_debug {
+            btn = btn.on_click(move |event, window, cx| {
+                on_debug(event, window, cx);
+            });
+        }
+        btn
     }
 
     fn render_theme_switcher(theme: &Theme, is_dark: bool) -> Stateful<Div> {
@@ -123,9 +200,16 @@ impl RenderOnce for Sidebar {
                 .bg(theme.sidebar)
                 .border_r_1()
                 .border_color(theme.border)
+                .gap_1()
                 .items_center()
                 .pt_2()
                 .child(expand_btn)
+                .child(Self::render_debug_button(
+                    self.debug_active,
+                    true,
+                    &theme,
+                    self.on_debug,
+                ))
                 .child(div().flex_1())
                 .child(div().pb_2().child(theme_btn));
         }
@@ -177,7 +261,20 @@ impl RenderOnce for Sidebar {
             .border_r_1()
             .border_color(theme.border)
             .child(header)
-            .child(div().id("sidebar-content").flex_1())
+            .child(
+                div()
+                    .id("sidebar-content")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .p_2()
+                    .child(Self::render_debug_button(
+                        self.debug_active,
+                        false,
+                        &theme,
+                        self.on_debug,
+                    )),
+            )
             .child(
                 div()
                     .p_2()

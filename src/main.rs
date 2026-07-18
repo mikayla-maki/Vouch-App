@@ -6,6 +6,7 @@ use vouch_core::{Database, Peer, PeerActor, ServePolicy, Writer};
 
 mod app;
 mod assets;
+mod debug_feed;
 mod feed;
 mod identity;
 mod theme;

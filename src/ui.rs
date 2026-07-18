@@ -1,3 +1,4 @@
+pub mod debug_panel;
 pub mod detail_panel;
 pub mod feed_panel;
 pub mod format;
