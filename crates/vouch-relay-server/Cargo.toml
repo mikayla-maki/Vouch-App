@@ -1,0 +1,17 @@
+[package]
+name = "vouch-relay-server"
+version = "0.1.0"
+edition = "2024"
+description = "A bounded store-and-forward relay: one Peer per LogId mailbox, WebSocket transport, time-based retention. Not a permanent archive — see Database::gc_claims_older_than."
+
+[[bin]]
+name = "vouch-relay-server"
+path = "src/main.rs"
+
+[dependencies]
+vouch-core = { path = "../vouch-core", features = ["wire"] }
+vouch-store = { path = "../vouch-store" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+bincode = "1"

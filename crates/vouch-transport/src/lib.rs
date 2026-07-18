@@ -41,6 +41,95 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// Returns as soon as the handshake completes; the bridge threads and any
 /// session traffic keep running in the background for the life of the
 /// process.
+/// Parse a `LogId` from the 64-hex-char form `Display` produces — the
+/// shape a friend's address travels in (a message, an env var, a QR code
+/// someday).
+pub fn parse_log_id(hex: &str) -> Option<LogId> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(LogId(bytes))
+}
+
+/// Dial one mailbox on a `vouch-relay-server` over WebSocket and follow
+/// `mailbox` through it. The same call covers both directions of the
+/// relay's contract: pointed at your *own* log's mailbox it publishes
+/// (following your own log somewhere is how you publish there); pointed
+/// at a friend's it subscribes. One connection per mailbox — the LogId
+/// is the address, nothing else identifies it.
+///
+/// The pipe is named after the mailbox's LogId, so cursors persist across
+/// reconnects and catch-up stays incremental.
+///
+/// Returns as soon as the actor holds the pipe; the WebSocket handshake,
+/// the session traffic, and the bridge itself all run on a background
+/// thread for the life of the process.
+pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) -> io::Result<PipeId> {
+    let (actor_end, transport_end) = pipe(64);
+    let pipe_id = futures::executor::block_on(
+        peer.connect(format!("mailbox-{mailbox}"), actor_end),
+    )
+    .map_err(io::Error::other)?;
+    futures::executor::block_on(peer.follow(mailbox, pipe_id)).map_err(io::Error::other)?;
+
+    let url = relay_url.to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build websocket runtime");
+        runtime.block_on(async move {
+            let (ws, _) = match tokio_tungstenite::connect_async(&url).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    eprintln!("mailbox {mailbox}: connect to {url} failed: {e}");
+                    return;
+                }
+            };
+            let (mut ws_write, mut ws_read) = ws.split();
+            use tokio_tungstenite::tungstenite::Message;
+            if ws_write
+                .send(Message::Binary(mailbox.0.to_vec()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let mut transport_tx = transport_end.tx;
+            let mut transport_rx = transport_end.rx;
+
+            let reader = async move {
+                while let Some(msg) = ws_read.next().await {
+                    let Ok(Message::Binary(bytes)) = msg else { break };
+                    let Ok(decoded) = bincode::deserialize::<vouch_core::PipeMsg>(&bytes) else {
+                        continue; // garbage frame: drop it, the session retries
+                    };
+                    if transport_tx.send(decoded).await.is_err() {
+                        break; // actor gone
+                    }
+                }
+            };
+            let writer = async move {
+                while let Some(msg) = transport_rx.next().await {
+                    let bytes = bincode::serialize(&msg).expect("encode PipeMsg");
+                    if ws_write.send(Message::Binary(bytes)).await.is_err() {
+                        break; // relay hung up
+                    }
+                }
+            };
+            futures::join!(reader, writer);
+        });
+    });
+
+    Ok(pipe_id)
+}
+
 pub fn connect_relay(
     peer: &Peer,
     relay_addr: &str,

@@ -8,3 +8,5 @@ description = "A socket transport for vouch-core's Peer: bridges a PipeEnd to a 
 vouch-core = { path = "../vouch-core", features = ["wire"] }
 futures = "0.3"
 bincode = "1"
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio-tungstenite = "0.24"

@@ -1,17 +1,28 @@
 //! A headless `Peer` process for exercising real sync over a real
-//! transport (a TCP connection through `vouch-relay`, or directly between
-//! two nodes). This is a test/dev harness, not the app — it proves the
-//! `PeerActor` + `PipeEnd` machinery converges two independent databases
-//! over an actual socket, the way `main.rs`'s in-process `pipe()` proves it
-//! converges two actors in a test.
+//! transport. This is a test/dev harness, not the app — it proves the
+//! `PeerActor` + `PipeEnd` machinery converges independent databases over
+//! actual sockets, the way vouch-core's tests prove it over in-process
+//! pipes.
+//!
+//! Two transports, either or both:
+//! - `VOUCH_RELAY_ADDR`: the dumb TCP pairing relay (`vouch-relay`) — dial,
+//!   swap LogIds, talk to whoever's on the other end.
+//! - `VOUCH_MAILBOX_URL`: a `vouch-relay-server` WebSocket URL
+//!   (`ws://host:port`). The node connects to its OWN log's mailbox there
+//!   (publishing is following your own log somewhere), and to one mailbox
+//!   per `VOUCH_FOLLOW` entry (comma-separated 64-hex LogIds) to
+//!   subscribe. Store-and-forward: neither side needs to be online at the
+//!   same time, within the relay's retention window.
 //!
 //! Env vars:
 //! - `VOUCH_DATA_DIR` (required): where this node's identity + claims.db live.
-//! - `VOUCH_RELAY_ADDR` (required): the relay (or peer) to dial, e.g. `127.0.0.1:7777`.
+//! - `VOUCH_RELAY_ADDR` (optional): dumb TCP relay to dial, e.g. `127.0.0.1:7777`.
+//! - `VOUCH_MAILBOX_URL` (optional): relay server to publish through.
+//! - `VOUCH_FOLLOW` (optional): comma-separated hex LogIds to follow via the
+//!   mailbox server.
 //! - `VOUCH_NAME` (optional): a label for this node's own log lines.
-//! - `VOUCH_AUTO_FOLLOW` (optional, "1"/"true"): follow whatever log is on
-//!   the other end of the pipe as soon as the handshake completes. There is
-//!   no discovery yet, so this is the harness's stand-in for it.
+//! - `VOUCH_AUTO_FOLLOW` (optional, "1"/"true"): with `VOUCH_RELAY_ADDR`,
+//!   follow whatever log answers the TCP handshake.
 //! - `VOUCH_SEED_CLAIM` (optional): if set, mint one `rec` claim with this
 //!   text shortly after startup, so there's something to observe syncing.
 
@@ -52,7 +63,8 @@ fn now_ms() -> i64 {
 fn main() {
     let name = env_var("VOUCH_NAME").unwrap_or_else(|| "node".to_string());
     let dir = env_var("VOUCH_DATA_DIR").expect("VOUCH_DATA_DIR is required");
-    let relay_addr = env_var("VOUCH_RELAY_ADDR").expect("VOUCH_RELAY_ADDR is required");
+    let relay_addr = env_var("VOUCH_RELAY_ADDR");
+    let mailbox_url = env_var("VOUCH_MAILBOX_URL");
     let auto_follow = env_flag("VOUCH_AUTO_FOLLOW");
     let seed_claim = env_var("VOUCH_SEED_CLAIM");
 
@@ -65,12 +77,34 @@ fn main() {
 
     std::thread::spawn(move || futures::executor::block_on(actor.run()));
 
-    println!("[{name}] connecting to {relay_addr}");
-    let (remote_log, _pipe_id) =
-        vouch_transport::connect_relay(&peer, &relay_addr, auto_follow).expect("connect to relay");
-    println!("[{name}] remote log id: {remote_log}");
-    if auto_follow {
-        println!("[{name}] auto-following {remote_log}");
+    // Every log this node cares about, for the status line.
+    let mut watched: Vec<vouch_core::LogId> = Vec::new();
+
+    if let Some(addr) = &relay_addr {
+        println!("[{name}] connecting to TCP relay {addr}");
+        let (remote_log, _) = vouch_transport::connect_relay(&peer, addr, auto_follow)
+            .expect("connect to TCP relay");
+        println!("[{name}] remote log id: {remote_log}");
+        watched.push(remote_log);
+    }
+
+    if let Some(url) = &mailbox_url {
+        println!("[{name}] publishing to own mailbox at {url}");
+        vouch_transport::connect_mailbox(&peer, url, my_log).expect("connect to own mailbox");
+        for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
+            if hex.trim().is_empty() {
+                continue;
+            }
+            let log = vouch_transport::parse_log_id(hex)
+                .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"));
+            println!("[{name}] following {log} via its mailbox");
+            vouch_transport::connect_mailbox(&peer, url, log).expect("connect to friend mailbox");
+            watched.push(log);
+        }
+    }
+
+    if relay_addr.is_none() && mailbox_url.is_none() {
+        panic!("set VOUCH_RELAY_ADDR and/or VOUCH_MAILBOX_URL — a node with no transport syncs nothing");
     }
 
     if let Some(text) = seed_claim {
@@ -87,12 +121,10 @@ fn main() {
 
     loop {
         std::thread::sleep(Duration::from_secs(1));
+        let watched = watched.clone();
         let counts = futures::executor::block_on(peer.query(move |db| {
-            (
-                db.claims().len(),
-                db.claims().log_len(&my_log),
-                db.claims().log_len(&remote_log),
-            )
+            let theirs: u64 = watched.iter().map(|log| db.claims().log_len(log)).sum();
+            (db.claims().len(), db.claims().log_len(&my_log), theirs)
         }));
         if let Ok((total, mine, theirs)) = counts {
             println!("[{name}] total={total} mine={mine} theirs={theirs}");
