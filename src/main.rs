@@ -6,6 +6,7 @@ use vouch_core::{Database, Peer, PeerActor, ServePolicy, Writer};
 
 mod app;
 mod assets;
+mod auto_update;
 mod debug_feed;
 mod feed;
 mod follows;
@@ -94,6 +95,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let (peer, actor, data_dir) = build_peer();
+    // Self-update only makes sense for real installs; the module also
+    // no-ops for dev builds and non-.app binaries on its own.
+    if data_dir.is_some() {
+        auto_update::spawn();
+    }
     let title = match env_var("VOUCH_NAME") {
         Some(name) => format!("Vouch — {name}"),
         None => "Vouch".to_string(),
@@ -105,20 +111,6 @@ fn main() {
         load_vouch_theme(cx);
 
         cx.background_executor().spawn(actor.run()).detach();
-
-        // Connections are opt-in and dev-only for now: no discovery or UI
-        // to drive them yet, just env vars so instances can be pointed at
-        // each other (or at a mailbox relay).
-        if let Some(relay_addr) = env_var("VOUCH_RELAY_ADDR") {
-            let auto_follow = env_flag("VOUCH_AUTO_FOLLOW");
-            let peer_for_relay = peer.clone();
-            std::thread::spawn(move || {
-                match vouch_transport::connect_relay(&peer_for_relay, &relay_addr, auto_follow) {
-                    Ok((remote, _)) => eprintln!("connected to relay; remote log id: {remote}"),
-                    Err(e) => eprintln!("failed to connect to relay: {e}"),
-                }
-            });
-        }
 
         // The mailbox relay: durable installs default to the hosted one,
         // ephemeral (demo) instances only connect when told to. Your own

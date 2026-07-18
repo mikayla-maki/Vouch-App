@@ -4,25 +4,18 @@
 //! actual sockets, the way vouch-core's tests prove it over in-process
 //! pipes.
 //!
-//! Two transports, either or both:
-//! - `VOUCH_RELAY_ADDR`: the dumb TCP pairing relay (`vouch-relay`) — dial,
-//!   swap LogIds, talk to whoever's on the other end.
-//! - `VOUCH_MAILBOX_URL`: a `vouch-relay-server` WebSocket URL
-//!   (`ws://host:port`). The node connects to its OWN log's mailbox there
-//!   (publishing is following your own log somewhere), and to one mailbox
-//!   per `VOUCH_FOLLOW` entry (comma-separated 64-hex LogIds) to
-//!   subscribe. Store-and-forward: neither side needs to be online at the
-//!   same time, within the relay's retention window.
+//! Talks to a `vouch-relay-server` (`VOUCH_MAILBOX_URL`, ws:// or wss://):
+//! connects to its OWN log's mailbox there (publishing is following your
+//! own log somewhere), and to one mailbox per `VOUCH_FOLLOW` entry
+//! (comma-separated 64-hex LogIds) to subscribe. Store-and-forward:
+//! neither side needs to be online at the same moment, within the relay's
+//! retention window.
 //!
 //! Env vars:
 //! - `VOUCH_DATA_DIR` (required): where this node's identity + claims.db live.
-//! - `VOUCH_RELAY_ADDR` (optional): dumb TCP relay to dial, e.g. `127.0.0.1:7777`.
-//! - `VOUCH_MAILBOX_URL` (optional): relay server to publish through.
-//! - `VOUCH_FOLLOW` (optional): comma-separated hex LogIds to follow via the
-//!   mailbox server.
+//! - `VOUCH_MAILBOX_URL` (required): relay server to publish through.
+//! - `VOUCH_FOLLOW` (optional): comma-separated hex LogIds to follow.
 //! - `VOUCH_NAME` (optional): a label for this node's own log lines.
-//! - `VOUCH_AUTO_FOLLOW` (optional, "1"/"true"): with `VOUCH_RELAY_ADDR`,
-//!   follow whatever log answers the TCP handshake.
 //! - `VOUCH_SEED_CLAIM` (optional): if set, mint one `rec` claim with this
 //!   text shortly after startup, so there's something to observe syncing.
 
@@ -33,10 +26,6 @@ use vouch_core::{Draft, ServePolicy, Writer};
 
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
-}
-
-fn env_flag(name: &str) -> bool {
-    matches!(env_var(name).as_deref(), Some("1") | Some("true"))
 }
 
 fn load_or_create_writer(dir: &Path) -> Writer {
@@ -63,9 +52,7 @@ fn now_ms() -> i64 {
 fn main() {
     let name = env_var("VOUCH_NAME").unwrap_or_else(|| "node".to_string());
     let dir = env_var("VOUCH_DATA_DIR").expect("VOUCH_DATA_DIR is required");
-    let relay_addr = env_var("VOUCH_RELAY_ADDR");
-    let mailbox_url = env_var("VOUCH_MAILBOX_URL");
-    let auto_follow = env_flag("VOUCH_AUTO_FOLLOW");
+    let url = env_var("VOUCH_MAILBOX_URL").expect("VOUCH_MAILBOX_URL is required");
     let seed_claim = env_var("VOUCH_SEED_CLAIM");
 
     let dir = Path::new(&dir);
@@ -77,34 +64,19 @@ fn main() {
 
     std::thread::spawn(move || futures::executor::block_on(actor.run()));
 
-    // Every log this node cares about, for the status line.
+    println!("[{name}] publishing to own mailbox at {url}");
+    vouch_transport::connect_mailbox(&peer, &url, my_log);
+
     let mut watched: Vec<vouch_core::LogId> = Vec::new();
-
-    if let Some(addr) = &relay_addr {
-        println!("[{name}] connecting to TCP relay {addr}");
-        let (remote_log, _) = vouch_transport::connect_relay(&peer, addr, auto_follow)
-            .expect("connect to TCP relay");
-        println!("[{name}] remote log id: {remote_log}");
-        watched.push(remote_log);
-    }
-
-    if let Some(url) = &mailbox_url {
-        println!("[{name}] publishing to own mailbox at {url}");
-        vouch_transport::connect_mailbox(&peer, url, my_log);
-        for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
-            if hex.trim().is_empty() {
-                continue;
-            }
-            let log = vouch_transport::parse_log_id(hex)
-                .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"));
-            println!("[{name}] following {log} via its mailbox");
-            vouch_transport::connect_mailbox(&peer, url, log);
-            watched.push(log);
+    for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
+        if hex.trim().is_empty() {
+            continue;
         }
-    }
-
-    if relay_addr.is_none() && mailbox_url.is_none() {
-        panic!("set VOUCH_RELAY_ADDR and/or VOUCH_MAILBOX_URL — a node with no transport syncs nothing");
+        let log = vouch_transport::parse_log_id(hex)
+            .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"));
+        println!("[{name}] following {log} via its mailbox");
+        vouch_transport::connect_mailbox(&peer, &url, log);
+        watched.push(log);
     }
 
     if let Some(text) = seed_claim {

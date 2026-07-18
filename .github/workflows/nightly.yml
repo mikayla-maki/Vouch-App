@@ -1,0 +1,48 @@
+# Nightly builds: bundle the app and replace the rolling `nightly`
+# prerelease. The in-app updater polls this release's body for the
+# `stamp:` line and updates itself when it's newer than its own baked-in
+# VOUCH_BUILD_STAMP.
+#
+# Unsigned until these repo secrets exist (Settings → Secrets → Actions):
+#   MACOS_CERTIFICATE            base64 of the Developer ID Application .p12
+#   MACOS_CERTIFICATE_PASSWORD   the .p12's password
+#   APPLE_NOTARIZATION_APPLE_ID  your Apple ID email
+#   APPLE_NOTARIZATION_TEAM_ID   the 10-char team id
+#   APPLE_NOTARIZATION_PASSWORD  an app-specific password (appleid.apple.com)
+# Once set, builds are Developer-ID signed + notarized automatically.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # ~1am Pacific
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  nightly:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Bundle
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARIZATION_APPLE_ID: ${{ secrets.APPLE_NOTARIZATION_APPLE_ID }}
+          APPLE_NOTARIZATION_TEAM_ID: ${{ secrets.APPLE_NOTARIZATION_TEAM_ID }}
+          APPLE_NOTARIZATION_PASSWORD: ${{ secrets.APPLE_NOTARIZATION_PASSWORD }}
+        run: |
+          export VOUCH_BUILD_STAMP="$(date -u +%Y%m%d%H%M%S)"
+          echo "VOUCH_BUILD_STAMP=$VOUCH_BUILD_STAMP" >> "$GITHUB_ENV"
+          ./scripts/bundle-mac.sh
+      - name: Publish rolling nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly target/release/Vouch.zip \
+            --prerelease \
+            --title "Nightly $VOUCH_BUILD_STAMP" \
+            --notes "stamp: $VOUCH_BUILD_STAMP"

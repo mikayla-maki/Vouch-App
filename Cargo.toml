@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vouch-core", "crates/vouch-store", "crates/vouch-relay", "crates/vouch-node", "crates/vouch-transport", "crates/vouch-relay-server"]
+members = ["crates/vouch-core", "crates/vouch-store", "crates/vouch-node", "crates/vouch-transport", "crates/vouch-relay-server"]
 
 [package]
 name = "vouch"

@@ -7359,10 +7359,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vouch-relay"
-version = "0.1.0"
-
-[[package]]
 name = "vouch-relay-server"
 version = "0.1.0"
 dependencies = [

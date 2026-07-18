@@ -86,16 +86,10 @@ impl RenderOnce for WelcomeForm {
             .flex_col()
             .gap_4()
             .w_full()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        "Your account lives on this device — there's nothing to register. \
-                         Pick a name to suggest to people who follow you (they can always \
-                         rename you locally).",
-                    ),
-            )
+            .child(div().text_sm().text_color(theme.muted_foreground).child(
+                "Your account lives on this device — there's nothing to register. \
+                         Pick a name to suggest to people who follow you.",
+            ))
             .child(
                 div()
                     .flex()
