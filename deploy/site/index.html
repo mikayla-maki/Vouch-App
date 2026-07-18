@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vouch</title>
+<style>
+  :root {
+    --bg: #fdf7f9;
+    --fg: #2a2228;
+    --muted: #8a7a84;
+    --accent: #d16a94;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c161a;
+      --fg: #f0e8ed;
+      --muted: #9a8a94;
+      --accent: #e087ac;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+  }
+  main { max-width: 34rem; }
+  h1 {
+    font-size: 3rem;
+    letter-spacing: -0.02em;
+    color: var(--accent);
+  }
+  p { margin-top: 1rem; line-height: 1.6; }
+  .tagline { font-size: 1.25rem; }
+  .quiet { color: var(--muted); font-size: 0.95rem; }
+  code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.85em;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Vouch</h1>
+  <p class="tagline">Recommendations from people you actually trust.</p>
+  <p>
+    Vouch is a local-first app for sharing what's good — restaurants,
+    books, people, anything worth vouching for — along real trust lines.
+    Your words live on your devices, signed by you, shared only with the
+    people you choose. No feeds, no ads, no algorithm deciding what you
+    see.
+  </p>
+  <p class="quiet">
+    Early days. This server is a relay: it holds signed, end-attributed
+    claims for about a week so friends can sync without being online at
+    the same moment, then lets them go. If you're connecting an app,
+    you're already in the right place — this domain is the relay
+    (<code>wss://</code>) too.
+  </p>
+</main>
+</body>
+</html>

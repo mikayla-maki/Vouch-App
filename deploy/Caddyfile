@@ -1,6 +1,13 @@
-# TLS termination for the relay: clients speak wss://<domain>, Caddy
-# proxies plain ws to the relay container. WebSocket upgrade is handled
-# automatically; certificates come from Let's Encrypt, also automatically.
+# One domain, two jobs: WebSocket upgrades go to the relay, everything
+# else is the static site. Certificates come from Let's Encrypt,
+# automatically; the only configuration is the domain (from .env).
 {$VOUCH_RELAY_DOMAIN}
 
-reverse_proxy relay:9443
+@websocket {
+	header Connection *Upgrade*
+	header Upgrade websocket
+}
+reverse_proxy @websocket relay:9443
+
+root * /srv/site
+file_server

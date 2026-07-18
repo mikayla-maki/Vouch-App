@@ -20,11 +20,14 @@ docker build --platform linux/amd64 -f Dockerfile-relay -t vouch-relay-server .
 echo "==> shipping image to ${HOST}"
 docker save vouch-relay-server | gzip | ssh "$HOST" "docker load"
 
-echo "==> syncing compose files"
-ssh "$HOST" "mkdir -p ${REMOTE_DIR}"
+echo "==> syncing compose files and site"
+ssh "$HOST" "mkdir -p ${REMOTE_DIR}/site"
 scp deploy/compose.yml deploy/Caddyfile "$HOST":"${REMOTE_DIR}/"
+scp -r deploy/site/* "$HOST":"${REMOTE_DIR}/site/"
 
 echo "==> restarting"
-ssh "$HOST" "cd ${REMOTE_DIR} && docker compose up -d && docker compose ps"
+# `up -d` recreates what changed; the explicit caddy restart picks up
+# Caddyfile/site edits, which are bind mounts compose doesn't track.
+ssh "$HOST" "cd ${REMOTE_DIR} && docker compose up -d && docker compose restart caddy && docker compose ps"
 
 echo "==> deployed"

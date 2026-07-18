@@ -37,6 +37,14 @@ still applies (`VOUCH_RELAY_RETENTION_DAYS`, default 7 — set it in
 On Apple Silicon the amd64 build runs under Docker Desktop's Rosetta
 virtualization — slower than native, but a few minutes, not tens.
 
+## The website
+
+The same domain serves a static site: Caddy routes WebSocket upgrades to
+the relay and everything else to `deploy/site/` (synced on every deploy,
+served from `~/vouch-relay/site` on the host). So `https://<domain>` is
+the homepage and `wss://<domain>` is the relay — one droplet, one cert,
+one address to tell people. Edit `deploy/site/index.html` and redeploy.
+
 ## Pointing clients at it
 
 ```sh

@@ -5,6 +5,8 @@
 # Disk layout on the host, all under this directory:
 #   ./data   — the relay's mailboxes (one subdir of SQLite files per LogId)
 #   ./caddy  — Caddy's certs and ACME state (losing it just re-issues)
+#   ./site   — the static website, served for anything that isn't a
+#              WebSocket upgrade (see Caddyfile)
 
 services:
   relay:
@@ -24,3 +26,4 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy:/data
+      - ./site:/srv/site:ro
