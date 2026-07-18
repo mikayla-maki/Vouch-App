@@ -1,17 +1,21 @@
-use crate::ui::format::{TimeStyle, format_relative_time, truncate};
+use crate::ui::format::{TimeStyle, attribution, format_relative_time, truncate};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::theme::Theme;
+use std::collections::BTreeMap;
 use std::time::{Duration, UNIX_EPOCH};
 use vouch_core::{LogId, Recommendation};
 
 pub struct RecordCard;
 
 impl RecordCard {
-    fn format_attribution(rec: &Recommendation, local_log_id: Option<LogId>) -> String {
+    fn format_attribution(
+        rec: &Recommendation,
+        local_log_id: Option<LogId>,
+        names: &BTreeMap<LogId, String>,
+    ) -> String {
         match rec.author() {
-            Some(author) if Some(author) == local_log_id => "by you".to_string(),
-            Some(author) => format!("by {}", author.short()),
+            Some(author) => format!("by {}", attribution(author, local_log_id, names)),
             None => "by someone".to_string(),
         }
     }
@@ -20,6 +24,7 @@ impl RecordCard {
         rec: &Recommendation,
         is_selected: bool,
         local_log_id: Option<LogId>,
+        names: &BTreeMap<LogId, String>,
         theme: &Theme,
     ) -> impl IntoElement {
         let background = if is_selected {
@@ -30,7 +35,7 @@ impl RecordCard {
 
         let subject_name = rec.subject.clone();
         let content_preview = truncate(&rec.body, 80);
-        let attribution = Self::format_attribution(rec, local_log_id);
+        let attribution = Self::format_attribution(rec, local_log_id, names);
         let timestamp = format_relative_time(
             UNIX_EPOCH + Duration::from_millis(rec.at_ms().max(0) as u64),
             TimeStyle::Compact,

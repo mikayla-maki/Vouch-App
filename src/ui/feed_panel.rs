@@ -76,7 +76,9 @@ impl FeedPanel {
 
     fn render_feed_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut cards: Vec<Stateful<Div>> = Vec::new();
-        let recs = self.feed.read(cx).recs();
+        let feed = self.feed.read(cx);
+        let recs = feed.recs();
+        let names = feed.names();
 
         for hash in &self.filtered_hashes {
             let Some(rec) = recs.iter().find(|r| r.id == *hash) else {
@@ -97,6 +99,7 @@ impl FeedPanel {
                     rec,
                     is_selected,
                     self.local_log_id,
+                    names,
                     cx.theme(),
                 ));
 

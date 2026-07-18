@@ -8,6 +8,7 @@ mod app;
 mod assets;
 mod debug_feed;
 mod feed;
+mod follows;
 mod identity;
 mod theme;
 mod ui;
@@ -25,12 +26,18 @@ fn env_flag(name: &str) -> bool {
     matches!(env_var(name).as_deref(), Some("1") | Some("true"))
 }
 
-/// The normal path opens a durable `Peer` in the OS app-support directory.
+/// The relay every durable install talks to unless told otherwise: the
+/// hosted mailbox server. Ephemeral (demo) instances never default to
+/// it — they'd pollute production with throwaway identities.
+const DEFAULT_MAILBOX_URL: &str = "wss://vouch-app.online";
+
+/// The normal path opens a durable `Peer` in the OS app-support directory
+/// (returned so follows can persist next to identity.key).
 /// `VOUCH_EPHEMERAL=1` instead builds one entirely in memory — an
 /// identity, a database, and cursors that live only for this process —
 /// for running throwaway instances side by side (demos, sync testing)
 /// without leaving files behind or colliding with a real install.
-fn build_peer() -> (Peer, PeerActor) {
+fn build_peer() -> (Peer, PeerActor, Option<std::path::PathBuf>) {
     if env_flag("VOUCH_EPHEMERAL") {
         let writer = Writer::generate().expect("generate an ephemeral identity");
         let db = Database::new();
@@ -43,18 +50,21 @@ fn build_peer() -> (Peer, PeerActor) {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0)
         };
-        Peer::new(
+        let (peer, actor) = Peer::new(
             db,
             state,
             InstanceId(instance_bytes),
             Some(writer),
             ServePolicy::Owned,
             clock,
-        )
+        );
+        (peer, actor, None)
     } else {
         let dir = identity::app_dir();
         let writer = identity::load_or_create_writer(&dir);
-        vouch_store::open_peer(&dir, Some(writer), ServePolicy::Owned).expect("open local database")
+        let (peer, actor) = vouch_store::open_peer(&dir, Some(writer), ServePolicy::Owned)
+            .expect("open local database");
+        (peer, actor, Some(dir))
     }
 }
 
@@ -83,7 +93,7 @@ fn load_vouch_theme(cx: &mut App) {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let (peer, actor) = build_peer();
+    let (peer, actor, data_dir) = build_peer();
     let title = match env_var("VOUCH_NAME") {
         Some(name) => format!("Vouch — {name}"),
         None => "Vouch".to_string(),
@@ -110,29 +120,35 @@ fn main() {
             });
         }
 
-        // A vouch-relay-server: publish through your own mailbox, follow
-        // friends through theirs (VOUCH_FOLLOW: comma-separated hex
-        // LogIds). Store-and-forward — nobody has to be online together.
-        if let Some(url) = env_var("VOUCH_MAILBOX_URL") {
+        // The mailbox relay: durable installs default to the hosted one,
+        // ephemeral (demo) instances only connect when told to. Your own
+        // mailbox is how you publish; follows connect to friends' — the
+        // stored list plus any VOUCH_FOLLOW extras, all handled by the
+        // Follows entity inside the app.
+        let mailbox_url = env_var("VOUCH_MAILBOX_URL")
+            .or_else(|| data_dir.is_some().then(|| DEFAULT_MAILBOX_URL.to_string()));
+        if let Some(url) = &mailbox_url {
             let my_log = peer.id().expect("the app peer always holds a writer");
             eprintln!("my address: {my_log}");
-            if let Err(e) = vouch_transport::connect_mailbox(&peer, &url, my_log) {
-                eprintln!("failed to reach own mailbox: {e}");
-            }
-            for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
-                if hex.trim().is_empty() {
-                    continue;
-                }
-                match vouch_transport::parse_log_id(hex) {
-                    Some(log) => {
-                        if let Err(e) = vouch_transport::connect_mailbox(&peer, &url, log) {
-                            eprintln!("failed to reach {log}'s mailbox: {e}");
-                        }
-                    }
-                    None => eprintln!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"),
-                }
-            }
+            vouch_transport::connect_mailbox(&peer, url, my_log);
         }
+        let env_follows: Vec<vouch_core::LogId> = env_var("VOUCH_FOLLOW")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|hex| !hex.trim().is_empty())
+            .filter_map(|hex| {
+                let parsed = vouch_transport::parse_log_id(hex);
+                if parsed.is_none() {
+                    eprintln!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}");
+                }
+                parsed
+            })
+            .collect();
+        let bootstrap = app::Bootstrap {
+            mailbox_url,
+            follows_path: data_dir.as_ref().map(|d| d.join("follows.json")),
+            env_follows,
+        };
 
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -164,7 +180,7 @@ fn main() {
                 ..Default::default()
             },
             move |window, cx| {
-                let view = cx.new(|cx| VouchApp::new(peer.clone(), window, cx));
+                let view = cx.new(|cx| VouchApp::new(peer.clone(), bootstrap.clone(), window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )

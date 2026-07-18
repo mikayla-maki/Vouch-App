@@ -12,6 +12,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use vouch_core::{LogId, Peer, PipeId, pipe};
@@ -57,26 +58,21 @@ pub fn parse_log_id(hex: &str) -> Option<LogId> {
 }
 
 /// Dial one mailbox on a `vouch-relay-server` over WebSocket and follow
-/// `mailbox` through it. The same call covers both directions of the
-/// relay's contract: pointed at your *own* log's mailbox it publishes
-/// (following your own log somewhere is how you publish there); pointed
-/// at a friend's it subscribes. One connection per mailbox — the LogId
-/// is the address, nothing else identifies it.
+/// `mailbox` through it, forever: on connection loss the bridge backs
+/// off, reconnects, and re-follows — a laptop waking from sleep resumes
+/// syncing without a restart. The same call covers both directions of
+/// the relay's contract: pointed at your *own* log's mailbox it
+/// publishes (following your own log somewhere is how you publish
+/// there); pointed at a friend's it subscribes. One connection per
+/// mailbox — the LogId is the address, nothing else identifies it.
 ///
-/// The pipe is named after the mailbox's LogId, so cursors persist across
-/// reconnects and catch-up stays incremental.
-///
-/// Returns as soon as the actor holds the pipe; the WebSocket handshake,
-/// the session traffic, and the bridge itself all run on a background
-/// thread for the life of the process.
-pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) -> io::Result<PipeId> {
-    let (actor_end, transport_end) = pipe(64);
-    let pipe_id = futures::executor::block_on(
-        peer.connect(format!("mailbox-{mailbox}"), actor_end),
-    )
-    .map_err(io::Error::other)?;
-    futures::executor::block_on(peer.follow(mailbox, pipe_id)).map_err(io::Error::other)?;
-
+/// Each attempt registers a fresh pipe named after the mailbox's LogId;
+/// cursors are keyed by that stable name, so catch-up after a reconnect
+/// stays incremental. The whole bridge lives on a background thread for
+/// the life of the process — connection errors are printed, never
+/// returned, because there is no moment where they're final.
+pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) {
+    let peer = peer.clone();
     let url = relay_url.to_string();
     std::thread::spawn(move || {
         // Pick rustls's crypto backend explicitly, once: with both ring
@@ -90,51 +86,80 @@ pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) -> io::Resu
             .enable_all()
             .build()
             .expect("build websocket runtime");
-        runtime.block_on(async move {
-            let (ws, _) = match tokio_tungstenite::connect_async(&url).await {
-                Ok(ok) => ok,
-                Err(e) => {
-                    eprintln!("mailbox {mailbox}: connect to {url} failed: {e}");
-                    return;
-                }
+
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let (actor_end, transport_end) = pipe(64);
+            let Ok(pipe_id) =
+                futures::executor::block_on(peer.connect(format!("mailbox-{mailbox}"), actor_end))
+            else {
+                return; // peer actor gone: the app is shutting down
             };
-            let (mut ws_write, mut ws_read) = ws.split();
-            use tokio_tungstenite::tungstenite::Message;
-            if ws_write
-                .send(Message::Binary(mailbox.0.to_vec()))
-                .await
-                .is_err()
-            {
+            if futures::executor::block_on(peer.follow(mailbox, pipe_id)).is_err() {
                 return;
             }
 
-            let mut transport_tx = transport_end.tx;
-            let mut transport_rx = transport_end.rx;
+            let started = Instant::now();
+            runtime.block_on(bridge_once(&url, mailbox, transport_end));
+            let _ = futures::executor::block_on(peer.disconnect(pipe_id));
 
-            let reader = async move {
-                while let Some(msg) = ws_read.next().await {
-                    let Ok(Message::Binary(bytes)) = msg else { break };
-                    let Ok(decoded) = bincode::deserialize::<vouch_core::PipeMsg>(&bytes) else {
-                        continue; // garbage frame: drop it, the session retries
-                    };
-                    if transport_tx.send(decoded).await.is_err() {
-                        break; // actor gone
-                    }
-                }
-            };
-            let writer = async move {
-                while let Some(msg) = transport_rx.next().await {
-                    let bytes = bincode::serialize(&msg).expect("encode PipeMsg");
-                    if ws_write.send(Message::Binary(bytes)).await.is_err() {
-                        break; // relay hung up
-                    }
-                }
-            };
-            futures::join!(reader, writer);
-        });
+            // A session that held for a while earns a fresh start; rapid
+            // failures back off up to a minute.
+            if started.elapsed() > Duration::from_secs(60) {
+                backoff = Duration::from_secs(1);
+            } else {
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+            eprintln!("mailbox {mailbox}: connection ended, retrying in {backoff:?}");
+            std::thread::sleep(backoff);
+        }
     });
+}
 
-    Ok(pipe_id)
+/// One connection's lifetime: dial, handshake, move messages until
+/// either side ends. Returning (for any reason) means "reconnect".
+async fn bridge_once(url: &str, mailbox: LogId, transport_end: vouch_core::PipeEnd) {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (ws, _) = match tokio_tungstenite::connect_async(url).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            eprintln!("mailbox {mailbox}: connect to {url} failed: {e}");
+            return;
+        }
+    };
+    let (mut ws_write, mut ws_read) = ws.split();
+    if ws_write
+        .send(Message::Binary(mailbox.0.to_vec()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut transport_tx = transport_end.tx;
+    let mut transport_rx = transport_end.rx;
+
+    let reader = async move {
+        while let Some(msg) = ws_read.next().await {
+            let Ok(Message::Binary(bytes)) = msg else { break };
+            let Ok(decoded) = bincode::deserialize::<vouch_core::PipeMsg>(&bytes) else {
+                continue; // garbage frame: drop it, the session retries
+            };
+            if transport_tx.send(decoded).await.is_err() {
+                break; // actor gone
+            }
+        }
+    };
+    let writer = async move {
+        while let Some(msg) = transport_rx.next().await {
+            let bytes = bincode::serialize(&msg).expect("encode PipeMsg");
+            if ws_write.send(Message::Binary(bytes)).await.is_err() {
+                break; // relay hung up
+            }
+        }
+    };
+    futures::join!(reader, writer);
 }
 
 pub fn connect_relay(

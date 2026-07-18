@@ -90,7 +90,7 @@ fn main() {
 
     if let Some(url) = &mailbox_url {
         println!("[{name}] publishing to own mailbox at {url}");
-        vouch_transport::connect_mailbox(&peer, url, my_log).expect("connect to own mailbox");
+        vouch_transport::connect_mailbox(&peer, url, my_log);
         for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
             if hex.trim().is_empty() {
                 continue;
@@ -98,7 +98,7 @@ fn main() {
             let log = vouch_transport::parse_log_id(hex)
                 .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"));
             println!("[{name}] following {log} via its mailbox");
-            vouch_transport::connect_mailbox(&peer, url, log).expect("connect to friend mailbox");
+            vouch_transport::connect_mailbox(&peer, url, log);
             watched.push(log);
         }
     }

@@ -7,9 +7,11 @@
 //! is the materializer; this is just the GPUI-reactive wrapper around it,
 //! same shape as before.
 
+use std::collections::BTreeMap;
+
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, WeakEntity};
-use vouch_core::{Peer, Recommendation, StoredClaim};
+use vouch_core::{LogId, Peer, Recommendation, StoredClaim};
 
 fn accept_all(_: &StoredClaim) -> bool {
     true
@@ -18,6 +20,9 @@ fn accept_all(_: &StoredClaim) -> bool {
 pub struct Feed {
     peer: Peer,
     recs: Vec<Recommendation>,
+    /// Advertised display names, from each log's newest `profile` claim —
+    /// refreshed on the same firehose events as the recs.
+    names: BTreeMap<LogId, String>,
 }
 
 impl Feed {
@@ -39,12 +44,18 @@ impl Feed {
         Self {
             peer,
             recs: Vec::new(),
+            names: BTreeMap::new(),
         }
     }
 
     async fn reload(peer: &Peer, this: &WeakEntity<Self>, cx: &mut AsyncApp) {
-        let Ok(mut recs) = peer
-            .query(|db| vouch_core::rec::recommendations(db.claims(), &accept_all))
+        let Ok((mut recs, names)) = peer
+            .query(|db| {
+                (
+                    vouch_core::rec::recommendations(db.claims(), &accept_all),
+                    vouch_core::profile::names(db.claims()),
+                )
+            })
             .await
         else {
             return;
@@ -52,12 +63,17 @@ impl Feed {
         recs.sort_by_key(|r| std::cmp::Reverse(newest_at(r)));
         let _ = this.update(cx, |feed, cx| {
             feed.recs = recs;
+            feed.names = names;
             cx.notify();
         });
     }
 
     pub fn recs(&self) -> &[Recommendation] {
         &self.recs
+    }
+
+    pub fn names(&self) -> &BTreeMap<LogId, String> {
+        &self.names
     }
 
     pub fn peer(&self) -> &Peer {
@@ -151,6 +167,30 @@ mod tests {
         cx.run_until_parked();
 
         feed.read_with(cx, |feed, _| assert!(feed.recs().is_empty()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Advertised names ride the same reload as recs: a `profile` claim
+    /// lands and the name map updates without any explicit re-query.
+    #[gpui::test]
+    async fn feed_resolves_advertised_names(cx: &mut TestAppContext) {
+        let (peer, actor, dir) = open_test_peer(15);
+        cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
+
+        let feed = cx.new(|cx| Feed::new(peer.clone(), cx));
+        cx.run_until_parked();
+        feed.read_with(cx, |feed, _| assert!(feed.names().is_empty()));
+
+        peer.claim(Draft::new("profile").at(1).text("name", "Maya"))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let me = peer.id().unwrap();
+        feed.read_with(cx, |feed, _| {
+            assert_eq!(feed.names().get(&me).map(String::as_str), Some("Maya"));
+        });
 
         let _ = std::fs::remove_dir_all(&dir);
     }

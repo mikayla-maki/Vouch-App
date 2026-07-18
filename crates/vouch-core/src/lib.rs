@@ -58,6 +58,7 @@ pub mod error;
 pub mod fold;
 pub mod keys;
 pub mod peer;
+pub mod profile;
 pub mod rec;
 pub mod storage;
 pub mod store;

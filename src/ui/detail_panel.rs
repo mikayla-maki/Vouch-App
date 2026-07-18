@@ -1,10 +1,11 @@
-use crate::ui::format::{TimeStyle, format_relative_time};
+use crate::ui::format::{TimeStyle, attribution, format_relative_time};
 use crate::ui::modals::edit_recommendation::dominating_refs;
 use crate::ui::modals::{EditRecommendationModal, HistoryModal};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
 use gpui_component::theme::{ActiveTheme, Theme};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vouch_core::{Comment, Draft, LogId, Peer, Recommendation};
 
@@ -18,14 +19,21 @@ pub struct DetailPanel {
     selected: Option<Recommendation>,
     local_log_id: Option<LogId>,
     peer: Peer,
+    names: BTreeMap<LogId, String>,
 }
 
 impl DetailPanel {
-    pub fn new(selected: Option<Recommendation>, local_log_id: Option<LogId>, peer: Peer) -> Self {
+    pub fn new(
+        selected: Option<Recommendation>,
+        local_log_id: Option<LogId>,
+        peer: Peer,
+        names: BTreeMap<LogId, String>,
+    ) -> Self {
         Self {
             selected,
             local_log_id,
             peer,
+            names,
         }
     }
 
@@ -82,6 +90,7 @@ impl DetailPanel {
         is_own: bool,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
         theme: &Theme,
@@ -100,6 +109,7 @@ impl DetailPanel {
                 rec,
                 local_log_id,
                 peer,
+                names,
                 window,
                 cx,
                 theme,
@@ -193,6 +203,7 @@ impl DetailPanel {
         rec: &Recommendation,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
         theme: &Theme,
@@ -210,6 +221,7 @@ impl DetailPanel {
                 rec,
                 local_log_id,
                 peer,
+                names,
                 window,
                 cx,
                 theme,
@@ -276,6 +288,7 @@ impl DetailPanel {
         rec: &Recommendation,
         local_log_id: Option<LogId>,
         peer: &Peer,
+        names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
         theme: &Theme,
@@ -297,7 +310,7 @@ impl DetailPanel {
 
         let mut items: Vec<Div> = Vec::new();
         for comment in &comments {
-            items.push(Self::render_comment(comment, local_log_id, theme));
+            items.push(Self::render_comment(comment, local_log_id, names, theme));
         }
 
         div()
@@ -349,12 +362,13 @@ impl DetailPanel {
             .child(Self::render_comment_composer(rec, peer, &comment_state, theme))
     }
 
-    fn render_comment(comment: &Comment, local_log_id: Option<LogId>, theme: &Theme) -> Div {
-        let author = if local_log_id == Some(comment.author) {
-            "you".to_string()
-        } else {
-            comment.author.short()
-        };
+    fn render_comment(
+        comment: &Comment,
+        local_log_id: Option<LogId>,
+        names: &BTreeMap<LogId, String>,
+        theme: &Theme,
+    ) -> Div {
+        let author = attribution(comment.author, local_log_id, names);
         let when = format_relative_time(
             UNIX_EPOCH + Duration::from_millis(comment.at.max(0) as u64),
             TimeStyle::Compact,
@@ -615,6 +629,7 @@ impl RenderOnce for DetailPanel {
                     is_own,
                     self.local_log_id,
                     &self.peer,
+                    &self.names,
                     window,
                     cx,
                     &theme,

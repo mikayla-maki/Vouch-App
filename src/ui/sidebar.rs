@@ -3,18 +3,24 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::theme::{ActiveTheme, Theme};
 use gpui_component::{Icon, IconName};
+use vouch_core::LogId;
 
-// Filters (All/Mine/Friends) and a followed-peers list belong here once the
-// engine exposes them: "Mine" needs `Peer::authored()`, "Friends" needs a
-// public followed-logs query with resolved names (petname via `same-as`
-// entity claims), neither of which exist yet.
+// Filters (All/Mine/Friends) belong here once the engine exposes them:
+// "Mine" needs `Peer::authored()`; petname overrides for the follows list
+// are a designed-but-unbuilt concept.
 
 #[derive(IntoElement)]
 pub struct Sidebar {
     is_collapsed: bool,
     debug_active: bool,
+    /// (advertised name if any, full hex address) for the local writer.
+    own_name: Option<String>,
+    own_address: Option<String>,
+    /// Everyone followed, with their advertised names where known.
+    follows: Vec<(LogId, Option<String>)>,
     on_toggle: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_debug: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_add_follow: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl Sidebar {
@@ -22,13 +28,40 @@ impl Sidebar {
         Self {
             is_collapsed: false,
             debug_active: false,
+            own_name: None,
+            own_address: None,
+            follows: Vec::new(),
             on_toggle: None,
             on_debug: None,
+            on_add_follow: None,
         }
     }
 
     pub fn collapsed(mut self, collapsed: bool) -> Self {
         self.is_collapsed = collapsed;
+        self
+    }
+
+    /// The local writer's advertised name and full hex address.
+    pub fn identity(mut self, name: Option<String>, address: Option<String>) -> Self {
+        self.own_name = name;
+        self.own_address = address;
+        self
+    }
+
+    /// Everyone followed, with advertised names where their profile
+    /// claims have synced in.
+    pub fn follows(mut self, follows: Vec<(LogId, Option<String>)>) -> Self {
+        self.follows = follows;
+        self
+    }
+
+    /// Open the follow-someone dialog.
+    pub fn on_add_follow(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_add_follow = Some(Box::new(handler));
         self
     }
 
@@ -110,6 +143,152 @@ impl Sidebar {
             });
         }
         btn
+    }
+
+    /// The "You" block: advertised name, short address, one-click copy of
+    /// the full address (the thing you text a friend).
+    fn render_identity(
+        own_name: Option<String>,
+        own_address: Option<String>,
+        theme: &Theme,
+    ) -> Div {
+        let Some(address) = own_address else {
+            return div();
+        };
+        let short = format!("{}…", &address[..8.min(address.len())]);
+        let display_name = own_name.unwrap_or_else(|| "You".to_string());
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("YOU"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(display_name),
+            )
+            .child(
+                div()
+                    .id("copy-own-address")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .rounded_md()
+                    .hover(|style| style.bg(theme.list_hover))
+                    .on_click(move |_, _window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(address.clone()));
+                    })
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(short),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.primary_hover)
+                            .child("copy address"),
+                    ),
+            )
+    }
+
+    /// The people you follow, advertised names first, hash prefixes for
+    /// the not-yet-named — plus the button that adds someone new.
+    fn render_follows(
+        follows: Vec<(LogId, Option<String>)>,
+        theme: &Theme,
+        on_add_follow: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    ) -> Div {
+        let count = follows.len();
+        let mut rows: Vec<Div> = Vec::new();
+        for (log, name) in follows {
+            let (label, sub) = match name {
+                Some(name) => (name, log.short()),
+                None => (log.short(), String::new()),
+            };
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.foreground)
+                            .child(label),
+                    )
+                    .when(!sub.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .font_family("monospace")
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(sub),
+                        )
+                    }),
+            );
+        }
+
+        let mut add_btn = div()
+            .id("add-follow-btn")
+            .mx_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.list_hover))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.primary_hover)
+                    .child("+ Follow someone"),
+            );
+        if let Some(on_add_follow) = on_add_follow {
+            add_btn = add_btn.on_click(move |event, window, cx| {
+                on_add_follow(event, window, cx);
+            });
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .mt_2()
+            .child(
+                div()
+                    .px_3()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child(format!("FOLLOWING ({count})")),
+            )
+            .when(count == 0, |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Nobody yet — ask a friend for their address."),
+                )
+            })
+            .children(rows)
+            .child(add_btn)
     }
 
     fn render_theme_switcher(theme: &Theme, is_dark: bool) -> Stateful<Div> {
@@ -255,8 +434,8 @@ impl RenderOnce for Sidebar {
             .flex()
             .flex_col()
             .h_full()
-            .w_40()
-            .min_w_40()
+            .w_56()
+            .min_w_56()
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
@@ -267,13 +446,25 @@ impl RenderOnce for Sidebar {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .p_2()
-                    .child(Self::render_debug_button(
+                    .py_2()
+                    .overflow_y_scroll()
+                    .child(Self::render_identity(
+                        self.own_name,
+                        self.own_address,
+                        &theme,
+                    ))
+                    .child(Self::render_follows(
+                        self.follows,
+                        &theme,
+                        self.on_add_follow,
+                    ))
+                    .child(div().flex_1())
+                    .child(div().px_2().child(Self::render_debug_button(
                         self.debug_active,
                         false,
                         &theme,
                         self.on_debug,
-                    )),
+                    ))),
             )
             .child(
                 div()

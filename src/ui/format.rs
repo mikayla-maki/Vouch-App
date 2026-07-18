@@ -1,6 +1,28 @@
 //! Shared text-formatting helpers used by multiple UI components.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
+
+use vouch_core::LogId;
+
+/// One consistent way to say who wrote something: "you" for the local
+/// writer; an advertised name with the hash prefix appended ("Maya
+/// (a1b2c3d4…)") when a profile claim supplies one — the suffix stays
+/// because names are self-asserted and two logs can both claim "Maya";
+/// the bare hash prefix otherwise.
+pub fn attribution(
+    author: LogId,
+    local: Option<LogId>,
+    names: &BTreeMap<LogId, String>,
+) -> String {
+    if Some(author) == local {
+        return "you".to_string();
+    }
+    match names.get(&author) {
+        Some(name) => format!("{name} ({})", author.short()),
+        None => author.short(),
+    }
+}
 
 /// Output style for [`format_relative_time`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
