@@ -96,9 +96,9 @@ fn main() {
 
         cx.background_executor().spawn(actor.run()).detach();
 
-        // A relay/direct connection is opt-in and dev-only for now: no
-        // discovery or UI to drive it yet, just env vars so two instances
-        // (or a headless vouch-node) can be pointed at each other.
+        // Connections are opt-in and dev-only for now: no discovery or UI
+        // to drive them yet, just env vars so instances can be pointed at
+        // each other (or at a mailbox relay).
         if let Some(relay_addr) = env_var("VOUCH_RELAY_ADDR") {
             let auto_follow = env_flag("VOUCH_AUTO_FOLLOW");
             let peer_for_relay = peer.clone();
@@ -108,6 +108,30 @@ fn main() {
                     Err(e) => eprintln!("failed to connect to relay: {e}"),
                 }
             });
+        }
+
+        // A vouch-relay-server: publish through your own mailbox, follow
+        // friends through theirs (VOUCH_FOLLOW: comma-separated hex
+        // LogIds). Store-and-forward — nobody has to be online together.
+        if let Some(url) = env_var("VOUCH_MAILBOX_URL") {
+            let my_log = peer.id().expect("the app peer always holds a writer");
+            eprintln!("my address: {my_log}");
+            if let Err(e) = vouch_transport::connect_mailbox(&peer, &url, my_log) {
+                eprintln!("failed to reach own mailbox: {e}");
+            }
+            for hex in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
+                if hex.trim().is_empty() {
+                    continue;
+                }
+                match vouch_transport::parse_log_id(hex) {
+                    Some(log) => {
+                        if let Err(e) = vouch_transport::connect_mailbox(&peer, &url, log) {
+                            eprintln!("failed to reach {log}'s mailbox: {e}");
+                        }
+                    }
+                    None => eprintln!("VOUCH_FOLLOW entry is not a 64-hex LogId: {hex}"),
+                }
+            }
         }
 
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
