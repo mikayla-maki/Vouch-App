@@ -32,7 +32,7 @@ impl Follows {
         path: Option<PathBuf>,
         extras: Vec<LogId>,
     ) -> Self {
-        let (list, path) = match path {
+        let (mut list, path) = match path {
             None => (Vec::new(), None),
             Some(p) if !p.exists() => (Vec::new(), Some(p)),
             Some(p) => match load(&p) {
@@ -48,12 +48,22 @@ impl Follows {
             },
         };
 
+        // You already follow yourself (that's how publishing works) —
+        // a stored self-follow is junk from an older build or a hand
+        // edit; drop it and persist the cleanup.
+        let before = list.len();
+        list.retain(|log| Some(*log) != peer.id());
+        let cleaned = list.len() != before;
+
         let mut this = Self {
             peer,
             mailbox_url,
             path,
             list,
         };
+        if cleaned {
+            this.save();
+        }
         for log in this.list.clone() {
             this.connect(log);
         }
@@ -76,9 +86,11 @@ impl Follows {
     }
 
     /// Follow a new address: connect its mailbox, persist, notify.
-    /// Returns false (and does nothing) if already followed.
+    /// Returns false (and does nothing) for an address already followed —
+    /// including your own, which you follow by construction (publishing
+    /// IS following your own log at the mailbox).
     pub fn add(&mut self, log: LogId, cx: &mut Context<Self>) -> bool {
-        if self.list.contains(&log) {
+        if Some(log) == self.peer.id() || self.list.contains(&log) {
             return false;
         }
         self.list.push(log);

@@ -35,14 +35,10 @@ impl AddFollowModal {
                 .on_ok(move |_, _window, cx| {
                     let text = address_state_clone.read(cx).text().to_string();
                     match vouch_transport::parse_log_id(&text) {
-                        Some(log) => {
-                            follows.update(cx, |follows, cx| {
-                                follows.add(log, cx);
-                            });
-                            true
-                        }
-                        // Not an address: keep the dialog open so the
-                        // paste can be fixed rather than silently lost.
+                        // Close only if the follow actually took — your own
+                        // address, a duplicate, or garbage all keep the
+                        // dialog open rather than silently vanishing.
+                        Some(log) => follows.update(cx, |follows, cx| follows.add(log, cx)),
                         None => false,
                     }
                 })
