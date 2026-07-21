@@ -31,7 +31,7 @@ impl DebugPanel {
     }
 
     fn render_row(&self, claim: &StoredClaim, theme: &Theme) -> impl IntoElement {
-        let id = claim.signed.id();
+        let id = claim.event.id();
         let author = claim.header.log_id;
         let by = match self.local_log_id {
             Some(me) if me == author => "you".to_string(),
@@ -249,7 +249,7 @@ fn fmt_scalar(value: &Value) -> String {
         Value::BlobRef(b) => {
             format!("⧉ blob {} ({} bytes, {})", b.hash.short(), b.size, b.mime)
         }
-        Value::Embed(e) => match e.verify() {
+        Value::Embed(e) => match e.check() {
             Ok(claim) => {
                 let ty = match &claim.body {
                     Some(Value::Map(m)) => match m.get("type") {
@@ -260,7 +260,7 @@ fn fmt_scalar(value: &Value) -> String {
                 };
                 format!("« embed {} type={ty} »", e.id().short())
             }
-            Err(_) => format!("« embed {} (unverifiable) »", e.id().short()),
+            Err(_) => format!("« embed {} (malformed) »", e.id().short()),
         },
         Value::Tagged(tag, inner) => format!("tag({tag}) {}", fmt_scalar(inner)),
         // Maps and arrays are handled by fmt_value; a nested one reaching here

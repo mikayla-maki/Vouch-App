@@ -94,7 +94,17 @@ impl RecordCard {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(timestamp),
-                            ),
+                            )
+                            // The tier, at a glance: deniable is unmarked;
+                            // the scroll means the shown words are attested.
+                            .when(rec.on_the_record(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.primary)
+                                        .child("📜 on the record"),
+                                )
+                            }),
                     ),
             )
     }

@@ -10,13 +10,15 @@
 //! backends carry no convergence logic.
 //!
 //! Authentication is deliberately not modeled here. A relay that restricts
-//! who may `Publish` or `PutBlob` (signature-challenge auth for log owners)
-//! enforces that *around* the protocol, at the transport layer; between
-//! mutually trusting peers every message is open. Nothing in the engine
-//! depends on the answer — published garbage fails verification at ingest,
-//! which is the real gate.
+//! who may `Publish` or `PutBlob` (the deniable key-possession handshake,
+//! see `e2ee::publish_proof`) enforces that *around* the protocol, at the
+//! transport layer; between mutually trusting peers every message is open.
+//! That transport gate plus the per-pipe log check in the session are the
+//! real gates now: ingest checks structure only, and claim authenticity is
+//! the *reader's* judgment (MAC tags verified at decrypt time, by
+//! key-holders — a store or relay has nothing to verify with, by design).
 
-use crate::{BlobHash, ClaimHash, LogId, SignedEvent};
+use crate::{BlobHash, ClaimHash, LogId, Event};
 
 /// One incarnation of a peer's arrival order. Cursors count positions in
 /// the peer's per-log arrival sequence, which is only meaningful while
@@ -59,13 +61,13 @@ pub enum Request {
     /// log, with a has-body bit ("have" means "have the body").
     Hashes { log: LogId },
     /// Reconciliation fetch: specific claims by id. Returns whatever the
-    /// responder holds — content or signed tombstone; bodies fill in on
+    /// responder holds — content or tombstone; bodies fill in on
     /// ingest.
     Claims { ids: Vec<ClaimHash> },
-    /// Push events to the peer. Idempotent: every event is verified and
-    /// deduplicated by the receiver's ingest, so redelivery and
-    /// multi-device overlap cost nothing.
-    Publish { events: Vec<SignedEvent> },
+    /// Push events to the peer. Idempotent: every event is structurally
+    /// checked and deduplicated by the receiver's ingest, so redelivery
+    /// and multi-device overlap cost nothing.
+    Publish { events: Vec<Event> },
     /// Blob bytes by hash — THE blob transfer. Media moves only when the
     /// wanting side asks: sessions never carry bytes, fingerprints never
     /// see them, and "non-syncing" is the default posture (fetch when the
@@ -103,7 +105,7 @@ pub enum Response {
         instance: InstanceId,
     },
     /// Answer to [`Request::Since`] and [`Request::Claims`].
-    Events { events: Vec<SignedEvent> },
+    Events { events: Vec<Event> },
     /// Answer to [`Request::Hashes`].
     Hashes { entries: Vec<(ClaimHash, bool)> },
     /// Answer to [`Request::Publish`] and [`Request::PutBlob`].
@@ -126,7 +128,8 @@ pub enum Response {
 /// stream) fans these out to subscribers when new claims land.
 ///
 /// It is an unsolicited `Status` with the events attached: the receiver
-/// ingests the events (safe blind — verification lives at ingest) and then
+/// ingests the events (safe blind — ingest checks structure, and readers
+/// judge authenticity at decrypt time) and then
 /// runs the same settle decision a session would, against the carried
 /// `(count, fingerprint, instance)`. Best case the claim is applied and
 /// the log fully settled with **zero round trips**; worst case the frame
@@ -143,7 +146,7 @@ pub struct Notify {
     /// The newly landed events, in the sender's arrival order. Bodies
     /// included; blobs are NOT — a pushed claim pinning media lands as
     /// content plus a want (push channels don't carry megabytes).
-    pub events: Vec<SignedEvent>,
+    pub events: Vec<Event>,
     /// The sender's claim count for the log, after ingesting `events`.
     pub count: u64,
     /// The sender's fingerprint for the log, after ingesting `events`.

@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 
 use vouch_core::e2ee::{self, Identity};
 use vouch_core::fold::ClaimView;
-use vouch_core::{ClaimRef, Database, Draft, SignedEvent, TimelineEntry, Value, Writer};
+use vouch_core::{ClaimRef, Database, Draft, Event, TimelineEntry, Value, Writer};
 
 fn accept_all(_: &ClaimView) -> bool {
     true
 }
 
-fn seal(db: &mut Database, seed: u8, draft: Draft) -> SignedEvent {
+fn seal(db: &mut Database, seed: u8, draft: Draft) -> Event {
     let id = Identity::from_seed([seed; 32]);
     let sealed = e2ee::seal_draft(&id.content_key(), &draft).unwrap();
     db.claim(&id.log_id(), sealed.body_value()).unwrap()

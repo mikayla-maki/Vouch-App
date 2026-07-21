@@ -7,6 +7,7 @@
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use vouch_core::e2ee::{self, Identity};
 use vouch_core::{LogId, Peer, pipe};
 
 /// Parse a `LogId` from the 64-hex-char form `Display` produces — the
@@ -28,17 +29,23 @@ pub fn parse_log_id(hex: &str) -> Option<LogId> {
 /// `mailbox` through it, forever: on connection loss the bridge backs
 /// off, reconnects, and re-follows — a laptop waking from sleep resumes
 /// syncing without a restart. The same call covers both directions of
-/// the relay's contract: pointed at your *own* log's mailbox it
-/// publishes (following your own log somewhere is how you publish
-/// there); pointed at a friend's it subscribes. One connection per
-/// mailbox — the LogId is the address, nothing else identifies it.
+/// the relay's contract: pointed at your *own* log's mailbox with
+/// `publish: Some(identity)` it authenticates the deniable
+/// key-possession handshake and publishes (following your own log
+/// somewhere is how you publish there); pointed at a friend's with
+/// `publish: None` it subscribes read-only. One connection per mailbox —
+/// the LogId is the address, nothing else identifies it.
+///
+/// The handshake never signs anything: the proof is a MAC under a
+/// DH-agreed secret (see [`e2ee::publish_proof`]), so the relay is
+/// convinced in the moment and holds evidence of nothing afterward.
 ///
 /// Each attempt registers a fresh pipe named after the mailbox's LogId;
 /// cursors are keyed by that stable name, so catch-up after a reconnect
 /// stays incremental. The whole bridge lives on a background thread for
 /// the life of the process — connection errors are printed, never
 /// returned, because there is no moment where they're final.
-pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) {
+pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId, publish: Option<Identity>) {
     let peer = peer.clone();
     let url = relay_url.to_string();
     std::thread::spawn(move || {
@@ -67,7 +74,7 @@ pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) {
             }
 
             let started = Instant::now();
-            runtime.block_on(bridge_once(&url, mailbox, transport_end));
+            runtime.block_on(bridge_once(&url, mailbox, publish.clone(), transport_end));
             let _ = futures::executor::block_on(peer.disconnect(pipe_id));
 
             // A session that held for a while earns a fresh start; rapid
@@ -83,9 +90,15 @@ pub fn connect_mailbox(peer: &Peer, relay_url: &str, mailbox: LogId) {
     });
 }
 
-/// One connection's lifetime: dial, handshake, move messages until
-/// either side ends. Returning (for any reason) means "reconnect".
-async fn bridge_once(url: &str, mailbox: LogId, transport_end: vouch_core::PipeEnd) {
+/// One connection's lifetime: dial, handshake (+ publish auth when this
+/// is our own mailbox), move messages until either side ends. Returning
+/// (for any reason) means "reconnect".
+async fn bridge_once(
+    url: &str,
+    mailbox: LogId,
+    publish: Option<Identity>,
+    transport_end: vouch_core::PipeEnd,
+) {
     use tokio_tungstenite::tungstenite::Message;
 
     let (ws, _) = match tokio_tungstenite::connect_async(url).await {
@@ -96,12 +109,32 @@ async fn bridge_once(url: &str, mailbox: LogId, transport_end: vouch_core::PipeE
         }
     };
     let (mut ws_write, mut ws_read) = ws.split();
-    if ws_write
-        .send(Message::Binary(mailbox.0.to_vec()))
-        .await
-        .is_err()
-    {
+    let mut hello = mailbox.0.to_vec();
+    if publish.is_some() {
+        hello.push(1); // publish intent: the server will challenge us
+    }
+    if ws_write.send(Message::Binary(hello)).await.is_err() {
         return;
+    }
+    if let Some(identity) = &publish {
+        // The server's challenge: its ephemeral X25519 public + a nonce.
+        let challenge = loop {
+            match ws_read.next().await {
+                Some(Ok(Message::Binary(bytes))) => break bytes,
+                Some(Ok(_)) => continue, // ping/pong
+                _ => return,
+            }
+        };
+        if challenge.len() != 48 {
+            eprintln!("mailbox {mailbox}: malformed publish challenge");
+            return;
+        }
+        let eph_pub: [u8; 32] = challenge[..32].try_into().expect("length checked");
+        let nonce: [u8; 16] = challenge[32..].try_into().expect("length checked");
+        let proof = e2ee::publish_proof(identity, &eph_pub, &nonce);
+        if ws_write.send(Message::Binary(proof.to_vec())).await.is_err() {
+            return;
+        }
     }
 
     let mut transport_tx = transport_end.tx;

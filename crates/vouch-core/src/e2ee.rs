@@ -3,12 +3,26 @@
 //! the grant.
 //!
 //! Everything here is *vocabulary*, not wire format. An encrypted claim
-//! is an ordinary signed claim whose body is the tiny envelope map
+//! is an ordinary MAC-tagged claim whose body is the tiny envelope map
 //! `{type: "enc", n: <nonce>, ct: <ciphertext>}` — sync, relays,
 //! fingerprints, and redaction never look inside a body, so nothing
 //! below this module changes. Granularity is the log: one log, one key,
 //! one audience. Want a different boundary? Mint a different log —
 //! there is deliberately no per-claim visibility state.
+//!
+//! **Speech is deniable by default.** The content key also derives the
+//! MAC key claims are tagged under ([`auth_key`]), so the audience that
+//! can read a claim is exactly the audience that can authenticate it —
+//! and none of them can prove authorship onward, because any of them
+//! could have forged the tag. Escalation is a choice: an [`attest`]
+//! claim (`Identity::attest`) carries the one Ed25519 signature in the
+//! system, sealed inside ciphertext until someone holding the plaintext
+//! discloses it — at which point strangers verify the author's exact
+//! words ([`verify_attest`]) with no key at all. Publishing to a relay
+//! authenticates the same deniable way ([`publish_proof`]): a DH
+//! handshake the relay can check but could equally have simulated.
+//!
+//! [`attest`]: Identity::attest
 //!
 //! There is no plaintext user content, full stop — profiles and names
 //! included (your name resolves for people holding your address, and
@@ -41,22 +55,40 @@ use std::fmt;
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey, Verifier};
+
 use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::cbor;
+use crate::claim::AuthKey;
 use crate::draft::Draft;
 use crate::fold::ClaimView;
 use crate::keys::LogId;
 use crate::store::ClaimStore;
-use crate::value::Value;
+use crate::value::{ClaimHash, ClaimRef, Value};
 
 /// The vocabulary type of an encrypted-body envelope.
 pub const ENC_TYPE: &str = "enc";
 
+/// The vocabulary type of an attestation — the going-on-the-record claim.
+/// Sealed and MAC'd like all speech: minting one shows only your audience
+/// you went on the record. Its `sig` payload is the one Ed25519 signature
+/// in the system, and it becomes evidence exactly when someone holding the
+/// plaintext chooses to show it around — disclosure is the escalation.
+pub const ATTEST_TYPE: &str = "attest";
+
 /// A log's symmetric content key.
 pub type ContentKey = [u8; 32];
+
+/// The MAC key claims are tagged under: derived from the content key, so
+/// holding the address IS holding it — the verify-audience is exactly the
+/// read-audience, and the deniability set is "everyone with this log's
+/// address." (Derived from `K`, not the seed, precisely so the address
+/// format didn't change.)
+pub fn auth_key(key: &ContentKey) -> AuthKey {
+    hkdf(key, &[b"vouch auth key v1"])
+}
 
 /// A shareable address: the LogId to follow plus the content key to
 /// read what you find there. The string form (`vouch:` + 128 hex) is
@@ -261,15 +293,24 @@ pub fn keys_for(identity: &Identity, follows: &[Address]) -> BTreeMap<LogId, Con
     keys
 }
 
-/// The fold's input: exactly the envelopes these keys open, and
-/// nothing else. There is no plaintext-content concept — user speech is
-/// always sealed on the wire, so an unencrypted claim is either engine
-/// vocabulary (`redact` — read by the machinery, not the fold)
-/// or noise, and neither belongs in the view. Ciphertext you lack the
-/// key for is likewise absent: not part of your perceptible truth.
+/// The fold's input: exactly the envelopes these keys open — decrypted
+/// AND authenticated — and nothing else. There is no plaintext-content
+/// concept — user speech is always sealed on the wire, so an unencrypted
+/// claim is either engine vocabulary (`redact` — read by the machinery,
+/// not the fold) or noise, and neither belongs in the view. Ciphertext
+/// you lack the key for is likewise absent: not part of your perceptible
+/// truth.
+///
+/// This is also where authenticity lives now: the header tag is checked
+/// here, under the auth key derived from the same content key that opens
+/// the envelope. Read time, not ingest — stores and relays are blind
+/// carriers and judge nothing. A claim whose tag fails is exactly as
+/// absent as one that won't decrypt.
 /// References are recomputed from the decrypted plaintext — a sealed
 /// claim's edges are invisible to ingest-time indexes by design.
 pub fn decrypted_view(store: &ClaimStore, keys: &BTreeMap<LogId, ContentKey>) -> Vec<ClaimView> {
+    let auth: BTreeMap<LogId, AuthKey> =
+        keys.iter().map(|(log, key)| (*log, auth_key(key))).collect();
     let mut view = Vec::new();
     for claim in store.timeline() {
         let Some(Value::Map(map)) = &claim.body else {
@@ -281,12 +322,15 @@ pub fn decrypted_view(store: &ClaimStore, keys: &BTreeMap<LogId, ContentKey>) ->
         let Some(key) = keys.get(&claim.header.log_id) else {
             continue; // ciphertext without a key: not part of this view
         };
+        if !claim.event.verify_tag(&auth[&claim.header.log_id]) {
+            continue; // unauthenticated bytes: not speech, not visible
+        }
         let Some(Value::Map(plain)) = decrypt_body(key, map) else {
             continue; // wrong key or tampered: nothing legible here
         };
         let (refs, _, _) = Value::Map(plain.clone()).collect_refs();
         view.push(ClaimView {
-            id: claim.signed.id(),
+            id: claim.event.id(),
             author: claim.header.log_id,
             received_at: claim.received_at,
             body: plain,
@@ -294,6 +338,155 @@ pub fn decrypted_view(store: &ClaimStore, keys: &BTreeMap<LogId, ContentKey>) ->
         });
     }
     view
+}
+
+/// One publish-auth challenge: a relay's ephemeral X25519 keypair plus a
+/// nonce. The relay holds the whole struct for the round trip and sends
+/// `public ‖ nonce` to the client; nothing here outlives the connection.
+pub struct PublishChallenge {
+    pub secret: [u8; 32],
+    pub public: [u8; 32],
+    pub nonce: [u8; 16],
+}
+
+/// Domain for the publish-auth session key derivation.
+const PUBLISH_AUTH_DOMAIN: &[u8] = b"vouch publish auth v1";
+
+/// Mint a fresh challenge (relay side, one per authenticating connection).
+pub fn publish_challenge() -> Result<PublishChallenge, crate::Error> {
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|_| crate::Error::Randomness)?;
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| crate::Error::Randomness)?;
+    let public = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret))
+        .as_bytes();
+    Ok(PublishChallenge {
+        secret,
+        public,
+        nonce,
+    })
+}
+
+/// The shared MAC key both ends of a publish handshake derive: the log's
+/// Ed25519 identity viewed through X25519, DH'd against the relay's
+/// ephemeral, bound to this exact challenge.
+fn publish_auth_secret(shared: &[u8], log: &LogId, eph_pub: &[u8; 32], nonce: &[u8; 16]) -> [u8; 32] {
+    hkdf(shared, &[PUBLISH_AUTH_DOMAIN, &log.0, eph_pub, nonce])
+}
+
+fn proof_mac(key: &[u8; 32]) -> hmac::Hmac<Sha256> {
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac<Sha256> as Mac>::new_from_slice(key).expect("any key length");
+    mac.update(b"vouch publish proof v1");
+    mac
+}
+
+/// Prove key possession for publishing (client side): answer the relay's
+/// challenge with a MAC under the DH-agreed secret.
+///
+/// **Deniable by construction.** The relay verifies by computing the same
+/// DH from its ephemeral secret — which means the relay could also have
+/// *minted* this proof itself. Its logs therefore prove nothing about who
+/// published; it could have simulated every transcript it holds. An
+/// eavesdropper (holding neither private key) can neither verify nor
+/// forge. This replaces per-claim signatures as the publish gate: same
+/// spam posture — you still can't publish into a mailbox without the
+/// log's key — zero persistent evidence of the speech act.
+pub fn publish_proof(identity: &Identity, eph_pub: &[u8; 32], nonce: &[u8; 16]) -> [u8; 32] {
+    use hmac::Mac;
+    let my_secret = x25519_dalek::StaticSecret::from(identity.signing.to_scalar_bytes());
+    let shared = my_secret.diffie_hellman(&x25519_dalek::PublicKey::from(*eph_pub));
+    let key = publish_auth_secret(shared.as_bytes(), &identity.log_id(), eph_pub, nonce);
+    proof_mac(&key).finalize().into_bytes().into()
+}
+
+/// Verify a publish proof (relay side): recompute the DH from the
+/// challenge's ephemeral secret and the log's public key. `false` for an
+/// invalid log id or a wrong proof.
+pub fn verify_publish_proof(log: LogId, challenge: &PublishChallenge, proof: &[u8; 32]) -> bool {
+    let Ok(ed) = log.verifying_key() else {
+        return false;
+    };
+    let their_public = x25519_dalek::PublicKey::from(ed.to_montgomery().to_bytes());
+    let eph_secret = x25519_dalek::StaticSecret::from(challenge.secret);
+    let shared = eph_secret.diffie_hellman(&their_public);
+    let key = publish_auth_secret(shared.as_bytes(), &log, &challenge.public, &challenge.nonce);
+    use hmac::Mac;
+    proof_mac(&key).verify_slice(proof).is_ok() // constant-time compare
+}
+
+/// Domain-separation prefix for attestation signatures — the only Ed25519
+/// signature in the system, and it never touches the wire in the clear:
+/// it rides inside ciphertext until someone holding the plaintext
+/// discloses it.
+pub const ATTEST_DOMAIN: &[u8] = b"vouch attest v1";
+
+fn attest_input(claim: &ClaimHash, content_hash: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(ATTEST_DOMAIN.len() + 64);
+    msg.extend_from_slice(ATTEST_DOMAIN);
+    msg.extend_from_slice(&claim.0);
+    msg.extend_from_slice(content_hash);
+    msg
+}
+
+/// Go on the record: an attestation over one of this identity's own
+/// claims. Binds the exact claim (its id) and the exact words (the hash
+/// of the canonical plaintext body — which seals in the claimed `at`):
+/// "I said this, then." Edits after attestation are new, unattested
+/// speech.
+///
+/// Returns the plaintext draft; seal it like any other claim
+/// ([`seal_draft`]) and mint it. It is always a separate claim — one
+/// mechanism, whether you attest in the same breath or years later.
+impl Identity {
+    pub fn attest(&self, claim: ClaimHash, plaintext_body: &Value) -> Draft {
+        let content_hash = *blake3::hash(&cbor::to_bytes(plaintext_body)).as_bytes();
+        let sig = self.signing.sign(&attest_input(&claim, &content_hash));
+        Draft::new(ATTEST_TYPE)
+            .field(
+                "of",
+                Value::ClaimRef(ClaimRef {
+                    log_id: self.log_id(),
+                    hash: claim,
+                }),
+            )
+            .field("content", Value::Bytes(content_hash.to_vec()))
+            .field("sig", Value::Bytes(sig.to_bytes().to_vec()))
+    }
+}
+
+/// Verify an attestation against the words it claims to cover. This is
+/// the stranger-facing check — no content key required: given the
+/// author's LogId (public), the attested claim id, the plaintext body
+/// someone disclosed, and the attest claim's fields, it holds iff the
+/// author's key really signed those exact words for that exact claim.
+/// Anyone shown the plaintext and the attestation can run it; that
+/// portability is what "on the record" means.
+pub fn verify_attest(
+    author: LogId,
+    claim: ClaimHash,
+    plaintext_body: &Value,
+    attest_body: &BTreeMap<String, Value>,
+) -> bool {
+    let Some(Value::Bytes(content)) = attest_body.get("content") else {
+        return false;
+    };
+    let Some(Value::Bytes(sig)) = attest_body.get("sig") else {
+        return false;
+    };
+    let Ok(content_hash): Result<[u8; 32], _> = content.as_slice().try_into() else {
+        return false;
+    };
+    if *blake3::hash(&cbor::to_bytes(plaintext_body)).as_bytes() != content_hash {
+        return false; // the words shown are not the words attested
+    }
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(sig) else {
+        return false;
+    };
+    let Ok(key) = author.verifying_key() else {
+        return false;
+    };
+    key.verify(&attest_input(&claim, &content_hash), &sig).is_ok()
 }
 
 /// Decrypt an envelope map back to its plaintext body. `None` for wrong
@@ -364,6 +557,73 @@ mod tests {
         assert_eq!(Address::parse(&alice.log_id().to_string()), None);
         assert_eq!(Address::parse(""), None);
         assert_eq!(Address::parse(&format!("{}zz", &text[..text.len() - 2])), None);
+    }
+
+    #[test]
+    fn publish_proofs_convince_the_relay_and_nobody_else() {
+        let alice = Identity::from_seed([1; 32]);
+        let mallory = Identity::from_seed([6; 32]);
+        let challenge = publish_challenge().unwrap();
+
+        // The key-holder's proof verifies against her log...
+        let proof = publish_proof(&alice, &challenge.public, &challenge.nonce);
+        assert!(verify_publish_proof(alice.log_id(), &challenge, &proof));
+        // ...someone else's key can't produce it...
+        let forged = publish_proof(&mallory, &challenge.public, &challenge.nonce);
+        assert!(!verify_publish_proof(alice.log_id(), &challenge, &forged));
+        // ...and a proof doesn't survive to a different challenge (replay).
+        let later = publish_challenge().unwrap();
+        assert!(!verify_publish_proof(alice.log_id(), &later, &proof));
+    }
+
+    #[test]
+    fn attestations_verify_for_strangers_and_bind_the_exact_words() {
+        let alice = Identity::from_seed([1; 32]);
+        let words = Value::map([
+            ("type", Value::text("rec")),
+            ("at", Value::Int(1_750_000_000_000)),
+            ("subject", Value::text("Joe's Pizza")),
+            ("body", Value::text("best slice in town")),
+        ]);
+        let claim_id = ClaimHash([7; 32]);
+
+        let draft = alice.attest(claim_id, &words);
+        let Value::Map(attest_body) = draft.body_value() else {
+            panic!("attest draft must be a map");
+        };
+
+        // A stranger — no content key anywhere in sight — verifies Alice
+        // signed exactly these words for exactly this claim.
+        assert!(verify_attest(alice.log_id(), claim_id, &words, &attest_body));
+
+        // Different words, different claim, or different author: nothing.
+        let edited = Value::map([("subject", Value::text("Joe's Pizza, mostly"))]);
+        assert!(!verify_attest(alice.log_id(), claim_id, &edited, &attest_body));
+        assert!(!verify_attest(alice.log_id(), ClaimHash([8; 32]), &words, &attest_body));
+        let bob = Identity::from_seed([2; 32]);
+        assert!(!verify_attest(bob.log_id(), claim_id, &words, &attest_body));
+    }
+
+    #[test]
+    fn a_forged_tag_is_invisible_in_the_decrypted_view() {
+        use crate::store::ClaimStore;
+        let alice = Identity::from_seed([1; 32]);
+        let mut writer = crate::Writer::from_seed([1; 32]);
+        let draft = seal_draft(
+            &alice.content_key(),
+            &Draft::new("rec").at(1).text("subject", "Joe's"),
+        )
+        .unwrap();
+        let mut event = writer.claim(draft.body_value()).unwrap();
+
+        // A key-holder CAN forge a whole claim (that's deniability), but
+        // bytes whose tag doesn't check — e.g. relay tampering — are not
+        // speech and never surface.
+        event.tag[0] ^= 1;
+        let mut store = ClaimStore::new();
+        store.ingest(event).unwrap(); // structurally fine: stores blind
+        let keys = keys_for(&alice, &[]);
+        assert!(decrypted_view(&store, &keys).is_empty());
     }
 
     #[test]

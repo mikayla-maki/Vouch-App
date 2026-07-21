@@ -12,9 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use ed25519_dalek::Signature;
-
-use crate::claim::SignedEvent;
+use crate::claim::Event;
 use crate::error::Error;
 use crate::keys::LogId;
 use crate::value::{
@@ -65,13 +63,12 @@ pub(crate) fn encode_claim_ref(out: &mut Vec<u8>, r: &ClaimRef) {
     out.extend_from_slice(&r.hash.0);
 }
 
-pub(crate) fn encode_signed_event(out: &mut Vec<u8>, e: &SignedEvent) {
+pub(crate) fn encode_event(out: &mut Vec<u8>, e: &Event) {
     head(out, 4, 3);
     head(out, 2, e.header_bytes.len() as u64);
     out.extend_from_slice(&e.header_bytes);
-    let sig = e.signature.to_bytes();
-    head(out, 2, sig.len() as u64);
-    out.extend_from_slice(&sig);
+    head(out, 2, e.tag.len() as u64);
+    out.extend_from_slice(&e.tag);
     match &e.body_bytes {
         None => out.push(0xf6),
         Some(b) => {
@@ -125,7 +122,7 @@ pub fn encode_value(out: &mut Vec<u8>, value: &Value) {
         Value::ClaimRef(r) => encode_claim_ref(out, r),
         Value::Embed(e) => {
             head(out, 6, TAG_EMBED);
-            encode_signed_event(out, e);
+            encode_event(out, e);
         }
         Value::BlobRef(b) => {
             head(out, 6, TAG_BLOB_REF);
@@ -365,7 +362,7 @@ fn interpret_tag(tag: u64, inner: Value) -> Value {
             Some(r) => Value::ClaimRef(r),
             None => Value::Tagged(tag, Box::new(inner)),
         },
-        TAG_EMBED => match signed_event_from_value(&inner) {
+        TAG_EMBED => match event_from_value(&inner) {
             Some(e) => Value::Embed(Box::new(e)),
             None => Value::Tagged(tag, Box::new(inner)),
         },
@@ -404,20 +401,20 @@ fn blob_ref_from_value(v: &Value) -> Option<BlobRef> {
     })
 }
 
-fn signed_event_from_value(v: &Value) -> Option<SignedEvent> {
+fn event_from_value(v: &Value) -> Option<Event> {
     let Value::Array(items) = v else { return None };
-    let [Value::Bytes(header), Value::Bytes(sig), body] = items.as_slice() else {
+    let [Value::Bytes(header), Value::Bytes(tag), body] = items.as_slice() else {
         return None;
     };
-    let signature = Signature::from_slice(sig).ok()?;
+    let tag: [u8; 32] = tag.as_slice().try_into().ok()?;
     let body_bytes = match body {
         Value::Null => None,
         Value::Bytes(b) => Some(b.clone()),
         _ => return None,
     };
-    Some(SignedEvent {
+    Some(Event {
         header_bytes: header.clone(),
-        signature,
+        tag,
         body_bytes,
     })
 }

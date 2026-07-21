@@ -44,7 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{ClaimHash, Database, Error as CoreError, LogId, SignedEvent};
+use crate::{ClaimHash, Database, Error as CoreError, LogId, Event};
 
 use super::error::Error;
 use super::protocol::{BATCH, InstanceId, Request, Response};
@@ -137,7 +137,7 @@ pub struct SyncSession {
     /// reconciliation outcome be cached as `settled` (caching over
     /// garbage would mask real missing data as "known benign").
     clean: bool,
-    push_batch: Vec<SignedEvent>,
+    push_batch: Vec<Event>,
     push_sent: usize,
     /// Whether this push batch is the cursor-ordered `serve_since` prefix
     /// (only then may acks advance the push cursor — reconciliation
@@ -146,7 +146,7 @@ pub struct SyncSession {
     after_push: AfterPush,
     want_ids: Vec<ClaimHash>,
     want_sent: usize,
-    extra_batch: Vec<SignedEvent>,
+    extra_batch: Vec<Event>,
 }
 
 impl SyncSession {
@@ -240,7 +240,7 @@ impl SyncSession {
     }
 
     /// Stage a batch for the push pipeline, then onward to `after`.
-    fn begin_push(&mut self, batch: Vec<SignedEvent>, cursor_prefix: bool, after: AfterPush) {
+    fn begin_push(&mut self, batch: Vec<Event>, cursor_prefix: bool, after: AfterPush) {
         self.push_batch = batch;
         self.push_sent = 0;
         self.push_is_cursor_prefix = cursor_prefix;
@@ -327,7 +327,7 @@ impl SyncSession {
 
     /// Ingest one peer-served event. Verification failures are the peer's
     /// misbehavior (counted, skipped); storage failures are ours (fatal).
-    fn ingest(&mut self, db: &mut Database, event: SignedEvent) -> Result<(), Error> {
+    fn ingest(&mut self, db: &mut Database, event: Event) -> Result<(), Error> {
         match db.ingest_at(event, self.now) {
             Ok(report) => {
                 self.report.pulled += report.newly_stored.is_some() as usize;
@@ -506,7 +506,7 @@ impl SyncSession {
                             Some(true) => false,
                         };
                         if offer && let Some(claim) = db.claims().get(id) {
-                            self.extra_batch.push(claim.signed);
+                            self.extra_batch.push(claim.event);
                         }
                     }
                 }
@@ -584,7 +584,7 @@ fn expect_status(r: Response) -> Result<(u64, [u8; 32], InstanceId), Error> {
     }
 }
 
-fn expect_events(r: Response) -> Result<Vec<SignedEvent>, Error> {
+fn expect_events(r: Response) -> Result<Vec<Event>, Error> {
     match r {
         Response::Events { events } => Ok(events),
         other => Err(unexpected("Events", &other)),

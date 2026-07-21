@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::claim::{Claim, SignedEvent};
+use crate::claim::{Claim, Event};
 use crate::keys::LogId;
 
 /// How deep embedded claims may nest inside one another.
@@ -29,7 +29,7 @@ pub const MAX_EMBED_DEPTH: usize = 64;
 /// can happen if this format ever matters to anyone else.
 pub const TAG_CLAIM_REF: u64 = 33001;
 
-/// CBOR tag number for an `Embed` value (a carried [`SignedEvent`]).
+/// CBOR tag number for an `Embed` value (a carried [`Event`]).
 pub const TAG_EMBED: u64 = 33002;
 
 /// CBOR tag number for a [`BlobRef`] value.
@@ -148,7 +148,7 @@ pub enum Value {
     /// A reference to another claim. Legal anywhere in a body.
     ClaimRef(ClaimRef),
     /// Another author's signed claim, carried whole. Verified by the engine.
-    Embed(Box<SignedEvent>),
+    Embed(Box<Event>),
     /// Bulk bytes pinned by hash, stored and fetched outside the claim.
     BlobRef(BlobRef),
     /// An unrecognized CBOR tag, retained so unknown vocabulary re-encodes
@@ -169,8 +169,8 @@ pub type Path = Vec<PathSeg>;
 /// Every `ClaimRef` found in a body, with where it was found.
 pub type FoundRefs = Vec<(Path, ClaimRef)>;
 
-/// Every embedded `SignedEvent` found in a body, with where it was found.
-pub type FoundEmbeds = Vec<(Path, SignedEvent)>;
+/// Every embedded `Event` found in a body, with where it was found.
+pub type FoundEmbeds = Vec<(Path, Event)>;
 
 /// Every [`BlobRef`] found in a body, with where it was found.
 pub type FoundBlobs = Vec<(Path, BlobRef)>;
@@ -236,12 +236,14 @@ impl Value {
     ///
     /// An embedded claim is content, not a row — it is part of the speech
     /// that quotes it, so its edges belong to the quoting claim. Each embed
-    /// is verified (signature, body hash) in place; a verified embed
-    /// contributes one claim edge for itself (path: where the embed sits)
-    /// plus everything inside it, with interior paths appended to the
-    /// embed's path. An embed that fails verification, or nests past
-    /// [`MAX_EMBED_DEPTH`], is skipped whole and counted — opaque signed
-    /// bytes, not edges.
+    /// is structurally checked (header decodes, body hash pins) in place; a
+    /// well-formed embed contributes one claim edge for itself (path: where
+    /// the embed sits) plus everything inside it, with interior paths
+    /// appended to the embed's path. An embed that fails the check, or
+    /// nests past [`MAX_EMBED_DEPTH`], is skipped whole and counted —
+    /// opaque bytes, not edges. (Whether the quoted author really said it
+    /// is hearsay by design — the quoter's word, judged by readers, not
+    /// here.)
     ///
     /// Deterministic: the same body always yields the same edges, in tree
     /// order — so a backend can recompute them from stored bytes and fsck
@@ -253,16 +255,17 @@ impl Value {
         edges
     }
 
-    /// The verified claims embedded in this body, shallow: each is decoded
-    /// and verified (signature, body hash), with the path where it sits.
-    /// Embeds that fail verification are omitted — unrenderable garbage the
-    /// container's author signed. A UI recurses by calling this on each
-    /// returned claim's body; identity is `claim.header.id()`.
+    /// The well-formed claims embedded in this body, shallow: each is
+    /// decoded and structurally checked (header decodes, body hash pins),
+    /// with the path where it sits. Embeds that fail the check are omitted
+    /// — unrenderable garbage the container's author uttered. A UI recurses
+    /// by calling this on each returned claim's body; identity is
+    /// `claim.header.id()`.
     pub fn embedded_claims(&self) -> Vec<(Path, Claim)> {
         let (_, embeds, _) = self.collect_refs();
         embeds
             .into_iter()
-            .filter_map(|(path, e)| e.verify().ok().map(|c| (path, c)))
+            .filter_map(|(path, e)| e.check().ok().map(|c| (path, c)))
             .collect()
     }
 
@@ -280,7 +283,7 @@ fn collect(
     value: &Value,
     path: &mut Path,
     refs: &mut Vec<(Path, ClaimRef)>,
-    embeds: &mut Vec<(Path, SignedEvent)>,
+    embeds: &mut Vec<(Path, Event)>,
     blobs: &mut Vec<(Path, BlobRef)>,
 ) {
     match value {
@@ -308,7 +311,7 @@ fn collect(
 
 /// The deep walk behind [`Value::collect_edges`]. `depth` counts embed
 /// layers entered so far; entering another requires `depth < MAX_EMBED_DEPTH`
-/// (one signature check per layer is the work being bounded).
+/// (one structural check per layer is the work being bounded).
 fn collect_deep(value: &Value, path: &mut Path, depth: usize, edges: &mut Edges) {
     match value {
         Value::ClaimRef(r) => edges.refs.push((path.clone(), *r)),
@@ -318,7 +321,7 @@ fn collect_deep(value: &Value, path: &mut Path, depth: usize, edges: &mut Edges)
                 edges.skipped += 1;
                 return;
             }
-            match e.verify() {
+            match e.check() {
                 Ok(claim) => {
                     edges.refs.push((
                         path.clone(),

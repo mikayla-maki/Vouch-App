@@ -431,6 +431,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bob_dir);
     }
 
+    /// Going on the record, through the reactive layer: the feed shows the
+    /// rec unmarked (deniable is the default), then flips to on-the-record
+    /// when the attest claim lands — the exact minting path the detail
+    /// panel's button drives.
+    #[gpui::test]
+    async fn an_attest_claim_flips_the_rec_to_on_the_record(cx: &mut TestAppContext) {
+        let (peer, actor, dir) = open_test_peer(17);
+        cx.update(|cx| cx.background_executor().spawn(actor.run()).detach());
+
+        let feed = feed_with(&peer, 17, vec![], cx);
+        cx.run_until_parked();
+
+        let rec_draft = Draft::new("rec")
+            .at(1)
+            .text("subject", "Delfina")
+            .text("body", "Overrated, honestly");
+        let rec_words = rec_draft.body_value();
+        let rec = peer.claim(sealed(17, rec_draft)).await.unwrap();
+        cx.run_until_parked();
+
+        feed.read_with(cx, |feed, _| {
+            assert_eq!(feed.recs().len(), 1);
+            assert!(!feed.recs()[0].on_the_record(), "deniable by default");
+        });
+
+        // The button's path: attest the exact plaintext, sealed like all
+        // speech.
+        let identity = identity_of(17);
+        let attest = identity.attest(rec.id(), &rec_words).at(2);
+        peer.claim(sealed(17, attest)).await.unwrap();
+        cx.run_until_parked();
+
+        feed.read_with(cx, |feed, _| {
+            assert_eq!(feed.recs().len(), 1, "an attest is not a feed item");
+            assert!(feed.recs()[0].on_the_record());
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The capability moment: bob's sealed claims are already synced into
     /// alice's store but illegible — until she pastes his address. No new
     /// claim arrives; the follow itself re-folds the feed and the backlog

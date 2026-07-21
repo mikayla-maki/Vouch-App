@@ -5,9 +5,9 @@
 //! GC forgets them. These tests run [`BlobStore`] (the verification
 //! logic) over the memory backend — the same logic any backend gets.
 
-use vouch_core::{BlobRef, BlobStore, ClaimStore, Error, SignedEvent, Value, Writer};
+use vouch_core::{BlobRef, BlobStore, ClaimStore, Error, Event, Value, Writer};
 
-fn photo_rec(db: &mut Writer, at: i64, subject: &str, blob: &BlobRef) -> SignedEvent {
+fn photo_rec(db: &mut Writer, at: i64, subject: &str, blob: &BlobRef) -> Event {
     db.claim(Value::map([
         ("type", Value::text("rec")),
         ("at", Value::Int(at)),

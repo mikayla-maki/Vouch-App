@@ -109,7 +109,7 @@ impl Follows {
 
     fn connect(&self, address: &Address) {
         if let Some(url) = &self.mailbox_url {
-            vouch_transport::connect_mailbox(&self.peer, url, address.log);
+            vouch_transport::connect_mailbox(&self.peer, url, address.log, None);
         }
     }
 

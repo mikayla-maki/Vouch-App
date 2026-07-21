@@ -4,7 +4,7 @@
 //! anywhere. Two [`Database`]s exchanging `serve_since` streams are a
 //! complete sync session.
 
-use vouch_core::{ClaimHash, ClaimRef, Database, SignedEvent, Value, Writer};
+use vouch_core::{ClaimHash, ClaimRef, Database, Event, Value, Writer};
 
 /// Tiny deterministic PRNG (xorshift64*) so shuffles are reproducible
 /// without a rand dependency.
@@ -37,11 +37,11 @@ fn rec_body(at: i64, subject: &str) -> Value {
     ])
 }
 
-fn rec(db: &mut Writer, at: i64, subject: &str) -> SignedEvent {
+fn rec(db: &mut Writer, at: i64, subject: &str) -> Event {
     db.claim(rec_body(at, subject)).unwrap()
 }
 
-fn vouch(db: &mut Writer, at: i64, original: &SignedEvent) -> SignedEvent {
+fn vouch(db: &mut Writer, at: i64, original: &Event) -> Event {
     db.claim(Value::map([
         ("type", Value::text("vouch")),
         ("at", Value::Int(at)),
@@ -51,14 +51,14 @@ fn vouch(db: &mut Writer, at: i64, original: &SignedEvent) -> SignedEvent {
     .unwrap()
 }
 
-fn cref(event: &SignedEvent) -> ClaimRef {
+fn cref(event: &Event) -> ClaimRef {
     ClaimRef {
         log_id: event.header().unwrap().log_id,
         hash: event.id(),
     }
 }
 
-fn id_of(event: &SignedEvent) -> ClaimHash {
+fn id_of(event: &Event) -> ClaimHash {
     event.id()
 }
 
@@ -75,7 +75,7 @@ fn vouch_chain_verifies_without_subscribing_to_the_source() {
     let report = carol.ingest(bob_vouch.clone()).unwrap();
 
     // Carol's store gains exactly one row: Bob's vouch. Alice's rec is
-    // content INSIDE it — verified (signature, body hash) at the walk,
+    // content INSIDE it — checked (structure, body hash) at the walk,
     // never extracted into a row of its own.
     assert_eq!(report.newly_stored, Some(id_of(&bob_vouch)));
     assert_eq!(report.skipped_embeds, 0);
@@ -152,7 +152,7 @@ fn shuffled_replay_converges() {
     let mut bob = Writer::from_seed([2; 32]);
     let mut carol = Writer::from_seed([3; 32]);
 
-    let mut events: Vec<SignedEvent> = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
     for i in 0..8 {
         events.push(rec(&mut alice, 1000 + i, &format!("place-{i}")));
     }
@@ -277,7 +277,7 @@ fn fingerprint_flags_silent_divergence_that_cursors_cannot_see() {
     // The fingerprint catches it.
     let mut alice = Writer::from_seed([1; 32]);
     let log = alice.id();
-    let claims: Vec<SignedEvent> = (0..8)
+    let claims: Vec<Event> = (0..8)
         .map(|i| rec(&mut alice, 1000 + i, &format!("place-{i}")))
         .collect();
 

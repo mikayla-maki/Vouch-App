@@ -1,63 +1,87 @@
-//! Claims: signed headers referencing bodies by hash.
+//! Claims: MAC'd headers referencing bodies by hash.
 //!
 //! A claim is split in two, and the split is load-bearing:
 //!
 //! ```text
 //! header = [ uint version, bytes-32 log_id, bytes-32 body_hash ]
-//! signature = Ed25519::sign(signing_key, canonical_header_bytes)
-//! id        = BLAKE3(canonical_header_bytes)
-//! body      = canonical CBOR map, shipped alongside, pinned by body_hash
+//! tag    = HMAC-SHA256(K_auth, MAC_DOMAIN ++ canonical_header_bytes)
+//! id     = BLAKE3(canonical_header_bytes)
+//! body   = canonical CBOR map, shipped alongside, pinned by body_hash
 //! ```
 //!
-//! The signature covers the header; the header pins the body. So a body can
+//! The tag covers the header; the header pins the body. So a body can
 //! be *dropped* (redaction) while the header — the claim's existence and
-//! identity — stays verifiable forever. A header without its body is a
-//! signed tombstone.
+//! identity — stays verifiable to the audience forever. A header without
+//! its body is an authenticated tombstone.
 //!
-//! The header is exactly what verification needs and nothing else: a
-//! version to decode by, a key to verify with, a hash to pin the content.
-//! Everything the author *means* — including when they claim they said it
-//! (the vocabulary's `at` field) — lives in the body, transitively signed
-//! via `body_hash`, and redactable with it: a tombstone reveals nothing
-//! but "this key once signed something with this hash", not even when.
-//! There is no sequence number and no prev pointer — sync coordinates are
-//! pipe-local arrival positions (see the store), and drift between pipes
-//! is caught by per-log set fingerprints.
+//! **Why a MAC and not a signature — deniability.** `K_auth` derives from
+//! the log's content key (see [`e2ee`](crate::e2ee)), so exactly the
+//! audience that can read a claim can authenticate it — and, because a MAC
+//! key verifies and forges with the same bytes, none of them can prove
+//! authorship to anyone outside. There are no signatures on the wire at
+//! all; an Ed25519 signature exists only inside ciphertext, as the payload
+//! of an `attest` claim, when the author chooses to go on the record.
+//! Stores, relays, and wiretaps hold bytes that prove nothing.
+//!
+//! It follows that authenticity is judged where reading is: at read time,
+//! by key-holders ([`e2ee::decrypted_view`](crate::e2ee::decrypted_view)).
+//! Ingest and relays [`check`](Event::check) structure only — the real
+//! gate against strangers' bytes is the transport (publish-gated
+//! mailboxes; the per-pipe log check in sync).
+//!
+//! The header is exactly what authentication needs and nothing else: a
+//! version to decode by, a log to look the key up under, a hash to pin the
+//! content. Everything the author *means* — including when they claim they
+//! said it (the vocabulary's `at` field) — lives in the body, transitively
+//! authenticated via `body_hash`, and redactable with it: a tombstone
+//! reveals nothing but "this log once uttered something with this hash",
+//! not even when. There is no sequence number and no prev pointer — sync
+//! coordinates are pipe-local arrival positions (see the store), and drift
+//! between pipes is caught by per-log set fingerprints.
 //!
 //! Identity is therefore exactly (author × content): the same author
-//! signing byte-identical bodies produces ONE claim — saying the same
-//! thing twice is saying it once. Corollary: redacting a claim redacts
-//! those exact bytes from that author for good; "republishing" is new
-//! speech (a superseding claim, a new `at`) with a new identity.
+//! uttering byte-identical bodies produces ONE claim — saying the same
+//! thing twice is saying it once. (HMAC is deterministic, so the tag
+//! agrees.) Corollary: redacting a claim redacts those exact bytes from
+//! that author for good; "republishing" is new speech (a superseding
+//! claim, a new `at`) with a new identity.
 
-use ed25519_dalek::Signature;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 use crate::cbor::{self, Decoder};
 use crate::error::Error;
 use crate::keys::LogId;
 use crate::value::{ClaimHash, Value};
 
-/// Domain-separation prefix for claim signatures. The signed message is
-/// `SIGNING_DOMAIN ++ canonical_header_bytes`, never the header bytes
-/// alone, so a Vouch claim signature can never be replayed as a valid
-/// signature over some other protocol's message under a reused key (and
-/// vice versa). The claim id stays `BLAKE3(header_bytes)` — a hash needs no
-/// domain separation, only a signature does. Changing this string is a wire
-/// break (it changes every signature).
-pub const SIGNING_DOMAIN: &[u8] = b"vouch-claim-sig-v1";
+/// A log's MAC key — derived from its content key
+/// ([`e2ee::auth_key`](crate::e2ee::auth_key)), so read-audience =
+/// verify-audience, always.
+pub type AuthKey = [u8; 32];
 
-/// The exact bytes a claim signature covers: the domain prefix followed by
-/// the canonical header.
-pub fn signing_input(header_bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(SIGNING_DOMAIN.len() + header_bytes.len());
-    out.extend_from_slice(SIGNING_DOMAIN);
-    out.extend_from_slice(header_bytes);
-    out
+/// Domain-separation prefix for claim tags. The MAC'd message is
+/// `MAC_DOMAIN ++ canonical_header_bytes`, never the header bytes alone,
+/// so a Vouch claim tag can never be replayed as a valid MAC over some
+/// other protocol's message under a reused key (and vice versa). The claim
+/// id stays `BLAKE3(header_bytes)` — a hash needs no domain separation,
+/// only a keyed tag does. Changing this string is a wire break (it changes
+/// every tag).
+pub const MAC_DOMAIN: &[u8] = b"vouch-claim-mac-v1";
+
+/// The tag for a canonical header under a log's auth key.
+pub fn header_tag(key: &AuthKey, header_bytes: &[u8]) -> [u8; 32] {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(MAC_DOMAIN);
+    mac.update(header_bytes);
+    mac.finalize().into_bytes().into()
 }
 
-/// Current wire-format version. Structural changes to the signed layout bump
-/// this; new claim types and fields never do.
-pub const WIRE_VERSION: u16 = 1;
+/// Current wire-format version. Structural changes to the authenticated
+/// layout bump this; new claim types and fields never do. v2: signatures
+/// left the wire (deniable claims — a 32-byte MAC tag replaced the 64-byte
+/// Ed25519 signature).
+pub const WIRE_VERSION: u16 = 2;
 
 /// Maximum encoded body size in bytes. A normative wire-format rule, not a
 /// courtesy: stores must agree on which claims are valid or their
@@ -133,38 +157,35 @@ pub struct Claim {
     pub body: Option<Value>,
 }
 
-/// A claim as transmitted and stored: canonical header bytes, the signature
+/// A claim as transmitted and stored: canonical header bytes, the MAC tag
 /// over them, and (unless tombstoned) the canonical body bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
-pub struct SignedEvent {
+pub struct Event {
     pub header_bytes: Vec<u8>,
-    pub signature: Signature,
+    pub tag: [u8; 32],
     pub body_bytes: Option<Vec<u8>>,
 }
 
-impl SignedEvent {
+impl Event {
     /// The claim's identity: BLAKE3 of the header bytes. Cheap, and valid
     /// even before verification (it's an address, not a judgment).
     pub fn id(&self) -> ClaimHash {
         ClaimHash(*blake3::hash(&self.header_bytes).as_bytes())
     }
 
-    /// Decode the header without checking the signature.
+    /// Decode the header without judging authenticity.
     pub fn header(&self) -> Result<EventHeader, Error> {
         EventHeader::decode(&self.header_bytes)
     }
 
-    /// Decode and verify: signature against the domain-separated header
-    /// bytes as received (using the log id from the decoded header as the
-    /// verifying key), then the body against the header's body hash.
-    pub fn verify(&self) -> Result<Claim, Error> {
+    /// Structural validity — everything a keyless party (ingest, a relay,
+    /// fsck) can and must check: the header decodes, the body respects the
+    /// size cap and matches the header's pin, and is a CBOR map.
+    /// Deliberately NOT authenticity: that takes the audience's key
+    /// ([`verify_tag`](Event::verify_tag)) and happens at read time.
+    pub fn check(&self) -> Result<Claim, Error> {
         let header = self.header()?;
-        let key = header.log_id.verifying_key()?;
-        key.verify_strict(&signing_input(&self.header_bytes), &self.signature)
-            .map_err(|_| Error::BadSignature {
-                log_id: header.log_id,
-            })?;
         let body = match &self.body_bytes {
             None => None,
             Some(bytes) => {
@@ -184,26 +205,38 @@ impl SignedEvent {
         Ok(Claim { header, body })
     }
 
-    /// This event as a signed tombstone: same header and signature, body
-    /// dropped.
-    pub fn without_body(&self) -> SignedEvent {
-        SignedEvent {
+    /// Authenticate the header to the audience holding `key`: the tag under
+    /// the log's auth key, compared in constant time. True means "someone
+    /// holding this log's address uttered exactly this" — which convinces a
+    /// reader and proves nothing to anyone else, since every reader could
+    /// have computed the same tag.
+    pub fn verify_tag(&self, key: &AuthKey) -> bool {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(MAC_DOMAIN);
+        mac.update(&self.header_bytes);
+        mac.verify_slice(&self.tag).is_ok()
+    }
+
+    /// This event as a tombstone: same header and tag, body dropped.
+    pub fn without_body(&self) -> Event {
+        Event {
             header_bytes: self.header_bytes.clone(),
-            signature: self.signature,
+            tag: self.tag,
             body_bytes: None,
         }
     }
 
     /// Wire encoding for standalone transmission:
-    /// `[bytes header, bytes-64 signature, bytes body | null]`.
+    /// `[bytes header, bytes-32 tag, bytes body | null]`.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        cbor::encode_signed_event(&mut out, self);
+        cbor::encode_event(&mut out, self);
         out
     }
 
     /// Decode the standalone wire form.
-    pub fn decode(buf: &[u8]) -> Result<SignedEvent, Error> {
+    pub fn decode(buf: &[u8]) -> Result<Event, Error> {
         let (event, n) = Self::decode_prefix(buf)?;
         if n != buf.len() {
             return Err(Error::Cbor {
@@ -219,28 +252,25 @@ impl SignedEvent {
     /// events — a persistence file, a backup, a batch — is read: frames are
     /// simply concatenated, and a torn final frame fails to decode without
     /// corrupting anything before it.
-    pub fn decode_prefix(buf: &[u8]) -> Result<(SignedEvent, usize), Error> {
+    pub fn decode_prefix(buf: &[u8]) -> Result<(Event, usize), Error> {
         let mut d = Decoder::new(buf);
-        let n = d.expect(4, "signed event must be a 3-element array")?;
+        let n = d.expect(4, "event must be a 3-element array")?;
         if n != 3 {
             return Err(Error::Cbor {
                 offset: 0,
-                reason: "signed event must be a 3-element array",
+                reason: "event must be a 3-element array",
             });
         }
         let hlen = d.expect(2, "header must be a byte string")?;
         let header_bytes = d.take(hlen)?.to_vec();
-        let slen = d.expect(2, "signature must be a byte string")?;
-        if slen != 64 {
+        let tlen = d.expect(2, "tag must be a byte string")?;
+        if tlen != 32 {
             return Err(Error::Cbor {
                 offset: 0,
-                reason: "signature must be 64 bytes",
+                reason: "tag must be 32 bytes",
             });
         }
-        let signature = Signature::from_slice(d.take(64)?).map_err(|_| Error::Cbor {
-            offset: 0,
-            reason: "invalid signature bytes",
-        })?;
+        let tag: [u8; 32] = d.take(32)?.try_into().expect("took exactly 32 bytes");
         let body_bytes = if d.peek_null() {
             d.skip_null();
             None
@@ -249,9 +279,9 @@ impl SignedEvent {
             Some(d.take(blen)?.to_vec())
         };
         Ok((
-            SignedEvent {
+            Event {
                 header_bytes,
-                signature,
+                tag,
                 body_bytes,
             },
             d.pos(),
@@ -273,21 +303,23 @@ mod tests {
                 ("subject", Value::text("x")),
             ]))
             .unwrap();
-        let claim = event.verify().unwrap();
+        let claim = event.check().unwrap();
         assert_eq!(claim.header.canonical_bytes(), event.header_bytes);
         assert_eq!(claim.header.version, WIRE_VERSION);
         assert_eq!(claim.header.id(), event.id());
     }
 
     #[test]
-    fn tampered_header_fails_verification() {
+    fn tampered_header_fails_the_structural_check() {
         let mut db = Writer::from_seed([2; 32]);
         let mut event = db
             .claim(Value::map([("type", Value::text("rec"))]))
             .unwrap();
         let last = event.header_bytes.len() - 1;
         event.header_bytes[last] ^= 1;
-        assert!(event.verify().is_err());
+        // The header no longer pins the body it ships with (and no longer
+        // decodes canonically) — a keyless party already rejects it.
+        assert!(event.check().is_err());
     }
 
     #[test]
@@ -299,84 +331,96 @@ mod tests {
         let body = event.body_bytes.as_mut().unwrap();
         let pos = body.windows(3).position(|w| w == b"Joe").unwrap();
         body[pos] = b'M';
-        assert!(matches!(event.verify(), Err(Error::BodyHashMismatch)));
+        assert!(matches!(event.check(), Err(Error::BodyHashMismatch)));
     }
 
     #[test]
     fn oversized_bodies_are_refused_at_both_ends() {
         let mut db = Writer::from_seed([4; 32]);
 
-        // The writer won't sign one...
+        // The writer won't utter one...
         let huge = Value::map([("body", Value::text("x".repeat(MAX_BODY_SIZE + 1)))]);
         assert!(matches!(db.claim(huge), Err(Error::BodyTooLarge(_))));
 
-        // ...and the verifier won't accept one, before spending any work
+        // ...and the checker won't accept one, before spending any work
         // hashing it (so the size check also bounds adversarial input).
         let mut event = db
             .claim(Value::map([("type", Value::text("rec"))]))
             .unwrap();
         event.body_bytes = Some(vec![0; MAX_BODY_SIZE + 1]);
-        assert!(matches!(event.verify(), Err(Error::BodyTooLarge(_))));
+        assert!(matches!(event.check(), Err(Error::BodyTooLarge(_))));
 
         // A generous-but-legal body is fine.
         let big = Value::map([("body", Value::text("x".repeat(MAX_BODY_SIZE - 64)))]);
-        db.claim(big).unwrap().verify().unwrap();
+        db.claim(big).unwrap().check().unwrap();
     }
 
     #[test]
-    fn tombstone_verifies_without_body() {
+    fn tombstone_keeps_identity_and_authenticity_without_its_body() {
         let mut db = Writer::from_seed([3; 32]);
+        let key = crate::e2ee::auth_key(&crate::e2ee::Identity::from_seed([3; 32]).content_key());
         let event = db
             .claim(Value::map([("type", Value::text("rec"))]))
             .unwrap();
         let tomb = event.without_body();
-        let claim = tomb.verify().unwrap();
+        let claim = tomb.check().unwrap();
         assert!(claim.body.is_none());
         assert_eq!(tomb.id(), event.id());
+        // The tag covers the header, so redaction never orphans
+        // authenticity: the audience can still tell a real tombstone from
+        // an invented one.
+        assert!(tomb.verify_tag(&key));
     }
 
     #[test]
-    fn signed_event_wire_roundtrip_with_and_without_body() {
+    fn event_wire_roundtrip_with_and_without_body() {
         let mut db = Writer::from_seed([3; 32]);
         let event = db
             .claim(Value::map([("type", Value::text("rec"))]))
             .unwrap();
         for e in [event.clone(), event.without_body()] {
-            let back = SignedEvent::decode(&e.encode()).unwrap();
+            let back = Event::decode(&e.encode()).unwrap();
             assert_eq!(back, e);
-            back.verify().unwrap();
+            back.check().unwrap();
         }
     }
 
     #[test]
-    fn signature_is_domain_separated() {
-        // The signature covers SIGNING_DOMAIN ++ header, never the bare
-        // header — so the raw signature over the header bytes alone (what a
-        // different protocol reusing the key might produce) does NOT verify
-        // as a Vouch claim.
-        use ed25519_dalek::{Signer, SigningKey};
-        let key = SigningKey::from_bytes(&[3; 32]);
+    fn tags_authenticate_to_key_holders_and_nobody_else() {
         let mut db = Writer::from_seed([3; 32]);
+        let audience =
+            crate::e2ee::auth_key(&crate::e2ee::Identity::from_seed([3; 32]).content_key());
+        let stranger =
+            crate::e2ee::auth_key(&crate::e2ee::Identity::from_seed([9; 32]).content_key());
         let event = db
             .claim(Value::map([("type", Value::text("rec"))]))
             .unwrap();
 
-        // A signature over the bare header bytes (no domain prefix).
-        let bare = SignedEvent {
-            header_bytes: event.header_bytes.clone(),
-            signature: key.sign(&event.header_bytes),
-            body_bytes: event.body_bytes.clone(),
-        };
-        assert!(matches!(bare.verify(), Err(Error::BadSignature { .. })));
-        // The properly domain-separated one verifies.
-        event.verify().unwrap();
+        // The audience's key verifies; any other key sees noise. (That the
+        // SAME audience key could also have FORGED the tag is the point —
+        // deniability — and is what header_tag being public API states.)
+        assert!(event.verify_tag(&audience));
+        assert!(!event.verify_tag(&stranger));
+        assert_eq!(event.tag, header_tag(&audience, &event.header_bytes));
+
+        // Domain separation: a MAC over the bare header bytes (what some
+        // other protocol reusing the key might produce) is not a claim tag.
+        let mut mac = Hmac::<Sha256>::new_from_slice(&audience).unwrap();
+        mac.update(&event.header_bytes);
+        let bare: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_ne!(event.tag, bare);
+
+        // And a tampered tag fails even for the audience.
+        let mut forged = event.clone();
+        forged.tag[0] ^= 1;
+        assert!(!forged.verify_tag(&audience));
     }
 
     #[test]
-    fn writer_refuses_to_sign_an_undecodable_body() {
+    fn writer_refuses_to_utter_an_undecodable_body() {
         // A BlobRef size beyond i64::MAX encodes (u64) but no conformant
-        // decoder accepts it. The writer round-trips before signing, so it
-        // refuses rather than mint a permanently-unverifiable claim.
+        // decoder accepts it. The writer round-trips before tagging, so it
+        // refuses rather than mint a permanently-unreadable claim.
         use crate::value::{BlobHash, BlobRef};
         let mut db = Writer::from_seed([5; 32]);
         let body = Value::map([(

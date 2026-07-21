@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use vouch_core::storage::{ClaimStorage, MemoryClaimStorage};
 use vouch_core::value::{BlobHash, ClaimHash};
-use vouch_core::{ClaimRef, ClaimStore, Error, LogId, SignedEvent, StoredClaim, Value, Writer};
+use vouch_core::{ClaimRef, ClaimStore, Error, LogId, Event, StoredClaim, Value, Writer};
 
 /// Wraps the memory backend; every MUTATING call spends from a shared
 /// budget and fails once it's gone (reads stay up: a crashed-and-restarted
@@ -138,7 +138,7 @@ impl ClaimStorage for FlakyStorage {
 /// indexing through quotes), cross-log refs (backlinks), media (blob
 /// referrers), redaction (entry + body drop + index removal), and a
 /// tombstone fill-in.
-fn scenario() -> Vec<SignedEvent> {
+fn scenario() -> Vec<Event> {
     let mut alice = Writer::from_seed([1; 32]);
     let mut bob = Writer::from_seed([2; 32]);
     let mut carol = Writer::from_seed([3; 32]);
@@ -426,7 +426,7 @@ fn fsck_catches_a_lying_or_corrupted_backend() {
             ("subject", Value::text("Joe's Pizza")),
         ]))
         .unwrap();
-    let claim = event.verify().unwrap();
+    let claim = event.check().unwrap();
 
     // A backend with rotted rows: the claim's body bytes were tampered
     // (rows are self-authenticating, so this is detectable), plus a
@@ -436,7 +436,7 @@ fn fsck_catches_a_lying_or_corrupted_backend() {
     tampered.body_bytes.as_mut().unwrap()[0] ^= 0xff;
     storage
         .put_claim(StoredClaim {
-            signed: tampered,
+            event: tampered,
             header: claim.header,
             body: claim.body,
             refs: vec![],
@@ -452,7 +452,7 @@ fn fsck_catches_a_lying_or_corrupted_backend() {
     let store = ClaimStore::with_storage(Box::new(storage));
     let problems = store.verify_integrity();
     assert!(
-        problems.iter().any(|p| p.contains("fails verification")),
+        problems.iter().any(|p| p.contains("fails structural check")),
         "tampered row not flagged: {problems:?}"
     );
     assert!(

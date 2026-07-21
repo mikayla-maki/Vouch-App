@@ -44,7 +44,7 @@ pub fn respond(
             events: ids
                 .iter()
                 .filter_map(|id| db.claims().get(id))
-                .map(|c| c.signed)
+                .map(|c| c.event)
                 .collect(),
         },
 

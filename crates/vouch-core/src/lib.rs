@@ -7,7 +7,7 @@
 //! This crate is deliberately I/O-free. Everything here operates on bytes
 //! and in-memory structures, which makes multi-client interactions testable
 //! as plain unit tests: create several [`Writer`]s, exchange
-//! [`SignedEvent`]s between [`ClaimStore`]s, and assert convergence.
+//! [`Event`]s between [`ClaimStore`]s, and assert convergence.
 //!
 //! The crate (together with its conformance test vectors) doubles as the
 //! cross-language wire-format spec: see `VOUCH_ARCHITECTURE.md` at the
@@ -69,13 +69,12 @@ pub mod writer;
 
 pub use blob::{BlobStorage, BlobStore, MemoryBlobStorage};
 pub use claim::{
-    Claim, EventHeader, MAX_BODY_SIZE, SIGNING_DOMAIN, SignedEvent, WIRE_VERSION, signing_input,
+    AuthKey, Claim, Event, EventHeader, MAC_DOMAIN, MAX_BODY_SIZE, WIRE_VERSION, header_tag,
 };
 pub use database::Database;
 pub use draft::Draft;
 pub use fold::{Comment, Component, FieldContribution, FieldState};
 pub use rec::{Recommendation, TimelineEntry};
-pub use ed25519_dalek::Signature;
 pub use error::Error;
 pub use keys::LogId;
 pub use peer::{

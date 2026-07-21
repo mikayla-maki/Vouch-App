@@ -68,7 +68,7 @@ use std::pin::Pin;
 use futures::channel::{mpsc, oneshot};
 use futures::stream::{self, SelectAll, Stream, StreamExt};
 
-use crate::claim::SignedEvent;
+use crate::claim::Event;
 use crate::database::Database;
 use crate::draft::Draft;
 use crate::error::Error as CoreError;
@@ -158,7 +158,7 @@ pub struct PipeConfig {
 #[derive(Debug, Clone)]
 pub struct PeerEvent {
     pub log: LogId,
-    pub events: Vec<SignedEvent>,
+    pub events: Vec<Event>,
 }
 
 enum Command {
@@ -182,7 +182,7 @@ enum Command {
     },
     Claim {
         draft: Draft,
-        reply: oneshot::Sender<Result<SignedEvent, Error>>,
+        reply: oneshot::Sender<Result<Event, Error>>,
     },
     SyncNow {
         reply: oneshot::Sender<()>,
@@ -357,7 +357,7 @@ impl Peer {
     /// Speak: mint the draft (attachments stored, body signed, ingested),
     /// fan it to watchers, queue it for every pipe where you follow your
     /// own log. Returns the signed artifact.
-    pub async fn claim(&self, draft: Draft) -> Result<SignedEvent, Error> {
+    pub async fn claim(&self, draft: Draft) -> Result<Event, Error> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Claim { draft, reply }).await?;
         rx.await.map_err(gone)?
@@ -588,7 +588,7 @@ impl Core {
         }
     }
 
-    fn mint(&mut self, draft: Draft) -> Result<SignedEvent, Error> {
+    fn mint(&mut self, draft: Draft) -> Result<Event, Error> {
         let me = self
             .me
             .ok_or_else(|| Error::State("read-only peer: no writer configured".into()))?;
@@ -637,7 +637,7 @@ impl Core {
 
     /// New artifacts landed for `log`: tell the taps, frame the watchers
     /// (except whoever brought them — they obviously have them).
-    fn landed(&mut self, log: LogId, events: Vec<SignedEvent>, source: Option<PipeId>) {
+    fn landed(&mut self, log: LogId, events: Vec<Event>, source: Option<PipeId>) {
         let item = PeerEvent {
             log,
             events: events.clone(),
@@ -822,7 +822,7 @@ impl Core {
         };
         let name = pipe.name.clone();
         let log = frame.log;
-        let carried: Vec<SignedEvent> = frame
+        let carried: Vec<Event> = frame
             .events
             .iter()
             .filter(|e| e.header().ok().map(|h| h.log_id) == Some(log))
@@ -853,7 +853,7 @@ impl Core {
     /// Answer a request within the serve scope. Returns the response plus
     /// whatever newly landed (so the caller can fan it out — that's the
     /// relay re-serving what an owner just published).
-    fn respond_scoped(&mut self, request: Request) -> (Response, Vec<(LogId, Vec<SignedEvent>)>) {
+    fn respond_scoped(&mut self, request: Request) -> (Response, Vec<(LogId, Vec<Event>)>) {
         let now = self.now();
         match request {
             Request::Status { log } if !self.serves(&log) => (
@@ -881,7 +881,7 @@ impl Core {
                     .iter()
                     .filter_map(|cid| self.db.claims().get(cid))
                     .filter(|c| self.serves(&c.header.log_id))
-                    .map(|c| c.signed)
+                    .map(|c| c.event)
                     .collect();
                 (Response::Events { events }, Vec::new())
             }
@@ -948,12 +948,12 @@ impl Core {
     /// the rest silently (not misbehavior, just not our business).
     fn accept_publish(
         &mut self,
-        events: Vec<SignedEvent>,
+        events: Vec<Event>,
         now: i64,
-    ) -> (Response, Vec<(LogId, Vec<SignedEvent>)>) {
+    ) -> (Response, Vec<(LogId, Vec<Event>)>) {
         let mut stored = 0u64;
         let mut rejected = 0u64;
-        let mut landed: BTreeMap<LogId, Vec<SignedEvent>> = BTreeMap::new();
+        let mut landed: BTreeMap<LogId, Vec<Event>> = BTreeMap::new();
         for event in events {
             let Ok(header) = event.header() else {
                 rejected += 1;

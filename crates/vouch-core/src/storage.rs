@@ -32,7 +32,7 @@ use crate::value::{BlobHash, ClaimHash};
 pub trait ClaimStorage: Send {
     // ── claims ──────────────────────────────────────────────────────────
     fn get_claim(&self, id: &ClaimHash) -> Result<Option<StoredClaim>, Error>;
-    /// Upsert by `claim.signed.id()`.
+    /// Upsert by `claim.event.id()`.
     fn put_claim(&mut self, claim: StoredClaim) -> Result<(), Error>;
     fn claim_count(&self) -> Result<usize, Error>;
     /// Visit every claim, unspecified order.
@@ -156,7 +156,7 @@ impl ClaimStorage for MemoryClaimStorage {
     }
 
     fn put_claim(&mut self, claim: StoredClaim) -> Result<(), Error> {
-        let id = claim.signed.id();
+        let id = claim.event.id();
         if self.undo.is_some() {
             let prior = self.state.claims.get(&id).cloned();
             self.record(Box::new(move |s| {
@@ -298,7 +298,7 @@ impl ClaimStorage for MemoryClaimStorage {
             .claims
             .values()
             .filter(|c| c.received_at < cutoff)
-            .map(|c| c.signed.id())
+            .map(|c| c.event.id())
             .collect();
 
         for &id in &purge_ids {

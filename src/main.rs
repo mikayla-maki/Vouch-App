@@ -136,7 +136,7 @@ fn main() {
             // The full capability address: what a friend pastes to
             // follow AND read this instance.
             eprintln!("my address: {}", crypto_identity.address());
-            vouch_transport::connect_mailbox(&peer, url, my_log);
+            vouch_transport::connect_mailbox(&peer, url, my_log, Some(crypto_identity.clone()));
         }
         let env_follows: Vec<vouch_core::e2ee::Address> = env_var("VOUCH_FOLLOW")
             .unwrap_or_default()

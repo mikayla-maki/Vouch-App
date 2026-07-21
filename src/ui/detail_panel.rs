@@ -5,10 +5,10 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputState};
 use gpui_component::theme::{ActiveTheme, Theme};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use vouch_core::e2ee::{self, ContentKey};
-use vouch_core::{Comment, Draft, LogId, Peer, Recommendation};
+use vouch_core::e2ee::{self, ContentKey, Identity};
+use vouch_core::{ClaimHash, Comment, Draft, LogId, Peer, Recommendation, Value};
 
 // Vouch-chain and related-vouches sections belong here once `vouch` claims
 // and `rec.about -> entity` linking exist end to end: real relatedness is
@@ -20,9 +20,10 @@ pub struct DetailPanel {
     selected: Option<Recommendation>,
     local_log_id: Option<LogId>,
     peer: Peer,
-    /// Our content key — everything authored here (edits, comments)
-    /// seals with it before minting.
-    key: ContentKey,
+    /// Our full crypto identity: its content key seals everything
+    /// authored here (edits, comments), and its signing seed is what "Go
+    /// on the record" attests with.
+    identity: Identity,
     names: BTreeMap<LogId, String>,
 }
 
@@ -31,14 +32,14 @@ impl DetailPanel {
         selected: Option<Recommendation>,
         local_log_id: Option<LogId>,
         peer: Peer,
-        key: ContentKey,
+        identity: Identity,
         names: BTreeMap<LogId, String>,
     ) -> Self {
         Self {
             selected,
             local_log_id,
             peer,
-            key,
+            identity,
             names,
         }
     }
@@ -96,12 +97,13 @@ impl DetailPanel {
         is_own: bool,
         local_log_id: Option<LogId>,
         peer: &Peer,
-        key: ContentKey,
+        identity: &Identity,
         names: &BTreeMap<LogId, String>,
         window: &mut Window,
         cx: &mut App,
         theme: &Theme,
     ) -> Stateful<Div> {
+        let key = identity.content_key();
         div()
             .id("detail-panel")
             .flex()
@@ -127,7 +129,7 @@ impl DetailPanel {
                 is_own,
                 local_log_id,
                 peer,
-                key,
+                identity,
                 theme,
             ))
     }
@@ -173,6 +175,9 @@ impl DetailPanel {
             .when_some(Self::conflict_badge(rec, "subject", theme), |this, badge| {
                 this.child(badge)
             })
+            .when_some(Self::record_badge(rec, theme), |this, badge| {
+                this.child(badge)
+            })
             .child(
                 div()
                     .mt_1()
@@ -180,6 +185,39 @@ impl DetailPanel {
                     .text_color(theme.muted_foreground)
                     .child(timestamp),
             )
+    }
+
+    /// The tier, made visible. Deniable is the unmarked default — most
+    /// recs show nothing here. A full badge means every currently-shown
+    /// word is attested; the softer variant means the author went on the
+    /// record about an earlier version and has since edited past it.
+    fn record_badge(rec: &Recommendation, theme: &Theme) -> Option<Div> {
+        let (label, strong) = if rec.on_the_record() {
+            ("📜 On the record", true)
+        } else if rec.attested_earlier() {
+            ("📜 Attested as of an earlier version", false)
+        } else {
+            return None;
+        };
+        let color = if strong {
+            theme.primary
+        } else {
+            theme.muted_foreground
+        };
+        Some(
+            div()
+                .mt_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(color.opacity(0.12))
+                .border_1()
+                .border_color(color)
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .child(label),
+        )
     }
 
     /// A small, visible marker when a field has an unreconciled frontier
@@ -501,7 +539,7 @@ impl DetailPanel {
         is_own: bool,
         local_log_id: Option<LogId>,
         peer: &Peer,
-        key: ContentKey,
+        identity: &Identity,
         theme: &Theme,
     ) -> Div {
         let not_implemented_border = gpui::red();
@@ -532,8 +570,109 @@ impl DetailPanel {
             ))
             .child(Self::render_history_button(rec, local_log_id, theme))
             .when(is_own, |this| {
-                this.child(Self::render_edit_button(rec, peer, key, theme))
+                this.child(Self::render_edit_button(
+                    rec,
+                    peer,
+                    identity.content_key(),
+                    theme,
+                ))
             })
+            .when(is_own && !rec.on_the_record(), |this| {
+                this.child(Self::render_attest_button(rec, peer, identity, theme))
+            })
+    }
+
+    /// Going on the record: escalate the words currently shown from
+    /// deniable to attested. Mints one `attest` claim per live
+    /// contribution of ours — sealed like all speech, so only the
+    /// audience sees the escalation until someone discloses it. There is
+    /// deliberately no undo: an attestation, once seen, can't be
+    /// unsigned; a `redact` of the attest claim asks honest peers to
+    /// forget it, nothing more.
+    fn render_attest_button(
+        rec: &Recommendation,
+        peer: &Peer,
+        identity: &Identity,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        let peer = peer.clone();
+        let identity = identity.clone();
+        let rec = rec.clone();
+
+        div()
+            .id("attest-btn")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(theme.colors.list)
+            .rounded_lg()
+            .cursor_pointer()
+            .border_1()
+            .border_color(theme.primary)
+            .shadow_sm()
+            .hover(|style| style.bg(theme.list_hover))
+            .on_click(move |_event, _window, cx| {
+                let peer = peer.clone();
+                let identity = identity.clone();
+                let rec = rec.clone();
+                let at_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                cx.spawn(async move |_cx| {
+                    let key = identity.content_key();
+                    // The words currently shown: the live frontier of
+                    // subject and body — ours only (an attestation binds
+                    // its author's own words, nobody else's), and not
+                    // already attested.
+                    let mut targets: BTreeSet<ClaimHash> = BTreeSet::new();
+                    for field in ["subject", "body"] {
+                        let Some(state) = rec.fields.get(field) else {
+                            continue;
+                        };
+                        for c in &state.frontier {
+                            if c.author == identity.log_id() && !rec.attested.contains(&c.claim)
+                            {
+                                targets.insert(c.claim);
+                            }
+                        }
+                    }
+                    for claim_id in targets {
+                        // Sign exactly what the store holds: fetch the
+                        // sealed claim and reopen it, rather than trusting
+                        // any re-rendering of it.
+                        let Ok(Some(stored)) =
+                            peer.query(move |db| db.claims().get(&claim_id)).await
+                        else {
+                            continue;
+                        };
+                        let Some(Value::Map(envelope)) = stored.body else {
+                            continue;
+                        };
+                        let Some(words) = e2ee::decrypt_body(&key, &envelope) else {
+                            continue;
+                        };
+                        let draft = identity.attest(claim_id, &words).at(at_ms);
+                        let Ok(sealed) = e2ee::seal_draft(&key, &draft) else {
+                            continue;
+                        };
+                        let _ = peer.claim(sealed).await;
+                    }
+                })
+                .detach();
+            })
+            .child(div().text_sm().child("📜"))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child("Go on the record"),
+            )
     }
 
     /// Open to anyone, unlike Edit — seeing what happened isn't gated on
@@ -653,7 +792,7 @@ impl RenderOnce for DetailPanel {
                     is_own,
                     self.local_log_id,
                     &self.peer,
-                    self.key,
+                    &self.identity,
                     &self.names,
                     window,
                     cx,

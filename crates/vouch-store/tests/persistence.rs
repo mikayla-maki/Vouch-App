@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use vouch_core::{Database, SignedEvent, Value, Writer};
+use vouch_core::{Database, Event, Value, Writer};
 
 fn fresh_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vouch-store-test-{}-{name}", std::process::id()));
@@ -99,13 +99,13 @@ fn redaction_reaches_the_disk_and_survives_reopen() {
     };
 
     // Reopen: the tombstone is a tombstone on disk — body gone, redaction
-    // authority recorded, signature still verifiable, cursor intact.
+    // authority recorded, structure intact, cursor intact.
     let db = vouch_store::open(&dir).unwrap();
     assert!(!db.claims().contains(&target));
     let tomb = db.claims().get(&target).expect("tombstone persisted");
     assert!(tomb.body.is_none());
-    assert!(tomb.signed.body_bytes.is_none());
-    tomb.signed.verify().expect("tombstone still verifies");
+    assert!(tomb.event.body_bytes.is_none());
+    tomb.event.check().expect("tombstone still checks out");
     assert!(db.claims().redaction(&target).is_some());
     assert_eq!(db.claims().log_len(&log), 2);
 
@@ -132,7 +132,7 @@ fn sqlite_and_memory_databases_converge() {
             ]),
         )
         .unwrap();
-    let vouched: SignedEvent = durable.claims().serve_since(&log, 0).remove(0);
+    let vouched: Event = durable.claims().serve_since(&log, 0).remove(0);
 
     let mut memory = Database::new();
     let bob = Writer::from_seed([4; 32]);
@@ -506,4 +506,46 @@ fn a_relays_retention_gc_reaches_sqlite() {
     let reopened = vouch_store::open(&dir).unwrap();
     assert!(!reopened.claims().contains(&old.id()));
     assert!(reopened.claims().contains(&new.id()));
+}
+
+/// The alpha-reset migration: a pre-v2 claims.db (signed-claim era,
+/// user_version 0) is wiped whole on open — claims, cursors, and blobs
+/// together — rather than carried. A v2 store reopens untouched.
+#[test]
+fn a_pre_v2_store_is_wiped_on_open_and_a_v2_store_is_not() {
+    let dir = fresh_dir("wipe");
+
+    // Fake a v1-era install: a claims.db with the old schema (any tables,
+    // user_version 0), plus cursors and a blob.
+    {
+        let conn = rusqlite::Connection::open(dir.join("claims.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE claims (id BLOB PRIMARY KEY, signature BLOB NOT NULL);
+             INSERT INTO claims VALUES (x'01', x'02');",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sync.db"), b"old cursors").unwrap();
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::write(dir.join("blobs").join("junk"), b"old blob").unwrap();
+        std::fs::write(dir.join("identity.key"), [7u8; 32]).unwrap();
+    }
+
+    let db = vouch_store::open(&dir).unwrap();
+    assert_eq!(db.claims().len(), 0, "v1 data does not survive");
+    assert!(!dir.join("blobs").join("junk").exists());
+    // Identity is sacred: the seed outlives every wire format.
+    assert_eq!(std::fs::read(dir.join("identity.key")).unwrap(), [7u8; 32]);
+    drop(db);
+
+    // Now a v2 store with content: reopening keeps it.
+    let mut minter = Database::new();
+    let me = minter.add_writer(Writer::from_seed([71; 32]));
+    let claim = minter.claim(&me, rec("survives")).unwrap();
+    let mut db = vouch_store::open(&dir).unwrap();
+    db.ingest(claim.clone()).unwrap();
+    drop(db);
+    let db = vouch_store::open(&dir).unwrap();
+    assert!(db.claims().contains(&claim.id()));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

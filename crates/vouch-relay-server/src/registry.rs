@@ -1,5 +1,5 @@
 //! The mailbox registry: one durable `Peer` per `LogId`, created lazily —
-//! and only ever *created* after the bridge has seen a validly signed
+//! and only ever *created* after the bridge has authenticated a
 //! publish for that log. A bare connection (a scanner, a typo, a reader
 //! of an address nobody ever published under) must never be able to cost
 //! this server disk; see `bridge::dormant_phase` for how such
@@ -54,9 +54,9 @@ impl Registry {
         Some(self.open_locked(&mut mailboxes, log_id))
     }
 
-    /// Create-or-open. Called from exactly one place: the bridge, after
-    /// verifying a signed publish for `log_id` — the single event allowed
-    /// to allocate disk on this server.
+    /// Create-or-open. Called from exactly one place: the bridge, when an
+    /// authenticated publisher session sends a well-formed publish for
+    /// `log_id` — the single event allowed to allocate disk on this server.
     pub async fn materialize(&self, log_id: LogId) -> Peer {
         let mut mailboxes = self.mailboxes.lock().await;
         if let Some(peer) = mailboxes.get(&log_id) {

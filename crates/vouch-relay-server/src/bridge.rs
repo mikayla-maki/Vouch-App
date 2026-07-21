@@ -3,24 +3,34 @@
 //! doc describes for `vouch-transport`'s TCP bridge, just carried over
 //! WebSocket messages (already framed, so no length-prefix needed).
 //!
-//! The handshake is one message: the client's first WebSocket frame is
-//! the 32-byte `LogId` of the mailbox it wants to reach. That's the
-//! entire address — no separate secret, since signature verification
-//! already gatekeeps who can validly publish under a log.
+//! The handshake opens with the mailbox address: the client's first
+//! frame is the 32-byte `LogId` it wants to reach (a reader), or that
+//! LogId plus a trailing `0x01` byte (a would-be publisher). Publishing
+//! requires proving possession of the log's key — **deniably**: the
+//! server answers with an ephemeral X25519 public key and a nonce, the
+//! client returns a MAC under the DH-agreed secret, and the server
+//! checks it against the mailbox's LogId (see
+//! `vouch_core::e2ee::publish_proof`). No signature is ever produced:
+//! the server, holding the ephemeral secret, could have forged every
+//! proof it accepted, so its logs are evidence of nothing — while an
+//! outsider without either private key can't forge one at all. Wire
+//! claims carry MAC tags this server has no key to check; the session
+//! IS the publish gate.
 //!
 //! ## Dormant until proven costly
 //!
 //! A connection to a mailbox that doesn't exist yet allocates NOTHING —
 //! no directory, no SQLite, no actor. The bridge answers its reads
 //! synthetically (the honest empty answers an empty mailbox would give)
-//! and only materializes the mailbox when a *validly signed* publish for
-//! that exact log arrives. Keypairs are free, so this doesn't stop a
-//! determined attacker from creating mailboxes — but it makes creation
-//! cost a signature the server verifies, instead of being free for
-//! anyone who can send 32 bytes. The synthesized `Status` carries a
-//! fresh random instance id; when the mailbox later materializes with
-//! its real one, clients see an instance change and reset cursors —
-//! exactly the relay-reborn path the protocol already heals.
+//! and only materializes the mailbox when an *authenticated publisher*
+//! sends a structurally valid publish for that exact log. Keypairs are
+//! free, so this doesn't stop a determined attacker from creating
+//! mailboxes — but it makes creation cost a key-possession handshake,
+//! instead of being free for anyone who can send 32 bytes. The
+//! synthesized `Status` carries a fresh random instance id; when the
+//! mailbox later materializes with its real one, clients see an
+//! instance change and reset cursors — exactly the relay-reborn path
+//! the protocol already heals.
 
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +42,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+use vouch_core::e2ee;
 use vouch_core::sync::{InstanceId, Notify, Request, Response};
 use vouch_core::{LogId, Peer, PipeMsg, pipe};
 
@@ -63,21 +74,62 @@ pub async fn serve_connection(stream: TcpStream, registry: Registry) -> Result<(
     let Message::Binary(bytes) = first? else {
         return Err("expected a binary handshake frame".into());
     };
-    let log_bytes: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "handshake frame must be exactly 32 bytes")?;
-    let mailbox_log = LogId(log_bytes);
+    let (log_bytes, wants_publish): (&[u8], bool) = match bytes.as_slice() {
+        b if b.len() == 32 => (b, false),
+        [b @ .., 1] if b.len() == 32 => (b, true),
+        _ => return Err("handshake frame must be a 32-byte LogId (+ 0x01 to publish)".into()),
+    };
+    let mailbox_log = LogId(log_bytes.try_into().expect("length checked"));
+
+    let publisher = if wants_publish {
+        publish_handshake(&mut ws_read, &mut ws_write, mailbox_log).await?
+    } else {
+        false
+    };
 
     let (peer, initial) = match registry.open_existing(mailbox_log).await {
         Some(peer) => (peer, None),
-        None => match dormant_phase(&mut ws_read, &mut ws_write, mailbox_log, &registry).await? {
-            Some((peer, publish)) => (peer, Some(publish)),
-            None => return Ok(()), // closed while dormant: zero cost
-        },
+        None => {
+            match dormant_phase(&mut ws_read, &mut ws_write, mailbox_log, publisher, &registry)
+                .await?
+            {
+                Some((peer, publish)) => (peer, Some(publish)),
+                None => return Ok(()), // closed while dormant: zero cost
+            }
+        }
     };
 
-    live_phase(peer, ws_read, ws_write, mailbox_log, initial).await
+    live_phase(peer, ws_read, ws_write, mailbox_log, publisher, initial).await
+}
+
+/// The deniable challenge-response: ephemeral key + nonce out, MAC proof
+/// back. `Err` (which closes the connection) for a wrong proof — a caller
+/// who asked to publish and can't prove the key gets nothing, not a
+/// read-only downgrade.
+async fn publish_handshake(
+    ws_read: &mut WsRead,
+    ws_write: &mut WsWrite,
+    mailbox_log: LogId,
+) -> Result<bool, BoxError> {
+    let challenge = e2ee::publish_challenge().map_err(|e| format!("challenge: {e}"))?;
+    let mut frame = challenge.public.to_vec();
+    frame.extend_from_slice(&challenge.nonce);
+    ws_write.send(Message::Binary(frame)).await?;
+
+    let Some(reply) = ws_read.next().await else {
+        return Ok(false); // closed instead of proving: fine, cost nothing
+    };
+    let Message::Binary(proof_bytes) = reply? else {
+        return Err("expected a binary proof frame".into());
+    };
+    let proof: [u8; 32] = proof_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "publish proof must be exactly 32 bytes")?;
+    if !e2ee::verify_publish_proof(mailbox_log, &challenge, &proof) {
+        return Err("publish proof did not verify for this mailbox".into());
+    }
+    Ok(true)
 }
 
 async fn send_msg(ws_write: &mut WsWrite, msg: &PipeMsg) -> Result<(), BoxError> {
@@ -87,12 +139,14 @@ async fn send_msg(ws_write: &mut WsWrite, msg: &PipeMsg) -> Result<(), BoxError>
 }
 
 /// Answer a nonexistent mailbox honestly (the empty answers an empty
-/// mailbox would give) until either the connection ends or a validly
-/// signed publish for this log justifies materializing it.
+/// mailbox would give) until either the connection ends or an
+/// authenticated publisher's structurally valid publish for this log
+/// justifies materializing it.
 async fn dormant_phase(
     ws_read: &mut WsRead,
     ws_write: &mut WsWrite,
     mailbox_log: LogId,
+    publisher: bool,
     registry: &Registry,
 ) -> Result<Option<(Peer, PipeMsg)>, BoxError> {
     let mut instance_bytes = [0u8; 16];
@@ -113,13 +167,20 @@ async fn dormant_phase(
                 let response = match request {
                     Request::Publish { events } => {
                         let total = events.len() as u64;
-                        let valid: Vec<_> = events
-                            .into_iter()
-                            .filter(|e| {
-                                e.header().is_ok_and(|h| h.log_id == mailbox_log)
-                                    && e.verify().is_ok()
-                            })
-                            .collect();
+                        // The session is the gate: the server can't check a
+                        // MAC tag (no key, by design), so per-event scrutiny
+                        // is structure + address only.
+                        let valid: Vec<_> = if publisher {
+                            events
+                                .into_iter()
+                                .filter(|e| {
+                                    e.header().is_ok_and(|h| h.log_id == mailbox_log)
+                                        && e.check().is_ok()
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         if valid.is_empty() {
                             Response::Ack {
                                 stored: 0,
@@ -182,6 +243,7 @@ async fn live_phase(
     mut ws_read: WsRead,
     mut ws_write: WsWrite,
     mailbox_log: LogId,
+    publisher: bool,
     initial: Option<PipeMsg>,
 ) -> Result<(), BoxError> {
     let (actor_end, transport_end) = pipe(64);
@@ -211,19 +273,24 @@ async fn live_phase(
             let Ok(mut decoded) = bincode::deserialize::<PipeMsg>(&bytes) else {
                 continue; // garbage frame: drop it, the session retries
             };
-            // This mailbox only ever holds `mailbox_log`'s claims — drop
-            // anything else here, before it ever reaches the Peer, so a
-            // guest can never write into someone else's log through it.
+            // Only the authenticated key-holder writes here, and this
+            // mailbox only ever holds `mailbox_log`'s claims — enforce
+            // both before anything reaches the Peer, so a guest can
+            // never write into someone else's log through it.
             if let PipeMsg::Request {
                 request: Request::Publish { events },
                 ..
             } = &mut decoded
             {
-                events.retain(|e| {
-                    e.header()
-                        .map(|h| h.log_id == mailbox_log)
-                        .unwrap_or(false)
-                });
+                if !publisher {
+                    events.clear();
+                } else {
+                    events.retain(|e| {
+                        e.header()
+                            .map(|h| h.log_id == mailbox_log)
+                            .unwrap_or(false)
+                    });
+                }
             }
             if transport_tx.send(decoded).await.is_err() {
                 break;

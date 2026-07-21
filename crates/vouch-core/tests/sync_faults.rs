@@ -13,9 +13,9 @@ use vouch_core::sync::{
     Error, InstanceId, MemorySyncState, PeerCursor, SyncReport, SyncSession, SyncState, drive,
     respond,
 };
-use vouch_core::{ClaimRef, Database, LogId, SignedEvent, Value, Writer};
+use vouch_core::{ClaimRef, Database, LogId, Event, Value, Writer};
 
-fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> SignedEvent {
+fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> Event {
     db.claim(
         log,
         Value::map([

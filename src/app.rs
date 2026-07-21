@@ -186,7 +186,7 @@ impl Render for VouchApp {
                         selected,
                         self.local_log_id,
                         self.peer.clone(),
-                        self.identity.content_key(),
+                        self.identity.clone(),
                         names,
                     ))
                 }

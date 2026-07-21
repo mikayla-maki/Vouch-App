@@ -5,9 +5,10 @@
 //! published under that log by whoever actually holds its private key.
 //! Each connecting client picks a mailbox by sending the 32-byte LogId as
 //! the first WebSocket message (see `bridge`) — the LogId IS the address,
-//! Iroh-style; no separate secret, since signature verification already
-//! gatekeeps who can publish. A mailbox costs disk only after a validly
-//! signed publish; bare connections are answered dormant.
+//! Iroh-style. Publishing requires a deniable key-possession handshake
+//! (no signatures anywhere; the relay's own records prove nothing). A
+//! mailbox costs disk only after an authenticated publish; bare
+//! connections are answered dormant.
 //!
 //! This is explicitly NOT a permanent archive: a background sweep purges
 //! claims older than `VOUCH_RELAY_RETENTION_DAYS` (default 7) and their
@@ -161,6 +162,7 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+    use vouch_core::e2ee::{self, Identity};
     use vouch_core::sync::{Request, Response};
     use vouch_core::{LogId, PipeMsg, Value, Writer};
 
@@ -189,6 +191,29 @@ mod tests {
             .await
             .unwrap();
         ws.send(Message::Binary(mailbox.0.to_vec())).await.unwrap();
+        ws
+    }
+
+    /// Connect with publish intent and answer the challenge with
+    /// `identity`'s key. Returns the authenticated session; panics if the
+    /// server closes it (callers proving the failure path do it by hand).
+    async fn connect_publish(addr: std::net::SocketAddr, mailbox: LogId, identity: &Identity) -> Ws {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let mut hello = mailbox.0.to_vec();
+        hello.push(1);
+        ws.send(Message::Binary(hello)).await.unwrap();
+        let challenge = loop {
+            match ws.next().await.expect("server closed during handshake").unwrap() {
+                Message::Binary(bytes) => break bytes,
+                _ => continue,
+            }
+        };
+        let eph_pub: [u8; 32] = challenge[..32].try_into().unwrap();
+        let nonce: [u8; 16] = challenge[32..48].try_into().unwrap();
+        let proof = e2ee::publish_proof(identity, &eph_pub, &nonce);
+        ws.send(Message::Binary(proof.to_vec())).await.unwrap();
         ws
     }
 
@@ -230,6 +255,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_valid_publish_materializes_and_survives_for_the_next_reader() {
         let mut writer = Writer::from_seed([1; 32]);
+        let identity = Identity::from_seed([1; 32]);
         let mailbox = writer.id();
         let event = writer
             .claim(Value::map([
@@ -239,7 +265,7 @@ mod tests {
             .unwrap();
 
         let (addr, dir) = start_server(16).await;
-        let mut ws = connect(addr, mailbox).await;
+        let mut ws = connect_publish(addr, mailbox, &identity).await;
         let response = roundtrip(
             &mut ws,
             0,
@@ -273,21 +299,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_publish_for_someone_elses_mailbox_is_rejected_without_disk() {
-        let mut mallory = Writer::from_seed([6; 32]);
-        let event = mallory
-            .claim(Value::map([("type", Value::text("rec"))]))
-            .unwrap();
-        // Valid signature, wrong mailbox: aimed at a log mallory doesn't hold.
+    async fn the_wrong_key_cannot_authenticate_as_publisher() {
+        // Mallory answers the victim-mailbox challenge with her own key:
+        // the server closes the connection outright.
+        let mallory = Identity::from_seed([6; 32]);
         let victim = Writer::from_seed([2; 32]).id();
 
         let (addr, dir) = start_server(16).await;
-        let mut ws = connect(addr, victim).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let mut hello = victim.0.to_vec();
+        hello.push(1);
+        ws.send(Message::Binary(hello)).await.unwrap();
+        let challenge = loop {
+            match ws.next().await.expect("server closed during handshake").unwrap() {
+                Message::Binary(bytes) => break bytes,
+                _ => continue,
+            }
+        };
+        let eph_pub: [u8; 32] = challenge[..32].try_into().unwrap();
+        let nonce: [u8; 16] = challenge[32..48].try_into().unwrap();
+        let proof = e2ee::publish_proof(&mallory, &eph_pub, &nonce);
+        ws.send(Message::Binary(proof.to_vec())).await.unwrap();
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "a failed proof must end the connection");
+        assert_eq!(mailbox_dirs(&dir), 0, "a failed handshake allocates nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_session_cannot_publish_at_all() {
+        // A well-formed event, but the session never authenticated: every
+        // event is rejected and no disk is allocated. (Without publish
+        // auth this would be the old forgery hole — the relay can't check
+        // MAC tags, so the session is the only gate.)
+        let mut writer = Writer::from_seed([2; 32]);
+        let mailbox = writer.id();
+        let event = writer
+            .claim(Value::map([("type", Value::text("rec"))]))
+            .unwrap();
+
+        let (addr, dir) = start_server(16).await;
+        let mut ws = connect(addr, mailbox).await;
         let response = roundtrip(
             &mut ws,
             0,
             Request::Publish {
                 events: vec![event],
+            },
+        )
+        .await;
+        let Response::Ack { stored, rejected } = response else {
+            panic!("expected an Ack, got {response:?}");
+        };
+        assert_eq!(stored, 0);
+        assert_eq!(rejected, 1);
+        assert_eq!(mailbox_dirs(&dir), 0, "a rejected publish allocates nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publisher_cannot_smuggle_another_logs_events() {
+        // Alice authenticates for HER mailbox but publishes an event
+        // belonging to a different log: address mismatch, rejected.
+        let alice = Identity::from_seed([1; 32]);
+        let mailbox = Writer::from_seed([1; 32]).id();
+        let mut other = Writer::from_seed([3; 32]);
+        let stray = other
+            .claim(Value::map([("type", Value::text("rec"))]))
+            .unwrap();
+
+        let (addr, dir) = start_server(16).await;
+        let mut ws = connect_publish(addr, mailbox, &alice).await;
+        let response = roundtrip(
+            &mut ws,
+            0,
+            Request::Publish {
+                events: vec![stray],
             },
         )
         .await;

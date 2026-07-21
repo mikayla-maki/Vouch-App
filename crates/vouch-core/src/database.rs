@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::blob::{BlobStorage, BlobStore};
-use crate::claim::SignedEvent;
+use crate::claim::Event;
 use crate::draft::Draft;
 use crate::error::Error;
 use crate::keys::LogId;
@@ -110,7 +110,7 @@ impl Database {
     /// returns, the claim is part of local state — your own claims are
     /// ordinary claims. The body carries everything the claim says,
     /// including its claimed time (the vocabulary's `at` field).
-    pub fn claim(&mut self, log: &LogId, body: Value) -> Result<SignedEvent, Error> {
+    pub fn claim(&mut self, log: &LogId, body: Value) -> Result<Event, Error> {
         let writer = self.writers.get_mut(log).ok_or(Error::NotOurLog(*log))?;
         let event = writer.claim(body)?;
         self.claims.ingest(event.clone())?;
@@ -120,7 +120,7 @@ impl Database {
     /// Mint a [`Draft`]: store its attachments as blobs, pin them in the
     /// body, sign, ingest — one operation, so media and the claim that
     /// pins it land together (blob-before-claim by construction).
-    pub fn compose(&mut self, log: &LogId, draft: Draft) -> Result<SignedEvent, Error> {
+    pub fn compose(&mut self, log: &LogId, draft: Draft) -> Result<Event, Error> {
         if !self.writers.contains_key(log) {
             return Err(Error::NotOurLog(*log));
         }
@@ -136,7 +136,7 @@ impl Database {
 
     /// Ingest one signed event from any pipe. Order-insensitive,
     /// idempotent; see [`ClaimStore::ingest`].
-    pub fn ingest(&mut self, event: SignedEvent) -> Result<IngestReport, Error> {
+    pub fn ingest(&mut self, event: Event) -> Result<IngestReport, Error> {
         self.claims.ingest(event)
     }
 
@@ -145,7 +145,7 @@ impl Database {
     /// "now"; vouch-core never reads a clock.
     pub fn ingest_at(
         &mut self,
-        event: SignedEvent,
+        event: Event,
         received_at: i64,
     ) -> Result<IngestReport, Error> {
         self.claims.ingest_at(event, received_at)

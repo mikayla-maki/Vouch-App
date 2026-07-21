@@ -27,18 +27,57 @@ use rusqlite::{Connection, OptionalExtension, params};
 use vouch_core::sync::{Error as SyncError, InstanceId, PeerCursor, SyncState};
 use vouch_core::value::{BlobHash, ClaimHash, Edges};
 use vouch_core::{
-    BlobStorage, ClaimStorage, Database, Error, EventHeader, LogId, Signature, SignedEvent,
-    StoredClaim,
+    BlobStorage, ClaimStorage, Database, Error, Event, EventHeader, LogId, StoredClaim,
 };
 use vouch_core::{Peer, PeerActor, ServePolicy, Writer};
 
+/// The claims.db schema generation, stored as SQLite's `user_version`.
+/// 2 = the WIRE_VERSION 2 world (MAC tags, no signatures). Anything older
+/// is pre-tier alpha data and is wiped whole on open — the deliberate
+/// migration story ("alpha reset"): signatures never coexist with the
+/// deniable format, and a store is either v2 or empty.
+const SCHEMA_VERSION: i64 = 2;
+
 /// Open (or create) a durable [`Database`] in `dir`: SQLite claim storage
 /// at `dir/claims.db`, file blob storage under `dir/blobs/`.
+///
+/// A `dir` from a pre-v2 install (signed claims) is reset first: claims,
+/// cursors, and blobs are deleted together, because cursors describe
+/// arrival orders that died with the claims and blobs are pinned by claims
+/// that no longer exist. Identity is untouched — the seed outlives every
+/// wire format.
 pub fn open(dir: impl AsRef<Path>) -> Result<Database, Error> {
     let dir = dir.as_ref();
+    wipe_pre_v2(dir)?;
     let claims = SqliteClaimStorage::open(dir.join("claims.db"))?;
     let blobs = FileBlobStorage::open(dir.join("blobs"))?;
     Ok(Database::with_stores(Box::new(claims), Box::new(blobs)))
+}
+
+fn wipe_pre_v2(dir: &Path) -> Result<(), Error> {
+    let claims_db = dir.join("claims.db");
+    if !claims_db.exists() {
+        return Ok(());
+    }
+    let version: i64 = Connection::open(&claims_db)
+        .and_then(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
+        .map_err(storage_err)?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    for db in ["claims.db", "sync.db"] {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.join(format!("{db}{suffix}"));
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(storage_err)?;
+            }
+        }
+    }
+    let blobs = dir.join("blobs");
+    if blobs.exists() {
+        std::fs::remove_dir_all(&blobs).map_err(storage_err)?;
+    }
+    Ok(())
 }
 
 /// Open (or create) the sync engine's cursor store for a database opened
@@ -130,7 +169,7 @@ impl SqliteClaimStorage {
                  arrival    INTEGER NOT NULL,
                  received_at INTEGER NOT NULL,
                  header     BLOB NOT NULL,
-                 signature  BLOB NOT NULL,
+                 tag        BLOB NOT NULL,
                  body       BLOB
              );
              CREATE INDEX IF NOT EXISTS claims_by_log ON claims(log_id, arrival);
@@ -150,6 +189,8 @@ impl SqliteClaimStorage {
              );",
         )
         .map_err(storage_err)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(storage_err)?;
         Ok(SqliteClaimStorage { conn })
     }
 }
@@ -161,14 +202,15 @@ impl SqliteClaimStorage {
 /// matches what fsck recomputes.
 fn row_to_claim(
     header_bytes: Vec<u8>,
-    signature: Vec<u8>,
+    tag: Vec<u8>,
     body_bytes: Option<Vec<u8>>,
     arrival: i64,
     received_at: i64,
 ) -> Result<StoredClaim, Error> {
     let header = EventHeader::decode(&header_bytes)?;
-    let signature = Signature::from_slice(&signature)
-        .map_err(|_| Error::Storage("stored signature is not 64 bytes".into()))?;
+    let tag: [u8; 32] = tag
+        .try_into()
+        .map_err(|_| Error::Storage("stored tag is not 32 bytes".into()))?;
     let body = match &body_bytes {
         Some(b) => Some(vouch_core::cbor::from_bytes(b)?),
         None => None,
@@ -178,9 +220,9 @@ fn row_to_claim(
         None => Edges::default(),
     };
     Ok(StoredClaim {
-        signed: SignedEvent {
+        event: Event {
             header_bytes,
-            signature,
+            tag,
             body_bytes,
         },
         header,
@@ -199,7 +241,7 @@ impl ClaimStorage for SqliteClaimStorage {
         let row: Option<ClaimRow> = self
             .conn
             .query_row(
-                "SELECT header, signature, body, arrival, received_at
+                "SELECT header, tag, body, arrival, received_at
                  FROM claims WHERE id = ?1",
                 params![id.0.as_slice()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -214,16 +256,16 @@ impl ClaimStorage for SqliteClaimStorage {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO claims
-                     (id, log_id, arrival, received_at, header, signature, body)
+                     (id, log_id, arrival, received_at, header, tag, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    claim.signed.id().0.as_slice(),
+                    claim.event.id().0.as_slice(),
                     claim.header.log_id.0.as_slice(),
                     claim.arrival as i64,
                     claim.received_at,
-                    claim.signed.header_bytes,
-                    claim.signed.signature.to_bytes().as_slice(),
-                    claim.signed.body_bytes,
+                    claim.event.header_bytes,
+                    claim.event.tag.as_slice(),
+                    claim.event.body_bytes,
                 ],
             )
             .map_err(storage_err)?;
@@ -241,7 +283,7 @@ impl ClaimStorage for SqliteClaimStorage {
     fn scan_claims(&self, visit: &mut dyn FnMut(&StoredClaim)) -> Result<(), Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT header, signature, body, arrival, received_at FROM claims")
+            .prepare("SELECT header, tag, body, arrival, received_at FROM claims")
             .map_err(storage_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -265,7 +307,7 @@ impl ClaimStorage for SqliteClaimStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT header, signature, body, arrival, received_at
+                "SELECT header, tag, body, arrival, received_at
                  FROM claims WHERE log_id = ?1",
             )
             .map_err(storage_err)?;

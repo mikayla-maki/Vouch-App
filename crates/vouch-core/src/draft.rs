@@ -10,7 +10,7 @@
 //!
 //! [`Database::compose`]: crate::Database::compose
 
-use crate::claim::SignedEvent;
+use crate::claim::Event;
 use crate::value::{ClaimRef, Value};
 
 /// One attachment: where it goes in the body, its bytes, its mime type.
@@ -68,7 +68,7 @@ impl Draft {
     /// Quote another claim whole: the event travels inside this one and
     /// re-verifies wherever it lands — the only sanctioned way third-party
     /// content crosses the network through you.
-    pub fn embed(self, key: impl Into<String>, event: SignedEvent) -> Draft {
+    pub fn embed(self, key: impl Into<String>, event: Event) -> Draft {
         self.field(key, Value::Embed(Box::new(event)))
     }
 

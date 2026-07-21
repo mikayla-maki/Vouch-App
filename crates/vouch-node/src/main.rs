@@ -71,7 +71,7 @@ fn main() {
     std::thread::spawn(move || futures::executor::block_on(actor.run()));
 
     println!("[{name}] publishing to own mailbox at {url}");
-    vouch_transport::connect_mailbox(&peer, &url, my_log);
+    vouch_transport::connect_mailbox(&peer, &url, my_log, Some(identity.clone()));
 
     let mut watched: Vec<vouch_core::LogId> = Vec::new();
     for entry in env_var("VOUCH_FOLLOW").unwrap_or_default().split(',') {
@@ -83,7 +83,7 @@ fn main() {
             .or_else(|| vouch_transport::parse_log_id(entry))
             .unwrap_or_else(|| panic!("VOUCH_FOLLOW entry is not an address or LogId: {entry}"));
         println!("[{name}] following {log} via its mailbox");
-        vouch_transport::connect_mailbox(&peer, &url, log);
+        vouch_transport::connect_mailbox(&peer, &url, log, None);
         watched.push(log);
     }
 

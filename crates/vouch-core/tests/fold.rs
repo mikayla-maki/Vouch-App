@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use vouch_core::e2ee::{self, ContentKey, Identity};
 use vouch_core::fold::{ClaimView, fold};
-use vouch_core::{ClaimRef, Database, Draft, LogId, SignedEvent, Value, Writer};
+use vouch_core::{ClaimRef, Database, Draft, LogId, Event, Value, Writer};
 
 fn accept_all(_: &ClaimView) -> bool {
     true
@@ -32,7 +32,7 @@ fn log_of(seed: u8) -> LogId {
 }
 
 /// Seal `draft` with seed's content key and mint it into their log.
-fn seal(db: &mut Database, seed: u8, draft: Draft) -> SignedEvent {
+fn seal(db: &mut Database, seed: u8, draft: Draft) -> Event {
     let id = Identity::from_seed([seed; 32]);
     let sealed = e2ee::seal_draft(&id.content_key(), &draft).unwrap();
     db.claim(&id.log_id(), sealed.body_value()).unwrap()
@@ -76,7 +76,7 @@ fn of(refs: impl IntoIterator<Item = ClaimRef>) -> Value {
     Value::Array(refs.into_iter().map(Value::ClaimRef).collect())
 }
 
-fn rec_ref(seed: u8, event: &SignedEvent) -> ClaimRef {
+fn rec_ref(seed: u8, event: &Event) -> ClaimRef {
     ClaimRef {
         log_id: log_of(seed),
         hash: event.id(),

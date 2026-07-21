@@ -7,14 +7,14 @@
 //! plus two monotone side effects:
 //!
 //! - **Redaction.** A `redact` claim (own log only) asks conformant stores
-//!   to forget a body. The header and signature stay — a *signed tombstone*
+//!   to forget a body. The header and tag stay — an *authenticated tombstone*
 //!   — so the claim's existence remains verifiable and serveable while its
 //!   content is gone. Monotone: no un-redact, in any arrival order.
 //!
 //! - **Body fill-in.** A header-only event (served tombstone, stripped by a
 //!   lossy peer) stores as a bodiless claim; if the body later arrives from
 //!   any pipe, it verifies against the header's body hash and attaches.
-//!   Only a signed redact claim makes bodilessness permanent — so a peer
+//!   Only a redact claim makes bodilessness permanent — so a peer
 //!   stripping bodies is a recoverable nuisance, not a censor.
 //!
 //! Embedded claims are *content, not rows*: a quote is part of the speech
@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::blob::BlobStore;
-use crate::claim::{Claim, EventHeader, SignedEvent};
+use crate::claim::{Claim, EventHeader, Event};
 use crate::error::Error;
 use crate::keys::LogId;
 use crate::storage::{ClaimStorage, MemoryClaimStorage};
@@ -50,7 +50,7 @@ const READ: &str = "claim storage read failed";
 /// (check [`ClaimStore::redaction`] to tell which).
 #[derive(Debug, Clone)]
 pub struct StoredClaim {
-    pub signed: SignedEvent,
+    pub event: Event,
     pub header: EventHeader,
     pub body: Option<Value>,
     /// Every outgoing claim edge, collected *through* embeds: each
@@ -119,7 +119,7 @@ pub type ClaimSnapshot = (Vec<u8>, Option<Vec<u8>>);
 /// A canonical snapshot of the store's *convergent* state: exactly the
 /// replicated substance — headers, bodies, redactions — and nothing local.
 ///
-/// Local metadata (arrival order, receive times, which valid signature we
+/// Local metadata (arrival order, receive times, which tag bytes we
 /// hold — an author can produce many; any one of them is equal proof of
 /// authorship) is deliberately excluded: sync exchanges claims by id and
 /// would never propagate it, so including it would let two fully-synced
@@ -170,12 +170,19 @@ impl ClaimStore {
         );
     }
 
-    /// Verify and store one signed event, applying any redaction its body
+    /// Check and store one event, applying any redaction its body
     /// carries. Order-insensitive and idempotent.
     ///
-    /// Embedded claims are verified in place and indexed as edges of this
+    /// The check is structural (header decodes, body pinned by its hash) —
+    /// NOT authenticity, which a store cannot judge: claims authenticate to
+    /// key-holders at read time
+    /// ([`e2ee::decrypted_view`](crate::e2ee::decrypted_view)), and the
+    /// gate against strangers' bytes is the transport (publish-gated
+    /// mailboxes, the per-pipe log check in sync).
+    ///
+    /// Embedded claims are checked in place and indexed as edges of this
     /// event — never stored as rows of their own. Embed problems and
-    /// redaction skips are counted in the report, never fatal. Verification
+    /// redaction skips are counted in the report, never fatal. Structural
     /// errors occur before any mutation; storage errors surface as
     /// [`Error::Storage`].
     ///
@@ -184,7 +191,7 @@ impl ClaimStore {
     /// write ordering makes `put_claim` the commit point — a partial ingest
     /// leaves only idempotent index rows that redelivery of the same event
     /// completes.
-    pub fn ingest(&mut self, event: SignedEvent) -> Result<IngestReport, Error> {
+    pub fn ingest(&mut self, event: Event) -> Result<IngestReport, Error> {
         self.ingest_at(event, 0)
     }
 
@@ -193,7 +200,7 @@ impl ClaimStore {
     /// vouch-core never reads a clock itself — time is injected.
     pub fn ingest_at(
         &mut self,
-        event: SignedEvent,
+        event: Event,
         received_at: i64,
     ) -> Result<IngestReport, Error> {
         self.guard();
@@ -229,11 +236,11 @@ impl ClaimStore {
 
     fn ingest_inner(
         &mut self,
-        event: SignedEvent,
+        event: Event,
         received_at: i64,
         report: &mut IngestReport,
     ) -> Result<(), Error> {
-        let claim = event.verify()?;
+        let claim = event.check()?;
         let id = event.id();
 
         // Is THIS claim an engine-recognized redaction of its own log?
@@ -261,10 +268,11 @@ impl ClaimStore {
 
         let existing = self.storage.get_claim(&id)?;
         if let Some(c) = &existing {
-            // The first valid signature we saw stays. An author can mint
-            // many valid signatures for one header; all are equal proof of
-            // authorship, so which one we hold is local metadata, not state
-            // (and is excluded from StateVector accordingly).
+            // The first tag we saw stays. HMAC is deterministic, so between
+            // honest parties there is exactly one valid tag per header —
+            // but a store can't check it, so which bytes we hold is local
+            // metadata, not state (and is excluded from StateVector
+            // accordingly; readers judge tags themselves at read time).
             if c.body.is_some() || body.is_none() {
                 report.duplicates += 1;
                 return Ok(());
@@ -293,7 +301,7 @@ impl ClaimStore {
 
         match existing {
             Some(mut c) => {
-                c.signed.body_bytes = event.body_bytes;
+                c.event.body_bytes = event.body_bytes;
                 c.body = body;
                 c.refs = refs;
                 c.blobs = blobs;
@@ -308,9 +316,9 @@ impl ClaimStore {
                 self.storage
                     .scan_log(&claim.header.log_id, &mut |_| arrival += 1)?;
                 self.storage.put_claim(StoredClaim {
-                    signed: SignedEvent {
+                    event: Event {
                         header_bytes: event.header_bytes,
-                        signature: event.signature,
+                        tag: event.tag,
                         body_bytes: if suppressed { None } else { event.body_bytes },
                     },
                     header: claim.header,
@@ -366,7 +374,7 @@ impl ClaimStore {
                 self.storage.remove_blob_referrer(&b.hash, &target)?;
             }
             c.body = None;
-            c.signed.body_bytes = None;
+            c.event.body_bytes = None;
             self.storage.put_claim(c)?;
         }
         Ok(effective)
@@ -449,25 +457,25 @@ impl ClaimStore {
                 }
             })
             .expect(READ);
-        out.sort_by_key(|c| (body_at(&c.body), c.signed.id()));
+        out.sort_by_key(|c| (body_at(&c.body), c.event.id()));
         out
     }
 
     /// Everything we hold for one log past a cursor — content claims *and*
-    /// signed tombstones — in THIS store's arrival order. The cursor is a
+    /// tombstones — in THIS store's arrival order. The cursor is a
     /// count: "I have `have` of your claims for this log; send the rest."
     /// It advances by the number of events returned, and is only
     /// meaningful against this store (arrival order is local). Tombstones
     /// ride along as headers without bodies, so a backfiller never
     /// downloads redacted content, and the markers are signed by
     /// construction.
-    pub fn serve_since(&self, log_id: &LogId, have: u64) -> Vec<SignedEvent> {
+    pub fn serve_since(&self, log_id: &LogId, have: u64) -> Vec<Event> {
         self.guard();
         let mut out = Vec::new();
         self.storage
             .scan_log(log_id, &mut |c| {
                 if c.arrival >= have {
-                    out.push((c.arrival, c.signed.clone()));
+                    out.push((c.arrival, c.event.clone()));
                 }
             })
             .expect(READ);
@@ -475,18 +483,18 @@ impl ClaimStore {
         out.into_iter().map(|(_, e)| e).collect()
     }
 
-    /// Every artifact we hold — content claims and signed tombstones, all
+    /// Every artifact we hold — content claims and tombstones, all
     /// logs — in canonical `(log, id)` order (convergent: two stores with
     /// the same state dump identical streams). This is the store
     /// serialized: replaying these frames through `ingest` reconstructs
     /// the convergent state exactly. Backup and the file transport are
     /// this one dump.
-    pub fn events(&self) -> Vec<SignedEvent> {
+    pub fn events(&self) -> Vec<Event> {
         self.guard();
         let mut out = Vec::new();
         self.storage
             .scan_claims(&mut |c| {
-                out.push((c.header.log_id, c.signed.id(), c.signed.clone()));
+                out.push((c.header.log_id, c.event.id(), c.event.clone()));
             })
             .expect(READ);
         out.sort_by_key(|(log, id, _)| (*log, *id));
@@ -531,7 +539,7 @@ impl ClaimStore {
             .scan_log(log_id, &mut |c| {
                 xor_into(
                     &mut acc,
-                    fingerprint_claim(&c.signed.id(), c.body.is_some()),
+                    fingerprint_claim(&c.event.id(), c.body.is_some()),
                 );
             })
             .expect(READ);
@@ -566,7 +574,7 @@ impl ClaimStore {
         self.guard();
         let mut out = Vec::new();
         self.storage
-            .scan_log(log_id, &mut |c| out.push((c.signed.id(), c.body.is_some())))
+            .scan_log(log_id, &mut |c| out.push((c.event.id(), c.body.is_some())))
             .expect(READ);
         out.sort_by_key(|(id, _)| *id);
         out
@@ -585,7 +593,7 @@ impl ClaimStore {
                 }
             })
             .expect(READ);
-        out.sort_by_key(|c| (body_at(&c.body), c.header.log_id, c.signed.id()));
+        out.sort_by_key(|c| (body_at(&c.body), c.header.log_id, c.event.id()));
         out
     }
 
@@ -596,8 +604,8 @@ impl ClaimStore {
         self.storage
             .scan_claims(&mut |c| {
                 claims.insert(
-                    c.signed.id(),
-                    (c.signed.header_bytes.clone(), c.signed.body_bytes.clone()),
+                    c.event.id(),
+                    (c.event.header_bytes.clone(), c.event.body_bytes.clone()),
                 );
             })
             .expect(READ);
@@ -675,11 +683,12 @@ impl ClaimStore {
     /// The fsck: cross-check the whole store against its own invariants.
     /// Returns human-readable violations; empty means healthy.
     ///
-    /// Every stored artifact re-verifies (signature, body hash — rows are
-    /// self-authenticating, so a backend cannot lie about *content*, only
-    /// lose it); redacted claims must be bodiless; the index edges must
-    /// agree with the bodies in both directions. Run it after chaos tests,
-    /// or as a paranoia pass at app startup.
+    /// Every stored artifact re-checks structurally (header decodes, body
+    /// hash pins — rows are content-addressed, so a backend cannot lie
+    /// about *content*, only lose it; authenticity is the reader's
+    /// judgment, not storage's); redacted claims must be bodiless; the
+    /// index edges must agree with the bodies in both directions. Run it
+    /// after chaos tests, or as a paranoia pass at app startup.
     ///
     /// One caveat by design: a store that crashed mid-ingest *without*
     /// transactions may transiently hold phantom index rows until the
@@ -695,12 +704,12 @@ impl ClaimStore {
 
         // Pass 1: every claim row is self-consistent and forward-indexed.
         for c in &claims {
-            let id = c.signed.id();
-            if let Err(e) = c.signed.verify() {
-                problems.push(format!("claim {id:?} fails verification: {e}"));
+            let id = c.event.id();
+            if let Err(e) = c.event.check() {
+                problems.push(format!("claim {id:?} fails structural check: {e}"));
                 continue;
             }
-            if c.body.is_some() != c.signed.body_bytes.is_some() {
+            if c.body.is_some() != c.event.body_bytes.is_some() {
                 problems.push(format!(
                     "claim {id:?}: decoded body and body bytes disagree"
                 ));
@@ -757,7 +766,7 @@ impl ClaimStore {
         // TARGETS are fine — edges to claims we haven't seen are real
         // edges; phantom SOURCES are not.)
         let by_id: HashMap<ClaimHash, &StoredClaim> =
-            claims.iter().map(|c| (c.signed.id(), c)).collect();
+            claims.iter().map(|c| (c.event.id(), c)).collect();
         let mut backlink_rows = Vec::new();
         self.storage
             .scan_backlinks(&mut |t, s| backlink_rows.push((t, s)))

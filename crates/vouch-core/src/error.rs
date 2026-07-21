@@ -31,10 +31,6 @@ pub enum Error {
     #[error("no writer for log {0}; claims can only be minted into owned logs")]
     NotOurLog(LogId),
 
-    /// Signature verification failed.
-    #[error("signature verification failed for a claim by {log_id}")]
-    BadSignature { log_id: LogId },
-
     /// The wire version is not one this implementation understands. Carries
     /// the claimed version faithfully (it may be wider than the current
     /// u16-range version field, e.g. a far-future or garbage value).

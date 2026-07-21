@@ -5,9 +5,9 @@
 //! hostile peer stripping content) is recoverable, because only a signed
 //! redact claim makes it permanent.
 
-use vouch_core::{ClaimHash, ClaimRef, ClaimStore, SignedEvent, Value, Writer};
+use vouch_core::{ClaimHash, ClaimRef, ClaimStore, Event, Value, Writer};
 
-fn rec(db: &mut Writer, at: i64, subject: &str) -> SignedEvent {
+fn rec(db: &mut Writer, at: i64, subject: &str) -> Event {
     db.claim(Value::map([
         ("type", Value::text("rec")),
         ("at", Value::Int(at)),
@@ -16,7 +16,7 @@ fn rec(db: &mut Writer, at: i64, subject: &str) -> SignedEvent {
     .unwrap()
 }
 
-fn redact(db: &mut Writer, at: i64, target: &SignedEvent) -> SignedEvent {
+fn redact(db: &mut Writer, at: i64, target: &Event) -> Event {
     db.claim(Value::map([
         ("type", Value::text("redact")),
         ("at", Value::Int(at)),
@@ -25,7 +25,7 @@ fn redact(db: &mut Writer, at: i64, target: &SignedEvent) -> SignedEvent {
     .unwrap()
 }
 
-fn vouch(db: &mut Writer, at: i64, original: &SignedEvent) -> SignedEvent {
+fn vouch(db: &mut Writer, at: i64, original: &Event) -> Event {
     db.claim(Value::map([
         ("type", Value::text("vouch")),
         ("at", Value::Int(at)),
@@ -34,14 +34,14 @@ fn vouch(db: &mut Writer, at: i64, original: &SignedEvent) -> SignedEvent {
     .unwrap()
 }
 
-fn cref(event: &SignedEvent) -> ClaimRef {
+fn cref(event: &Event) -> ClaimRef {
     ClaimRef {
         log_id: event.header().unwrap().log_id,
         hash: event.id(),
     }
 }
 
-fn id_of(event: &SignedEvent) -> ClaimHash {
+fn id_of(event: &Event) -> ClaimHash {
     event.id()
 }
 
@@ -67,19 +67,19 @@ fn redact_drops_body_keeps_signed_tombstone_and_cursor() {
     store.ingest(disavowal.clone()).unwrap();
     store.ingest(redaction).unwrap();
 
-    // Body gone, signed tombstone present and independently verifiable,
+    // Body gone, tombstone present and structurally sound,
     // advisory cursor not regressed.
     assert!(!store.contains(&target));
     let tomb = store.get(&target).expect("tombstone remains");
     assert!(tomb.body.is_none());
-    assert!(tomb.signed.body_bytes.is_none());
-    tomb.signed.verify().expect("tombstone still verifies");
+    assert!(tomb.event.body_bytes.is_none());
+    tomb.event.check().expect("tombstone still checks out");
     assert_eq!(store.redaction(&target), Some(redaction_id));
     assert_eq!(store.log_len(&alice.id()), 2);
     // The log shows only the redact claim; the timeline never shows the
     // tombstone.
     assert_eq!(store.log(&alice.id()).len(), 1);
-    assert!(store.timeline().iter().all(|c| c.signed.id() != target));
+    assert!(store.timeline().iter().all(|c| c.event.id() != target));
     // Backlinks TO the tombstone survive (the disavowal still points there);
     // that's history about the claim, not content of it.
     assert_eq!(store.backlinks(&target).len(), 2); // disavowal + redact claim
@@ -125,7 +125,7 @@ fn serve_since_serves_signed_tombstones_and_backfill_converges() {
 
     // The serve stream contains the live claims and, in place of the
     // redacted one, its signed tombstone — never the redacted body.
-    let served: Vec<SignedEvent> = store.serve_since(&alice.id(), 0);
+    let served: Vec<Event> = store.serve_since(&alice.id(), 0);
     assert_eq!(served.len(), 3);
     assert_eq!(served[0], keep);
     assert_eq!(served[1], regret.without_body());

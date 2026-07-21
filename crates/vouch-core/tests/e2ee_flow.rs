@@ -7,14 +7,14 @@ use std::collections::BTreeMap;
 
 use vouch_core::e2ee::{self, Address, Identity};
 use vouch_core::fold::ClaimView;
-use vouch_core::{Database, Draft, LogId, SignedEvent, Value, Writer};
+use vouch_core::{Database, Draft, LogId, Event, Value, Writer};
 
 fn accept_all(_: &ClaimView) -> bool {
     true
 }
 
 fn pull(from: &Database, into: &mut Database, log: &LogId) {
-    let events: Vec<SignedEvent> = from.claims().serve_since(log, 0);
+    let events: Vec<Event> = from.claims().serve_since(log, 0);
     for e in events {
         into.ingest(e).unwrap();
     }
@@ -121,4 +121,88 @@ fn sealed_edits_fold_with_their_sealed_original() {
     let recs = vouch_core::rec::recommendations(&view, &accept_all);
     assert_eq!(recs.len(), 1, "envelope + sealed edit are one component");
     assert_eq!(recs[0].subject, "New name");
+}
+
+/// The full going-on-the-record loop through real storage and sync: alice
+/// mints a sealed rec, then attests it; bob (following her) sees the rec
+/// badge as on-the-record. When she edits past the attested claim, the
+/// badge downgrades — an attestation binds words, not the thread.
+#[test]
+fn an_attested_rec_reads_on_the_record_until_edited_past_it() {
+    let alice_seed = [1u8; 32];
+    let alice_id = Identity::from_seed(alice_seed);
+    let mut alice = Database::new();
+    let alice_log = alice.add_writer(Writer::from_seed(alice_seed));
+
+    let rec = Draft::new("rec")
+        .at(1)
+        .text("subject", "Delfina")
+        .text("body", "Overrated, honestly");
+    let sealed = e2ee::seal_draft(&alice_id.content_key(), &rec).unwrap();
+    let rec_event = alice.claim(&alice_log, sealed.body_value()).unwrap();
+
+    // Going on the record: an ordinary sealed claim whose payload is the
+    // one signature in the system.
+    let attest = alice_id.attest(rec_event.id(), &rec.body_value()).at(2);
+    let sealed_attest = e2ee::seal_draft(&alice_id.content_key(), &attest).unwrap();
+    alice.claim(&alice_log, sealed_attest.body_value()).unwrap();
+
+    let mut bob = Database::new();
+    pull(&alice, &mut bob, &alice_log);
+    let bob_id = Identity::from_seed([2u8; 32]);
+    let keys = e2ee::keys_for(&bob_id, &[alice_id.address()]);
+    let view = e2ee::decrypted_view(bob.claims(), &keys);
+    let recs = vouch_core::rec::recommendations(&view, &accept_all);
+    assert_eq!(recs.len(), 1);
+    assert!(recs[0].on_the_record(), "bob sees alice went on the record");
+    assert!(!recs[0].attested_earlier());
+
+    // Alice edits the body: the shown text is no longer what she signed.
+    let edit = Draft::new("edit")
+        .at(3)
+        .field(
+            "of",
+            Value::Array(vec![Value::ClaimRef(vouch_core::ClaimRef {
+                log_id: alice_log,
+                hash: rec_event.id(),
+            })]),
+        )
+        .text("body", "Fine, the pizza is good actually");
+    let sealed_edit = e2ee::seal_draft(&alice_id.content_key(), &edit).unwrap();
+    alice.claim(&alice_log, sealed_edit.body_value()).unwrap();
+
+    pull(&alice, &mut bob, &alice_log);
+    let view = e2ee::decrypted_view(bob.claims(), &keys);
+    let recs = vouch_core::rec::recommendations(&view, &accept_all);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].body, "Fine, the pizza is good actually");
+    assert!(
+        !recs[0].on_the_record(),
+        "the edit is new, unattested speech"
+    );
+    assert!(
+        recs[0].attested_earlier(),
+        "but the earlier attestation is remembered"
+    );
+
+    // A forged attestation from someone else's log binds nothing: mallory
+    // (who holds alice's address, so she can read AND mint valid-tagged
+    // claims into her own log) attests alice's claim — inert.
+    let mallory_seed = [6u8; 32];
+    let mallory_id = Identity::from_seed(mallory_seed);
+    let mut mallory = Database::new();
+    let mallory_log = mallory.add_writer(Writer::from_seed(mallory_seed));
+    let forged = mallory_id.attest(rec_event.id(), &rec.body_value()).at(4);
+    let sealed_forged = e2ee::seal_draft(&mallory_id.content_key(), &forged).unwrap();
+    mallory.claim(&mallory_log, sealed_forged.body_value()).unwrap();
+    pull(&mallory, &mut bob, &mallory_log);
+
+    let keys = e2ee::keys_for(&bob_id, &[alice_id.address(), mallory_id.address()]);
+    let view = e2ee::decrypted_view(bob.claims(), &keys);
+    let recs = vouch_core::rec::recommendations(&view, &accept_all);
+    let rec = recs.iter().find(|r| r.subject == "Delfina").unwrap();
+    assert!(
+        !rec.on_the_record(),
+        "only the author's own signature escalates their words"
+    );
 }

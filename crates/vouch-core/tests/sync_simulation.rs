@@ -5,7 +5,7 @@
 use vouch_core::sync::{
     Error, InstanceId, MemorySyncState, Request, Response, SyncReport, SyncSession, drive, respond,
 };
-use vouch_core::{ClaimRef, Database, LogId, SignedEvent, Value, Writer};
+use vouch_core::{ClaimRef, Database, LogId, Event, Value, Writer};
 
 /// A peer: a database plus the incarnation of its arrival order.
 struct Peer {
@@ -38,7 +38,7 @@ fn sync(
     .unwrap()
 }
 
-fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> SignedEvent {
+fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> Event {
     db.claim(
         log,
         Value::map([
@@ -50,7 +50,7 @@ fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> SignedEvent {
     .unwrap()
 }
 
-fn redact(db: &mut Database, log: &LogId, at: i64, target: &SignedEvent) -> SignedEvent {
+fn redact(db: &mut Database, log: &LogId, at: i64, target: &Event) -> Event {
     db.claim(
         log,
         Value::map([
@@ -256,7 +256,7 @@ fn stale_backup_under_the_same_instance_is_caught_by_the_fingerprint() {
     // differ; only the fingerprint settle notices.
     let mut author = Database::new();
     let log = author.add_writer(Writer::from_seed([5; 32]));
-    let events: Vec<SignedEvent> = (0..5)
+    let events: Vec<Event> = (0..5)
         .map(|i| rec(&mut author, &log, i, &format!("rec {i}")))
         .collect();
 
@@ -329,7 +329,7 @@ fn a_pull_only_reader_caches_the_benign_difference() {
     // through hash lists again until the relay's set actually changes.
     let mut author = Database::new();
     let log = author.add_writer(Writer::from_seed([6; 32]));
-    let events: Vec<SignedEvent> = (0..4)
+    let events: Vec<Event> = (0..4)
         .map(|i| rec(&mut author, &log, i, &format!("rec {i}")))
         .collect();
 
@@ -370,7 +370,7 @@ fn stripped_bodies_heal_through_reconciliation() {
     // no new rows do — counts never move, only the fingerprint does.
     let mut author = Database::new();
     let log = author.add_writer(Writer::from_seed([7; 32]));
-    let events: Vec<SignedEvent> = (0..3)
+    let events: Vec<Event> = (0..3)
         .map(|i| rec(&mut author, &log, i, &format!("rec {i}")))
         .collect();
 

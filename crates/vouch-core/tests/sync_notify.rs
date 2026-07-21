@@ -6,7 +6,7 @@ use vouch_core::sync::{
     Error, InstanceId, MemorySyncState, Notify, Request, Response, SyncReport, SyncSession,
     SyncState, apply_notify, drive, notify_for, respond,
 };
-use vouch_core::{ClaimRef, Database, LogId, SignedEvent, Value, Writer};
+use vouch_core::{ClaimRef, Database, LogId, Event, Value, Writer};
 
 struct Peer {
     db: Database,
@@ -55,7 +55,7 @@ fn session_cost(
     (messages, report)
 }
 
-fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> SignedEvent {
+fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> Event {
     db.claim(
         log,
         Value::map([
@@ -67,7 +67,7 @@ fn rec(db: &mut Database, log: &LogId, at: i64, text: &str) -> SignedEvent {
     .unwrap()
 }
 
-fn redact(db: &mut Database, log: &LogId, at: i64, target: &SignedEvent) -> SignedEvent {
+fn redact(db: &mut Database, log: &LogId, at: i64, target: &Event) -> Event {
     db.claim(
         log,
         Value::map([
@@ -91,7 +91,7 @@ fn publish_and_notify(
     author: &mut Database,
     relay: &mut Peer,
     log: &LogId,
-    event: SignedEvent,
+    event: Event,
 ) -> Notify {
     author.ingest(event.clone()).ok();
     relay.db.ingest(event.clone()).unwrap();

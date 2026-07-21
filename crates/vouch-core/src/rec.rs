@@ -5,8 +5,9 @@
 //! full `fields` map stays available underneath for anything else anyone
 //! ever enriches it with, conflicts included.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::e2ee;
 use crate::fold::{self, ClaimView, Comment, FieldState};
 use crate::keys::LogId;
 use crate::value::{ClaimHash, Value};
@@ -23,6 +24,12 @@ pub struct Recommendation {
     pub body: String,
     pub fields: BTreeMap<String, FieldState>,
     pub comments: Vec<Comment>,
+    /// Claims in this component the author went on the record about:
+    /// every claim bound by a *valid* attestation (right author, signature
+    /// verifies against the exact plaintext in the view). An attestation
+    /// binds specific words — an edit after attesting is new, unattested
+    /// speech, which is why this is a set of claims and not a flag.
+    pub attested: BTreeSet<ClaimHash>,
 }
 
 impl Recommendation {
@@ -46,6 +53,24 @@ impl Recommendation {
             .and_then(FieldState::current_contribution)
             .map(|c| c.at)
             .unwrap_or(0)
+    }
+
+    /// On the record: everything currently shown (the live `subject` and
+    /// `body` contributions) is attested. The strongest badge state.
+    pub fn on_the_record(&self) -> bool {
+        ["subject", "body"].iter().all(|field| {
+            self.fields
+                .get(*field)
+                .and_then(FieldState::current_contribution)
+                .is_some_and(|c| self.attested.contains(&c.claim))
+        })
+    }
+
+    /// The author attested some earlier version, but the text shown now
+    /// has moved past it — render "attested as of an earlier version",
+    /// never the full badge.
+    pub fn attested_earlier(&self) -> bool {
+        !self.attested.is_empty() && !self.on_the_record()
     }
 
     /// Every claim that shaped this recommendation, oldest first: each
@@ -140,6 +165,7 @@ pub fn recommendations(
     view: &[ClaimView],
     accept: &dyn Fn(&ClaimView) -> bool,
 ) -> Vec<Recommendation> {
+    let attested = valid_attestations(view);
     fold::fold(view, ROOT_TYPE, EDIT_TYPE, COMMENT_TYPE, accept)
         .into_iter()
         .filter_map(|c| {
@@ -157,6 +183,7 @@ pub fn recommendations(
                 .to_string();
             Some(Recommendation {
                 id: c.id,
+                attested: c.claims.intersection(&attested).copied().collect(),
                 claims: c.claims,
                 subject,
                 body,
@@ -165,4 +192,33 @@ pub fn recommendations(
             })
         })
         .collect()
+}
+
+/// Every claim in the view bound by a valid attestation: the attest claim
+/// names it (`of`), was uttered by the *same log* (your attestation only
+/// ever binds your own words), and its Ed25519 signature verifies against
+/// the exact plaintext this view decrypted. An attest that fails any of
+/// those is inert — an invalid signature never downgrades the claim it
+/// points at, it just fails to escalate it.
+fn valid_attestations(view: &[ClaimView]) -> BTreeSet<ClaimHash> {
+    let by_id: HashMap<ClaimHash, &ClaimView> = view.iter().map(|c| (c.id, c)).collect();
+    let mut attested = BTreeSet::new();
+    for attest in view {
+        if attest.claim_type() != Some(e2ee::ATTEST_TYPE) {
+            continue;
+        }
+        for target_id in &attest.refs {
+            let Some(target) = by_id.get(target_id) else {
+                continue;
+            };
+            if target.author != attest.author {
+                continue;
+            }
+            let words = Value::Map(target.body.clone());
+            if e2ee::verify_attest(target.author, *target_id, &words, &attest.body) {
+                attested.insert(*target_id);
+            }
+        }
+    }
+    attested
 }

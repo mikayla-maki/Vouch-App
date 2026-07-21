@@ -2,10 +2,10 @@
 //! ingests from any pipe, serves peers, and maintains itself — a complete
 //! sync session is two `Database`s and a loop, no I/O anywhere.
 
-use vouch_core::{ClaimRef, Database, Error, LogId, SignedEvent, Value, Writer};
+use vouch_core::{ClaimRef, Database, Error, LogId, Event, Value, Writer};
 
 fn pull(from: &Database, into: &mut Database, log: &LogId, since: u64) {
-    let events: Vec<SignedEvent> = from.claims().serve_since(log, since);
+    let events: Vec<Event> = from.claims().serve_since(log, since);
     for e in events {
         into.ingest(e).unwrap();
     }

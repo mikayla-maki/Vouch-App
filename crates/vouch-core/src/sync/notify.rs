@@ -18,17 +18,19 @@
 //!   fast-forwards here too: a cache match proves the sender's set is one
 //!   we reconciled to and then tracked, i.e. a subset of ours.
 //! - **Not settled**: the frame degrades into a doorbell with a free claim
-//!   attached. Hold what was pushed (ingest already verified it), report
+//!   attached. Hold what was pushed (ingest already checked it), report
 //!   `settled: false`, and let the app run an ordinary session.
 //!
-//! Nothing here can be made unsafe by a lying sender: events verify at
-//! ingest, coordinates are advisory (the cursor only fast-forwards on
+//! Nothing here can be made unsafe by a lying sender: events are checked
+//! at ingest and judged by readers at decrypt time (a pipe subscribed to
+//! one log accepts only that log's events — see the smuggling check
+//! below), coordinates are advisory (the cursor only fast-forwards on
 //! fingerprint match, and the next session's settle catches real
 //! divergence), and a wrong homomorphic guess just fails the equality
 //! check and costs one session.
 
 use crate::{
-    BlobRef, Database, Error as CoreError, LogId, SignedEvent, Value, cbor, fingerprint_claim,
+    BlobRef, Database, Error as CoreError, LogId, Event, Value, cbor, fingerprint_claim,
     fingerprint_redaction, redact_target,
 };
 
@@ -67,7 +69,7 @@ pub fn notify_for(
     db: &Database,
     instance: InstanceId,
     log: &LogId,
-    events: Vec<SignedEvent>,
+    events: Vec<Event>,
 ) -> Notify {
     Notify {
         log: *log,
@@ -151,7 +153,7 @@ pub fn apply_notify(
 /// the sender already held the claim, a redaction tiebreak went the other
 /// way — the settled cache simply stops matching and the next settle runs
 /// a session. A wrong guess costs a round trip, never correctness.
-fn sender_delta(db: &Database, log: &LogId, event: &SignedEvent) -> [u8; 32] {
+fn sender_delta(db: &Database, log: &LogId, event: &Event) -> [u8; 32] {
     let id = event.id();
     let body: Option<Value> = event
         .body_bytes

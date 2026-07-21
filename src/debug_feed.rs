@@ -49,7 +49,7 @@ impl DebugFeed {
         claims.sort_by(|a, b| {
             claim_at(b)
                 .cmp(&claim_at(a))
-                .then_with(|| a.signed.id().cmp(&b.signed.id()))
+                .then_with(|| a.event.id().cmp(&b.event.id()))
         });
         let _ = this.update(cx, |feed, cx| {
             feed.claims = claims;
