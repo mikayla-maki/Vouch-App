@@ -20,10 +20,15 @@ pub struct Sidebar {
     follows: Vec<(LogId, Option<String>)>,
     /// An update is staged and waiting; restarting applies it.
     update_ready: bool,
+    /// "Check for updates" row label, state-dependent ("Checking…", "Up
+    /// to date ✓", …). `None` hides the row (dev builds, or an update is
+    /// already staged and the restart button has taken over).
+    check_label: Option<SharedString>,
     on_toggle: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_debug: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_add_follow: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_restart_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_check_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl Sidebar {
@@ -35,10 +40,12 @@ impl Sidebar {
             own_address: None,
             follows: Vec::new(),
             update_ready: false,
+            check_label: None,
             on_toggle: None,
             on_debug: None,
             on_add_follow: None,
             on_restart_update: None,
+            on_check_update: None,
         }
     }
 
@@ -46,6 +53,56 @@ impl Sidebar {
     pub fn update_ready(mut self, ready: bool) -> Self {
         self.update_ready = ready;
         self
+    }
+
+    /// Show the "check for updates" row with this label; `None` hides it.
+    pub fn check_update(mut self, label: Option<SharedString>) -> Self {
+        self.check_label = label;
+        self
+    }
+
+    /// Trigger a manual update check.
+    pub fn on_check_update(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_check_update = Some(Box::new(handler));
+        self
+    }
+
+    /// The manual-check row: quiet like the theme switcher — checking for
+    /// updates is routine, restarting into one (the primary-colored
+    /// sibling) is the decision.
+    fn render_check_button(
+        label: SharedString,
+        theme: &Theme,
+        on_check_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    ) -> Stateful<Div> {
+        let mut btn = div()
+            .id("check-for-updates")
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(theme.sidebar)
+            .hover(|style| style.bg(theme.list_hover))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_sm().text_color(theme.muted_foreground).child("↻"))
+                    .child(div().text_sm().text_color(theme.foreground).child(label)),
+            );
+
+        if let Some(on_check_update) = on_check_update {
+            btn = btn.on_click(move |event, window, cx| {
+                on_check_update(event, window, cx);
+            });
+        }
+        btn
     }
 
     /// Apply the staged update and relaunch — only ever user-initiated.
@@ -560,6 +617,13 @@ impl RenderOnce for Sidebar {
                             false,
                             &theme,
                             self.on_restart_update,
+                        ))
+                    })
+                    .when_some(self.check_label, |this, label| {
+                        this.child(Self::render_check_button(
+                            label,
+                            &theme,
+                            self.on_check_update,
                         ))
                     })
                     .child(Self::render_theme_switcher(&theme, is_dark)),

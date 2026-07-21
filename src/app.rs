@@ -38,6 +38,9 @@ pub struct VouchApp {
     /// A nightly is downloaded, validated, and waiting; the sidebar shows
     /// "restart to update" and nothing happens until it's clicked.
     update_ready: bool,
+    /// Where the last update check stands — drives the "check for
+    /// updates" row's label.
+    update_check: crate::auto_update::CheckState,
 }
 
 impl VouchApp {
@@ -110,12 +113,14 @@ impl VouchApp {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_secs(10))
+                    .timer(std::time::Duration::from_secs(2))
                     .await;
                 let ready = crate::auto_update::ready().is_some();
+                let check = crate::auto_update::check_state();
                 let Ok(()) = this.update(cx, |app: &mut VouchApp, cx| {
-                    if app.update_ready != ready {
+                    if app.update_ready != ready || app.update_check != check {
                         app.update_ready = ready;
+                        app.update_check = check;
                         cx.notify();
                     }
                 }) else {
@@ -136,6 +141,7 @@ impl VouchApp {
             sidebar_collapsed: false,
             show_debug: false,
             update_ready: false,
+            update_check: crate::auto_update::CheckState::Idle,
         }
     }
 
@@ -151,6 +157,38 @@ impl VouchApp {
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         cx.notify();
+    }
+
+    /// Dev-only escape hatch for eyeballing the update UI, which real
+    /// logic hides outside bundled installs: `VOUCH_UPDATE_UI_PREVIEW=check`
+    /// forces the check row, `=ready` forces the restart button. The
+    /// buttons are inert in preview (there's genuinely nothing to check
+    /// or restart into) — this exists to see them, not to use them.
+    fn update_ui_preview() -> Option<String> {
+        std::env::var("VOUCH_UPDATE_UI_PREVIEW").ok()
+    }
+
+    fn show_update_ready(&self) -> bool {
+        self.update_ready || Self::update_ui_preview().as_deref() == Some("ready")
+    }
+
+    /// The "check for updates" row label, or `None` to hide the row: dev
+    /// builds have no updater, and a staged update replaces the row with
+    /// the restart button.
+    fn check_update_label(&self) -> Option<SharedString> {
+        use crate::auto_update::CheckState;
+        if self.show_update_ready() {
+            return None;
+        }
+        if !crate::auto_update::active() && Self::update_ui_preview().is_none() {
+            return None;
+        }
+        Some(match self.update_check {
+            CheckState::Idle => "Check for updates".into(),
+            CheckState::Checking => "Checking…".into(),
+            CheckState::UpToDate => "Up to date ✓".into(),
+            CheckState::Failed => "Check failed — retry".into(),
+        })
     }
 }
 
@@ -193,7 +231,15 @@ impl Render for VouchApp {
                     .debug_active(self.show_debug)
                     .identity(own_name, own_address)
                     .follows(followed)
-                    .update_ready(self.update_ready)
+                    .update_ready(self.show_update_ready())
+                    .check_update(self.check_update_label())
+                    .on_check_update(cx.listener(|this, _, _window, cx| {
+                        // Optimistic: show "Checking…" now; the poller
+                        // syncs the real outcome as it lands.
+                        this.update_check = crate::auto_update::CheckState::Checking;
+                        crate::auto_update::check_now();
+                        cx.notify();
+                    }))
                     .on_restart_update(|_, _window, cx| {
                         // Swap the staged bundle, then quit; a detached
                         // helper relaunches the new build once we're gone.

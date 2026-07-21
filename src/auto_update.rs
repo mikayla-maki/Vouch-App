@@ -15,8 +15,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const RELEASE_API: &str = "https://api.github.com/repos/mikayla-maki/Vouch-App/releases/tags/nightly";
 const CHECK_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
@@ -33,11 +34,84 @@ struct Staged {
 
 static STAGED: Mutex<Option<Staged>> = Mutex::new(None);
 
+/// Where the last update check stands — what the sidebar's "check for
+/// updates" row displays. Distinct from [`ready`]: a staged update
+/// supersedes any of these in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    /// No check has run yet (or the result aged out of relevance).
+    Idle,
+    /// A check is in flight right now.
+    Checking,
+    /// The last check found nothing newer than what's running or staged.
+    UpToDate,
+    /// The last check failed (offline, GitHub down) — worth a retry.
+    Failed,
+}
+
+static CHECK_STATE: Mutex<CheckState> = Mutex::new(CheckState::Idle);
+/// Whether the updater thread is running at all (real installs only) —
+/// dev builds hide every update affordance.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static WAKE_FLAG: Mutex<bool> = Mutex::new(false);
+static WAKE: Condvar = Condvar::new();
+
 /// The staged-and-ready nightly stamp, if any — what the sidebar's
 /// "restart to update" button keys off. `None` until a newer build has
 /// been fully downloaded and validated.
 pub fn ready() -> Option<u64> {
     STAGED.lock().ok()?.as_ref().map(|s| s.stamp)
+}
+
+/// Whether this build updates itself at all — false for dev builds and
+/// bare binaries, where no update UI should render.
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+pub fn check_state() -> CheckState {
+    CHECK_STATE.lock().map(|s| *s).unwrap_or(CheckState::Idle)
+}
+
+fn set_check_state(state: CheckState) {
+    if let Ok(mut s) = CHECK_STATE.lock() {
+        *s = state;
+    }
+}
+
+/// Ask the updater thread to check now instead of at its next 4-hour
+/// tick. Flips the state to `Checking` immediately so the UI reflects
+/// the click; a no-op when the updater isn't running.
+pub fn check_now() {
+    if !active() {
+        return;
+    }
+    set_check_state(CheckState::Checking);
+    if let Ok(mut flag) = WAKE_FLAG.lock() {
+        *flag = true;
+    }
+    WAKE.notify_one();
+}
+
+/// Sleep up to `d`, waking early if [`check_now`] rings. Consumes the
+/// ring either way, so a wake can't double-fire.
+fn wait_for(d: Duration) {
+    let Ok(mut flag) = WAKE_FLAG.lock() else {
+        std::thread::sleep(d);
+        return;
+    };
+    let deadline = Instant::now() + d;
+    while !*flag {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Ok((next, _)) = WAKE.wait_timeout(flag, deadline - now) else {
+            return;
+        };
+        flag = next;
+    }
+    *flag = false;
 }
 
 /// The user said go: swap the staged bundle over the installed one and
@@ -93,20 +167,29 @@ pub fn spawn() {
         return; // not running from a .app bundle: nothing safe to replace
     };
 
+    ACTIVE.store(true, Ordering::Relaxed);
     std::thread::spawn(move || {
         let mut have = my_stamp;
-        // Let launch finish before touching the network.
-        std::thread::sleep(Duration::from_secs(60));
+        // Let launch finish before touching the network — but an explicit
+        // "check for updates" click cuts the wait short, like every other
+        // sleep in this loop.
+        wait_for(Duration::from_secs(60));
         loop {
+            set_check_state(CheckState::Checking);
             match check_and_stage(have, &app_dir) {
                 Ok(Some(new_stamp)) => {
                     eprintln!("auto-update: nightly {new_stamp} staged — restart to update");
                     have = new_stamp;
+                    // The restart button takes over the UI from here.
+                    set_check_state(CheckState::Idle);
                 }
-                Ok(None) => {}
-                Err(e) => eprintln!("auto-update: {e}"),
+                Ok(None) => set_check_state(CheckState::UpToDate),
+                Err(e) => {
+                    eprintln!("auto-update: {e}");
+                    set_check_state(CheckState::Failed);
+                }
             }
-            std::thread::sleep(CHECK_EVERY);
+            wait_for(CHECK_EVERY);
         }
     });
 }
@@ -250,5 +333,14 @@ mod tests {
     fn nothing_is_ready_and_restart_refuses_until_something_is_staged() {
         assert_eq!(ready(), None);
         assert!(restart_into_update().is_err());
+    }
+
+    #[test]
+    fn a_manual_check_is_inert_when_the_updater_is_not_running() {
+        // Dev builds never spawn the thread; the click must not lie by
+        // flipping the state to Checking with nobody there to finish it.
+        assert!(!active());
+        check_now();
+        assert_eq!(check_state(), CheckState::Idle);
     }
 }
