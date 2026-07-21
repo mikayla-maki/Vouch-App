@@ -18,9 +18,12 @@ pub struct Sidebar {
     own_address: Option<String>,
     /// Everyone followed, with their advertised names where known.
     follows: Vec<(LogId, Option<String>)>,
+    /// An update is staged and waiting; restarting applies it.
+    update_ready: bool,
     on_toggle: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_debug: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_add_follow: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_restart_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl Sidebar {
@@ -31,10 +34,78 @@ impl Sidebar {
             own_name: None,
             own_address: None,
             follows: Vec::new(),
+            update_ready: false,
             on_toggle: None,
             on_debug: None,
             on_add_follow: None,
+            on_restart_update: None,
         }
+    }
+
+    /// Show the "restart to update" affordance.
+    pub fn update_ready(mut self, ready: bool) -> Self {
+        self.update_ready = ready;
+        self
+    }
+
+    /// Apply the staged update and relaunch — only ever user-initiated.
+    pub fn on_restart_update(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_restart_update = Some(Box::new(handler));
+        self
+    }
+
+    /// The staged-update button. `compact` renders just the glyph (for
+    /// the collapsed rail); otherwise a labeled row. Primary-colored:
+    /// it's the one thing in the sidebar asking for a decision.
+    fn render_update_button(
+        compact: bool,
+        theme: &Theme,
+        on_restart_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    ) -> Stateful<Div> {
+        let mut btn = div()
+            .id("restart-to-update")
+            .cursor_pointer()
+            .rounded_md()
+            .bg(theme.primary.opacity(0.12))
+            .border_1()
+            .border_color(theme.primary)
+            .hover(|style| style.bg(theme.primary.opacity(0.25)));
+
+        btn = if compact {
+            btn.p_2().child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.primary)
+                    .child("⬆"),
+            )
+        } else {
+            btn.w_full().px_3().py_2().child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_sm().text_color(theme.primary).child("⬆"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.primary)
+                            .child("Restart to update"),
+                    ),
+            )
+        };
+
+        if let Some(on_restart_update) = on_restart_update {
+            btn = btn.on_click(move |event, window, cx| {
+                on_restart_update(event, window, cx);
+            });
+        }
+        btn
     }
 
     pub fn collapsed(mut self, collapsed: bool) -> Self {
@@ -393,6 +464,13 @@ impl RenderOnce for Sidebar {
                     self.on_debug,
                 ))
                 .child(div().flex_1())
+                .when(self.update_ready, |this| {
+                    this.child(Self::render_update_button(
+                        true,
+                        &theme,
+                        self.on_restart_update,
+                    ))
+                })
                 .child(div().pb_2().child(theme_btn));
         }
 
@@ -471,9 +549,19 @@ impl RenderOnce for Sidebar {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .p_2()
                     .border_t_1()
                     .border_color(theme.border)
+                    .when(self.update_ready, |this| {
+                        this.child(Self::render_update_button(
+                            false,
+                            &theme,
+                            self.on_restart_update,
+                        ))
+                    })
                     .child(Self::render_theme_switcher(&theme, is_dark)),
             )
     }

@@ -35,6 +35,9 @@ pub struct VouchApp {
     local_log_id: Option<LogId>,
     sidebar_collapsed: bool,
     show_debug: bool,
+    /// A nightly is downloaded, validated, and waiting; the sidebar shows
+    /// "restart to update" and nothing happens until it's clicked.
+    update_ready: bool,
 }
 
 impl VouchApp {
@@ -100,6 +103,28 @@ impl VouchApp {
         })
         .detach();
 
+        // The updater thread stages downloads in the background; this
+        // just watches for "ready" flipping so the sidebar button can
+        // appear. Polling a static is the whole protocol — the updater
+        // has no handle to the UI, on purpose.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(10))
+                    .await;
+                let ready = crate::auto_update::ready().is_some();
+                let Ok(()) = this.update(cx, |app: &mut VouchApp, cx| {
+                    if app.update_ready != ready {
+                        app.update_ready = ready;
+                        cx.notify();
+                    }
+                }) else {
+                    return;
+                };
+            }
+        })
+        .detach();
+
         Self {
             feed,
             feed_panel,
@@ -110,6 +135,7 @@ impl VouchApp {
             local_log_id,
             sidebar_collapsed: false,
             show_debug: false,
+            update_ready: false,
         }
     }
 
@@ -167,6 +193,15 @@ impl Render for VouchApp {
                     .debug_active(self.show_debug)
                     .identity(own_name, own_address)
                     .follows(followed)
+                    .update_ready(self.update_ready)
+                    .on_restart_update(|_, _window, cx| {
+                        // Swap the staged bundle, then quit; a detached
+                        // helper relaunches the new build once we're gone.
+                        match crate::auto_update::restart_into_update() {
+                            Ok(()) => cx.quit(),
+                            Err(e) => eprintln!("auto-update: restart failed: {e}"),
+                        }
+                    })
                     .on_add_follow(move |_, window, cx| {
                         AddFollowModal::open(follows_entity.clone(), window, cx);
                     })
